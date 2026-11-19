@@ -1,0 +1,16 @@
+[package]
+name = "mtseek-testkit"
+description = "Test support: deterministic synthetic corpora full of the edge cases that break search tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

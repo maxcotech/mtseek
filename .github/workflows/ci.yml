@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  MTSEEK_REQUIRE_RG: "1" # the ripgrep parity test must run, not skip
+
+jobs:
+  check:
+    name: fmt · clippy · test · doc (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ripgrep (parity reference)
+        run: choco install ripgrep --no-progress -y
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  deny:
+    name: licenses · advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

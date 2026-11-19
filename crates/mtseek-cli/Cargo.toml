@@ -1,0 +1,24 @@
+[package]
+name = "mtseek-cli"
+description = "The `mtseek` command: ripgrep-compatible flags, instant answers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mtseek"
+path = "src/main.rs"
+
+[dependencies]
+mtseek-core.workspace = true
+mtseek-walk.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+mtseek-testkit.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

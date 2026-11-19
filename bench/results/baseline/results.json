@@ -1,0 +1,945 @@
+{
+  "environment": {
+    "timestamp": "2026-11-19T21:41:07",
+    "os": "Windows-11-10.0.26200-SP0",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz",
+    "logical_cpus": 8,
+    "ram_gb": 31.7,
+    "ac_power": true,
+    "python": "3.12.10"
+  },
+  "config": {
+    "reference": "rg",
+    "target_ms": 100,
+    "runs": 5,
+    "modes": [
+      "files",
+      "lines"
+    ],
+    "scopes": [
+      {
+        "name": "dev",
+        "root": "C:\\Dev",
+        "default": true,
+        "list_flags": [],
+        "note": "rg defaults: respects .gitignore, skips hidden and binary files. rg's best case."
+      },
+      {
+        "name": "all",
+        "root": "C:\\Dev",
+        "default": false,
+        "list_flags": [
+          "-uu"
+        ],
+        "runs": 2,
+        "modes": [
+          "files"
+        ],
+        "queries": [
+          "absent",
+          "rare",
+          "common"
+        ],
+        "note": "Everything on disk under the root (node_modules, bin/obj, hidden). What 'search my whole machine' means. Minutes per query, so fewer runs and queries."
+      }
+    ],
+    "queries": [
+      {
+        "id": "absent",
+        "pattern": "zq7xkvq9plmw",
+        "kind": "literal",
+        "note": "No matches. Worst case for a scanner (reads everything), best case for an index."
+      },
+      {
+        "id": "rare",
+        "pattern": "Paystack",
+        "kind": "literal",
+        "note": "~17 files. The typical 'where is that thing' search."
+      },
+      {
+        "id": "uncommon",
+        "pattern": "HttpClient",
+        "kind": "literal",
+        "note": "~80 files."
+      },
+      {
+        "id": "medium",
+        "pattern": "useEffect",
+        "kind": "literal",
+        "note": "~800 files."
+      },
+      {
+        "id": "common",
+        "pattern": "import",
+        "kind": "literal",
+        "note": "Most files match. Index gives little; output volume dominates."
+      },
+      {
+        "id": "icase",
+        "pattern": "paystack",
+        "kind": "literal",
+        "ignore_case": true,
+        "note": "Case-insensitive literal."
+      },
+      {
+        "id": "regex-lit",
+        "pattern": "Connection\\w*String",
+        "kind": "regex",
+        "note": "Regex with literal anchors; an index can use 'Connection' and 'String'."
+      },
+      {
+        "id": "regex-nolit",
+        "pattern": "\\b\\d{3}-\\d{3}-\\d{4}\\b",
+        "kind": "regex",
+        "note": "No useful literal. Index-hostile: honest case where an index may not help."
+      }
+    ],
+    "contenders": {
+      "rg": {
+        "argv": [
+          "rg",
+          "--no-config",
+          "{flags}",
+          "--",
+          "{pattern}",
+          "{root}"
+        ],
+        "flags": {
+          "files": [
+            "--files-with-matches"
+          ],
+          "lines": [
+            "--line-number",
+            "--no-heading",
+            "--with-filename"
+          ],
+          "literal": [
+            "--fixed-strings"
+          ],
+          "ignore_case": [
+            "--ignore-case"
+          ],
+          "scope:all": [
+            "-uu"
+          ]
+        },
+        "ok_codes": [
+          0,
+          1
+        ],
+        "note": "Baseline. Scans files at query time."
+      },
+      "seek": {
+        "argv": [
+          "../target/release/seek.exe",
+          "{flags}",
+          "--",
+          "{pattern}",
+          "{root}"
+        ],
+        "flags": {
+          "files": [
+            "--files-with-matches"
+          ],
+          "lines": [
+            "--line-number",
+            "--no-heading",
+            "--with-filename"
+          ],
+          "literal": [
+            "--fixed-strings"
+          ],
+          "ignore_case": [
+            "--ignore-case"
+          ],
+          "scope:all": [
+            "-uu"
+          ]
+        },
+        "ok_codes": [
+          0,
+          1
+        ],
+        "note": "The tool we are building (not built yet). Expected to take rg-compatible flags."
+      },
+      "csearch": {
+        "argv": [
+          "csearch",
+          "{flags}",
+          "{pattern}"
+        ],
+        "flags": {
+          "files": [
+            "-l"
+          ],
+          "lines": [
+            "-n"
+          ],
+          "ignore_case": [
+            "-i"
+          ]
+        },
+        "literal": "escape",
+        "ok_codes": [
+          0,
+          1
+        ],
+        "version_args": [
+          "-h"
+        ],
+        "note": "Russ Cox codesearch. Run `cindex <root>` first; searches whatever was indexed. Adapter untested."
+      }
+    }
+  },
+  "contenders": [
+    {
+      "name": "rg",
+      "version": "ripgrep 15.2.0 (rev e89fff89ac)",
+      "note": "Baseline. Scans files at query time.",
+      "argv": [
+        "rg",
+        "--no-config",
+        "{flags}",
+        "--",
+        "{pattern}",
+        "{root}"
+      ]
+    }
+  ],
+  "scopes": [
+    {
+      "name": "dev",
+      "root": "C:\\Dev",
+      "default": true,
+      "list_flags": [],
+      "note": "rg defaults: respects .gitignore, skips hidden and binary files. rg's best case.",
+      "corpus": {
+        "files": 15086,
+        "bytes": 607577718,
+        "rg_files_listing_s": 0.123,
+        "measured_at": "2026-11-19T20:40:07"
+      }
+    },
+    {
+      "name": "all",
+      "root": "C:\\Dev",
+      "default": false,
+      "list_flags": [
+        "-uu"
+      ],
+      "runs": 2,
+      "modes": [
+        "files"
+      ],
+      "queries": [
+        "absent",
+        "rare",
+        "common"
+      ],
+      "note": "Everything on disk under the root (node_modules, bin/obj, hidden). What 'search my whole machine' means. Minutes per query, so fewer runs and queries.",
+      "corpus": {
+        "files": 1052796,
+        "bytes": 46845679364,
+        "rg_files_listing_s": 5.416,
+        "measured_at": "2026-11-19T20:41:20"
+      }
+    }
+  ],
+  "spawn_floor_s": 0.012515599999460392,
+  "warmup": 1,
+  "runs": 5,
+  "cells": [
+    {
+      "query": "absent",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--",
+            "zq7xkvq9plmw",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 2.025474600000962,
+          "samples_s": [
+            0.682778700000199,
+            0.6474655000001803,
+            0.6465260000004491,
+            0.6211027999997896,
+            0.6245933000009245
+          ],
+          "count": 0,
+          "stats": {
+            "n": 5,
+            "median": 0.6465260000004491,
+            "min": 0.6211027999997896,
+            "max": 0.682778700000199,
+            "mean": 0.6444932600003085,
+            "stdev": 0.024606214588611484
+          }
+        }
+      }
+    },
+    {
+      "query": "absent",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--",
+            "zq7xkvq9plmw",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6112761000003957,
+          "samples_s": [
+            0.6448039000006247,
+            0.6421540000010282,
+            0.7920991999999387,
+            0.738887600000453,
+            0.611048299999311
+          ],
+          "count": 0,
+          "stats": {
+            "n": 5,
+            "median": 0.6448039000006247,
+            "min": 0.611048299999311,
+            "max": 0.7920991999999387,
+            "mean": 0.6857986000002712,
+            "stdev": 0.07630741013934542
+          }
+        }
+      }
+    },
+    {
+      "query": "rare",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--",
+            "Paystack",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6363414999996166,
+          "samples_s": [
+            0.7052278999999544,
+            0.6840759999995498,
+            0.5905633000002126,
+            0.6079855000007228,
+            0.5500146000013046
+          ],
+          "count": 17,
+          "stats": {
+            "n": 5,
+            "median": 0.6079855000007228,
+            "min": 0.5500146000013046,
+            "max": 0.7052278999999544,
+            "mean": 0.6275734600003489,
+            "stdev": 0.06517585051717319
+          }
+        }
+      }
+    },
+    {
+      "query": "rare",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--",
+            "Paystack",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6758443999988231,
+          "samples_s": [
+            0.5851770999997825,
+            0.6563447000007727,
+            0.5926744000007602,
+            0.5599227000002429,
+            0.5759980000002543
+          ],
+          "count": 30,
+          "stats": {
+            "n": 5,
+            "median": 0.5851770999997825,
+            "min": 0.5599227000002429,
+            "max": 0.6563447000007727,
+            "mean": 0.5940233800003625,
+            "stdev": 0.03691813255061927
+          }
+        }
+      }
+    },
+    {
+      "query": "uncommon",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--",
+            "HttpClient",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5236723999987589,
+          "samples_s": [
+            0.605269199999384,
+            0.5348073999994085,
+            0.5322778999998263,
+            0.5946090999987064,
+            0.5223507999999129
+          ],
+          "count": 82,
+          "stats": {
+            "n": 5,
+            "median": 0.5348073999994085,
+            "min": 0.5223507999999129,
+            "max": 0.605269199999384,
+            "mean": 0.5578628799994476,
+            "stdev": 0.03887447120436776
+          }
+        }
+      }
+    },
+    {
+      "query": "uncommon",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--",
+            "HttpClient",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5915797999987262,
+          "samples_s": [
+            0.5544324999991659,
+            0.5331533999997191,
+            0.5800304999993386,
+            0.5232267000010324,
+            0.5981281000003946
+          ],
+          "count": 194,
+          "stats": {
+            "n": 5,
+            "median": 0.5544324999991659,
+            "min": 0.5232267000010324,
+            "max": 0.5981281000003946,
+            "mean": 0.5577942399999302,
+            "stdev": 0.03136342868143761
+          }
+        }
+      }
+    },
+    {
+      "query": "medium",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--",
+            "useEffect",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.537186900000961,
+          "samples_s": [
+            0.5357572000011714,
+            0.568092000001343,
+            0.5282306999997672,
+            0.6073641999992105,
+            0.5763401000003796
+          ],
+          "count": 779,
+          "stats": {
+            "n": 5,
+            "median": 0.568092000001343,
+            "min": 0.5282306999997672,
+            "max": 0.6073641999992105,
+            "mean": 0.5631568400003744,
+            "stdev": 0.03210537476014542
+          }
+        }
+      }
+    },
+    {
+      "query": "medium",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--",
+            "useEffect",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6089668000004167,
+          "samples_s": [
+            0.5931185999997979,
+            0.6055543000002217,
+            0.621947800000271,
+            0.5655440999998973,
+            0.6347514000008232
+          ],
+          "count": 1740,
+          "stats": {
+            "n": 5,
+            "median": 0.6055543000002217,
+            "min": 0.5655440999998973,
+            "max": 0.6347514000008232,
+            "mean": 0.6041832400002022,
+            "stdev": 0.026773499965660873
+          }
+        }
+      }
+    },
+    {
+      "query": "common",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--",
+            "import",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6038874999994732,
+          "samples_s": [
+            0.638078799998766,
+            0.5919971999992413,
+            0.6457028000004357,
+            0.595577800000683,
+            0.5993196999988868
+          ],
+          "count": 9401,
+          "stats": {
+            "n": 5,
+            "median": 0.5993196999988868,
+            "min": 0.5919971999992413,
+            "max": 0.6457028000004357,
+            "mean": 0.6141352599996026,
+            "stdev": 0.025611406295445997
+          }
+        }
+      }
+    },
+    {
+      "query": "common",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--",
+            "import",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.6901696999993874,
+          "samples_s": [
+            0.5937822999985656,
+            0.6213631000009627,
+            0.5706604999995761,
+            0.6029900000012276,
+            0.5738799999999173
+          ],
+          "count": 52995,
+          "stats": {
+            "n": 5,
+            "median": 0.5937822999985656,
+            "min": 0.5706604999995761,
+            "max": 0.6213631000009627,
+            "mean": 0.5925351800000499,
+            "stdev": 0.02102632223599283
+          }
+        }
+      }
+    },
+    {
+      "query": "icase",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "--ignore-case",
+            "--",
+            "paystack",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5624549999993178,
+          "samples_s": [
+            0.5372530999993614,
+            0.505398299999797,
+            0.550443300000552,
+            0.5765185000000201,
+            0.5593573999994987
+          ],
+          "count": 17,
+          "stats": {
+            "n": 5,
+            "median": 0.550443300000552,
+            "min": 0.505398299999797,
+            "max": 0.5765185000000201,
+            "mean": 0.5457941199998458,
+            "stdev": 0.026712994317130003
+          }
+        }
+      }
+    },
+    {
+      "query": "icase",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--fixed-strings",
+            "--ignore-case",
+            "--",
+            "paystack",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5200575000017125,
+          "samples_s": [
+            0.5132965000011609,
+            0.567412600001262,
+            0.5150622000001022,
+            0.5110251999994944,
+            0.5649854999992385
+          ],
+          "count": 33,
+          "stats": {
+            "n": 5,
+            "median": 0.5150622000001022,
+            "min": 0.5110251999994944,
+            "max": 0.567412600001262,
+            "mean": 0.5343564000002516,
+            "stdev": 0.029116080438254154
+          }
+        }
+      }
+    },
+    {
+      "query": "regex-lit",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--",
+            "Connection\\w*String",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.54407910000009,
+          "samples_s": [
+            0.5617124000000331,
+            0.5333313999999518,
+            0.506147999998575,
+            0.5612320999989606,
+            0.5093409999990399
+          ],
+          "count": 37,
+          "stats": {
+            "n": 5,
+            "median": 0.5333313999999518,
+            "min": 0.506147999998575,
+            "max": 0.5617124000000331,
+            "mean": 0.5343529799993121,
+            "stdev": 0.02689418441225931
+          }
+        }
+      }
+    },
+    {
+      "query": "regex-lit",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--",
+            "Connection\\w*String",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5583375000005617,
+          "samples_s": [
+            0.5432772000003752,
+            0.5191924000009749,
+            0.571083799999542,
+            0.5160995000005641,
+            0.5554634000000078
+          ],
+          "count": 79,
+          "stats": {
+            "n": 5,
+            "median": 0.5432772000003752,
+            "min": 0.5160995000005641,
+            "max": 0.571083799999542,
+            "mean": 0.5410232600002928,
+            "stdev": 0.023531968758561683
+          }
+        }
+      }
+    },
+    {
+      "query": "regex-nolit",
+      "scope": "dev",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--",
+            "\\b\\d{3}-\\d{3}-\\d{4}\\b",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5456233000004431,
+          "samples_s": [
+            0.5298352999998315,
+            0.5720870000004652,
+            0.5204438999990089,
+            0.5437454000002617,
+            0.5545129000001907
+          ],
+          "count": 3,
+          "stats": {
+            "n": 5,
+            "median": 0.5437454000002617,
+            "min": 0.5204438999990089,
+            "max": 0.5720870000004652,
+            "mean": 0.5441248999999516,
+            "stdev": 0.020340329581287134
+          }
+        }
+      }
+    },
+    {
+      "query": "regex-nolit",
+      "scope": "dev",
+      "mode": "lines",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--",
+            "\\b\\d{3}-\\d{3}-\\d{4}\\b",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 0.5207268000012846,
+          "samples_s": [
+            0.5947022999989713,
+            0.5253160000011121,
+            0.5369432000006782,
+            0.565260199999102,
+            0.5551727000001847
+          ],
+          "count": 7,
+          "stats": {
+            "n": 5,
+            "median": 0.5551727000001847,
+            "min": 0.5253160000011121,
+            "max": 0.5947022999989713,
+            "mean": 0.5554788800000097,
+            "stdev": 0.026868268489043865
+          }
+        }
+      }
+    },
+    {
+      "query": "absent",
+      "scope": "all",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "-uu",
+            "--",
+            "zq7xkvq9plmw",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 192.76416209999843,
+          "samples_s": [
+            187.08583120000003,
+            193.73677250000037
+          ],
+          "count": 0,
+          "stats": {
+            "n": 2,
+            "median": 190.4113018500002,
+            "min": 187.08583120000003,
+            "max": 193.73677250000037,
+            "mean": 190.4113018500002,
+            "stdev": 4.702925694503913
+          }
+        }
+      }
+    },
+    {
+      "query": "rare",
+      "scope": "all",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "-uu",
+            "--",
+            "Paystack",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 192.8732594000012,
+          "samples_s": [
+            178.25056890000087,
+            184.7597380999996
+          ],
+          "count": 30,
+          "stats": {
+            "n": 2,
+            "median": 181.50515350000023,
+            "min": 178.25056890000087,
+            "max": 184.7597380999996,
+            "mean": 181.50515350000023,
+            "stdev": 4.602677681209712
+          }
+        }
+      }
+    },
+    {
+      "query": "common",
+      "scope": "all",
+      "mode": "files",
+      "results": {
+        "rg": {
+          "argv": [
+            "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc\\rg.EXE",
+            "--no-config",
+            "--files-with-matches",
+            "--fixed-strings",
+            "-uu",
+            "--",
+            "import",
+            "C:\\Dev"
+          ],
+          "status": "ok",
+          "first_run_s": 188.14050619999944,
+          "samples_s": [
+            188.7292034000002,
+            170.32211540000026
+          ],
+          "count": 400769,
+          "stats": {
+            "n": 2,
+            "median": 179.52565940000022,
+            "min": 170.32211540000026,
+            "max": 188.7292034000002,
+            "mean": 179.52565940000022,
+            "stdev": 13.015776746697476
+          }
+        }
+      }
+    }
+  ]
+}

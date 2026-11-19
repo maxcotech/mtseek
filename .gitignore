@@ -1,0 +1,7 @@
+/target
+/bench/results/*/
+!/bench/results/baseline/
+/bench/results/cache/
+*.pdb
+.vs/
+.idea/

@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+# `cargo build` / `cargo test` at the root skip xtask; run it with `cargo xtask`.
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+mtseek-core = { path = "crates/mtseek-core" }
+mtseek-walk = { path = "crates/mtseek-walk" }
+mtseek-testkit = { path = "crates/mtseek-testkit" }
+
+# Search primitives: the same crates ripgrep is built from, so semantics match rg exactly.
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.34"
+regex-syntax = "0.8.12"
+
+# Everything else
+anyhow = "1.0.104"
+clap = { version = "4.6.8", features = ["derive"] }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+
+[workspace.lints.rust]
+# Only `mtseek-ntfs` (milestone M1) may contain unsafe code; it will declare its own [lints] table.
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unwrap_used = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only" # readable profiles (WPR, superluminal, samply) without a big binary
+
+[profile.dev.package."*"]
+opt-level = 2 # dependencies optimised so debug runs over real corpora stay usable

@@ -1,0 +1,72 @@
+{
+  "reference": "rg",
+  "target_ms": 100,
+  "runs": 5,
+  "modes": ["files", "lines"],
+
+  "scopes": [
+    {
+      "name": "dev",
+      "root": "C:\\Dev",
+      "default": true,
+      "list_flags": [],
+      "note": "rg defaults: respects .gitignore, skips hidden and binary files. rg's best case."
+    },
+    {
+      "name": "all",
+      "root": "C:\\Dev",
+      "default": false,
+      "list_flags": ["-uu"],
+      "runs": 2,
+      "modes": ["files"],
+      "queries": ["absent", "rare", "common"],
+      "note": "Everything on disk under the root (node_modules, bin/obj, hidden). What 'search my whole machine' means. Minutes per query, so fewer runs and queries."
+    }
+  ],
+
+  "queries": [
+    { "id": "absent",      "pattern": "zq7xkvq9plmw",           "kind": "literal", "note": "No matches. Worst case for a scanner (reads everything), best case for an index." },
+    { "id": "rare",        "pattern": "Paystack",               "kind": "literal", "note": "~17 files. The typical 'where is that thing' search." },
+    { "id": "uncommon",    "pattern": "HttpClient",             "kind": "literal", "note": "~80 files." },
+    { "id": "medium",      "pattern": "useEffect",              "kind": "literal", "note": "~800 files." },
+    { "id": "common",      "pattern": "import",                 "kind": "literal", "note": "Most files match. Index gives little; output volume dominates." },
+    { "id": "icase",       "pattern": "paystack",               "kind": "literal", "ignore_case": true, "note": "Case-insensitive literal." },
+    { "id": "regex-lit",   "pattern": "Connection\\w*String",   "kind": "regex", "note": "Regex with literal anchors; an index can use 'Connection' and 'String'." },
+    { "id": "regex-nolit", "pattern": "\\b\\d{3}-\\d{3}-\\d{4}\\b", "kind": "regex", "note": "No useful literal. Index-hostile: honest case where an index may not help." }
+  ],
+
+  "contenders": {
+    "rg": {
+      "argv": ["rg", "--no-config", "{flags}", "--", "{pattern}", "{root}"],
+      "flags": {
+        "files": ["--files-with-matches"],
+        "lines": ["--line-number", "--no-heading", "--with-filename"],
+        "literal": ["--fixed-strings"],
+        "ignore_case": ["--ignore-case"],
+        "scope:all": ["-uu"]
+      },
+      "ok_codes": [0, 1],
+      "note": "Baseline. Scans files at query time."
+    },
+    "mtseek": {
+      "argv": ["../target/release/mtseek.exe", "{flags}", "--", "{pattern}", "{root}"],
+      "flags": {
+        "files": ["--files-with-matches"],
+        "lines": ["--line-number", "--no-heading", "--with-filename"],
+        "literal": ["--fixed-strings"],
+        "ignore_case": ["--ignore-case"],
+        "scope:all": ["-uu"]
+      },
+      "ok_codes": [0, 1],
+      "note": "The tool we are building (not built yet). Expected to take rg-compatible flags."
+    },
+    "csearch": {
+      "argv": ["csearch", "{flags}", "{pattern}"],
+      "flags": { "files": ["-l"], "lines": ["-n"], "ignore_case": ["-i"] },
+      "literal": "escape",
+      "ok_codes": [0, 1],
+      "version_args": ["-h"],
+      "note": "Russ Cox codesearch. Run `cindex <root>` first; searches whatever was indexed. Adapter untested."
+    }
+  }
+}
