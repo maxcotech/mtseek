@@ -109,6 +109,15 @@ def environment() -> dict:
 # Contenders
 # --------------------------------------------------------------------------- #
 
+def resolve_exe(exe: str) -> str | None:
+    """An executable on PATH, or a path relative to bench/."""
+    found = shutil.which(exe)
+    if found:
+        return found
+    p = (HERE / exe).resolve()
+    return str(p) if p.exists() else None
+
+
 class Contender:
     """A search tool driven purely through its command line.
 
@@ -124,15 +133,34 @@ class Contender:
         self.ok_codes: list[int] = spec.get("ok_codes", [0])
         self.version_args: list[str] = spec.get("version_args", ["--version"])
         self.note: str = spec.get("note", "")
+        # File-name search ("names" mode) has its own command line, environment, and
+        # directories (caches) to empty before each cell. Contenders without one sit it out.
+        self.names_argv: list[str] | None = spec.get("names_argv")
+        # Values are paths, relative to bench/.
+        self.names_env: dict[str, str] = {
+            k: str((HERE / v).resolve()) for k, v in spec.get("names_env", {}).items()
+        }
+        self.names_reset: list[Path] = [(HERE / p).resolve() for p in spec.get("names_reset", [])]
+
+    def supports(self, mode: str) -> bool:
+        return mode != "names" or self.names_argv is not None
+
+    def env(self, mode: str) -> dict[str, str] | None:
+        if mode != "names" or not self.names_env:
+            return None
+        return {**os.environ, **self.names_env}
+
+    def reset(self, mode: str) -> None:
+        """Empties the contender's caches, so the cell's first run starts cold."""
+        if mode != "names":
+            return
+        for d in self.names_reset:
+            if d.is_relative_to(HERE / "results"):  # never delete anything outside bench/results
+                shutil.rmtree(d, ignore_errors=True)
 
     @property
     def exe(self) -> str | None:
-        exe = self.argv[0]
-        found = shutil.which(exe)
-        if found:
-            return found
-        p = (HERE / exe).resolve()
-        return str(p) if p.exists() else None
+        return resolve_exe(self.argv[0])
 
     def version(self) -> str:
         if not self.exe:
@@ -147,6 +175,15 @@ class Contender:
             return "unknown"
 
     def build(self, query: dict, scope: dict, mode: str) -> list[str]:
+        if mode == "names":
+            assert self.names_argv is not None
+            exe = self.names_argv[0]
+            argv = [resolve_exe(exe) or exe]
+            argv += [
+                part.replace("{pattern}", query["pattern"]).replace("{root}", scope["root"])
+                for part in self.names_argv[1:]
+            ]
+            return argv
         flags = list(self.flags.get(mode, []))
         pattern = query["pattern"]
         if query["kind"] == "literal":
@@ -223,10 +260,12 @@ def norm_path(p: str) -> str:
     return os.path.normcase(os.path.normpath(p.strip()))
 
 
-def run_once(argv: list[str], timeout: float) -> dict:
+def run_once(argv: list[str], timeout: float, env: dict[str, str] | None = None) -> dict:
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        proc = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env
+        )
     except subprocess.TimeoutExpired:
         return {"seconds": time.perf_counter() - t0, "timeout": True}
     secs = time.perf_counter() - t0
@@ -260,13 +299,35 @@ def summarize(samples: list[float]) -> dict:
 def digest(stdout: bytes, mode: str) -> dict:
     text = stdout.decode("utf-8", "surrogateescape")
     lines = [l for l in text.splitlines() if l.strip()]
-    if mode == "files":
+    if mode in ("files", "names"):
         files = sorted({norm_path(l) for l in lines})
         return {"count": len(files), "files": files}
     return {"count": len(lines)}
 
 
+def is_dir(path: str) -> bool:
+    # Paths past MAX_PATH need the verbatim prefix on Windows.
+    if sys.platform == "win32" and len(path) >= 240 and not path.startswith("\\\\"):
+        path = "\\\\?\\" + path
+    return os.path.isdir(path)
+
+
 def parity(ref: dict, other: dict, mode: str) -> dict:
+    if mode == "names":
+        # rg --files lists files only; a name search also finds directories. Extra
+        # directories are expected, anything else extra or missing is a failure.
+        a, b = set(ref["files"]), set(other["files"])
+        missing = sorted(a - b)
+        extra_all = sorted(b - a)
+        extra = [p for p in extra_all if not is_dir(p)]
+        return {
+            "ok": not missing and not extra,
+            "missing": len(missing),
+            "extra": len(extra),
+            "extra_dirs": len(extra_all) - len(extra),
+            "missing_sample": missing[:5],
+            "extra_sample": extra[:5],
+        }
     if mode == "files":
         a, b = set(ref["files"]), set(other["files"])
         missing, extra = sorted(a - b), sorted(b - a)
@@ -287,10 +348,14 @@ def bench_cell(contenders, query, scope, mode, runs, warmup, timeout, reference)
     digests = {}
     status = {c.name: "ok" for c in contenders}
 
-    # Warmup: first touch, also used for the result digest.
+    envs = {c.name: c.env(mode) for c in contenders}
+
+    # Warmup: first touch, also used for the result digest. Caches are emptied first, so
+    # for an indexing tool the first run includes building its index.
     for c in contenders:
+        c.reset(mode)
         for w in range(max(warmup, 1)):
-            r = run_once(argvs[c.name], timeout)
+            r = run_once(argvs[c.name], timeout, envs[c.name])
             if w == 0:
                 first[c.name] = r["seconds"]
             if r["timeout"]:
@@ -305,7 +370,7 @@ def bench_cell(contenders, query, scope, mode, runs, warmup, timeout, reference)
         for c in contenders:
             if status[c.name] == "timeout":
                 continue
-            r = run_once(argvs[c.name], timeout)
+            r = run_once(argvs[c.name], timeout, envs[c.name])
             if r["timeout"]:
                 status[c.name] = "timeout"
                 continue
@@ -376,6 +441,11 @@ def write_report(path: Path, data: dict) -> None:
              f"process spawn floor {fmt_s(data['spawn_floor_s'])} · target {fmt_s(target)}\n")
     L.append("Times are wall-clock medians, warm OS file cache (the best case for a scanning tool). "
              "`first` is the first run of the cell, which is not guaranteed to be a cold cache.\n")
+    if any(c["mode"] == "names" for c in data["cells"]):
+        L.append("`names` mode is file-name search, over everything on disk under the root (`-uu`), "
+                 "whatever the scope's flags. rg's equivalent is `rg --files -uu --iglob *pattern*`. "
+                 "Contenders' caches are emptied before each cell, so `first` includes building any "
+                 "index; the timed runs reuse it. Parity allows extra directories (rg lists only files).\n")
 
     L.append("## Contenders\n")
     L.append("| name | version | note |\n|---|---|---|")
@@ -417,9 +487,12 @@ def write_report(path: Path, data: dict) -> None:
         for c in cells:
             r = c["results"]
             rr = r.get(ref, {})
-            unit = "files" if c["mode"] == "files" else "lines"
+            unit = {"files": "files", "lines": "lines", "names": "files"}[c["mode"]]
             row = [c["query"], c["mode"], f"{rr.get('count', '–'):,} {unit}" if isinstance(rr.get('count'), int) else "–"]
             for n in names:
+                if n not in r:
+                    row += ["–", "–"]
+                    continue
                 st = r[n].get("stats")
                 med = st["median"] if st else None
                 mark = "" if r[n]["status"] == "ok" else f" ⚠ {r[n]['status']}"
@@ -428,15 +501,25 @@ def write_report(path: Path, data: dict) -> None:
             if rst:
                 ref_medians.append(rst["median"])
                 under_target += rst["median"] <= target
+            # Throughput means bytes searched; a name search reads no file contents.
+            if rst and c["mode"] != "names":
                 row.append(f"{nbytes / rst['median'] / 1024**3:.2f} GB/s")
             else:
                 row.append("–")
-            row.append(fmt_s(rr.get("first_run_s")))
+            row.append(" · ".join(f"{n} {fmt_s(r[n].get('first_run_s'))}" for n in names if n in r))
             for n in others:
+                if n not in r:
+                    row += ["–", "–"]
+                    continue
                 ost = r[n].get("stats")
                 row.append(f"{rst['median'] / ost['median']:.1f}×" if rst and ost else "–")
                 p = r[n].get("parity")
-                row.append("–" if not p else ("✓" if p["ok"] else f"✗ (-{p.get('missing', '?')} +{p.get('extra', '?')})"))
+                if not p:
+                    row.append("–")
+                elif p["ok"]:
+                    row.append("✓" + (f" (+{p['extra_dirs']:,} dirs)" if p.get("extra_dirs") else ""))
+                else:
+                    row.append(f"✗ (-{p.get('missing', '?')} +{p.get('extra', '?')})")
             L.append("| " + " | ".join(row) + " |")
         g = geomean(ref_medians)
         L.append("")
@@ -498,6 +581,8 @@ def main() -> None:
         sys.exit(f"not installed: {', '.join(missing)}")
     if ref not in wanted:
         sys.exit(f"reference contender '{ref}' must be included (parity is checked against it)")
+    if not contenders_all[ref].supports("names") and "names" in (args.modes or ""):
+        sys.exit(f"reference contender '{ref}' has no names_argv")
     contenders.sort(key=lambda c: c.name != ref)
 
     out_dir = Path(args.out) / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -534,7 +619,15 @@ def main() -> None:
     for s in scopes:
         s_queries = [q for q in query_ids if q in s.get("queries", query_ids)]
         s_modes = [m for m in modes if m in s.get("modes", modes)]
-        plan += [(s, q, m) for q in s_queries for m in s_modes]
+        # Name queries only make sense in names mode, and content queries only outside it.
+        plan += [
+            (s, q, m)
+            for m in s_modes
+            for q in s_queries
+            if (queries_all[q]["kind"] == "name") == (m == "names")
+        ]
+    if not plan:
+        sys.exit("nothing to run: names mode takes kind=name queries, files/lines take the rest")
 
     total = len(plan)
     i = 0
@@ -542,10 +635,11 @@ def main() -> None:
         runs = args.runs or s.get("runs") or cfg.get("runs", 5)
         i += 1
         print(f"[{i}/{total}] {s['name']:<6} {qid:<12} {mode:<6}", end="", flush=True)
-        cell = bench_cell(contenders, queries_all[qid], s, mode, runs, args.warmup, args.timeout, ref)
+        in_cell = [c for c in contenders if c.supports(mode)]
+        cell = bench_cell(in_cell, queries_all[qid], s, mode, runs, args.warmup, args.timeout, ref)
         data["cells"].append(cell)
         parts = []
-        for c in contenders:
+        for c in in_cell:
             r = cell["results"][c.name]
             med = r.get("stats", {}).get("median")
             p = r.get("parity")

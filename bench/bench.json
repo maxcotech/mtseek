@@ -3,6 +3,7 @@
   "target_ms": 100,
   "runs": 5,
   "modes": ["files", "lines"],
+  "_modes": "files and lines run the content queries. names runs the kind=name queries: python bench.py --modes names",
 
   "scopes": [
     {
@@ -32,7 +33,12 @@
     { "id": "common",      "pattern": "import",                 "kind": "literal", "note": "Most files match. Index gives little; output volume dominates." },
     { "id": "icase",       "pattern": "paystack",               "kind": "literal", "ignore_case": true, "note": "Case-insensitive literal." },
     { "id": "regex-lit",   "pattern": "Connection\\w*String",   "kind": "regex", "note": "Regex with literal anchors; an index can use 'Connection' and 'String'." },
-    { "id": "regex-nolit", "pattern": "\\b\\d{3}-\\d{3}-\\d{4}\\b", "kind": "regex", "note": "No useful literal. Index-hostile: honest case where an index may not help." }
+    { "id": "regex-nolit", "pattern": "\\b\\d{3}-\\d{3}-\\d{4}\\b", "kind": "regex", "note": "No useful literal. Index-hostile: honest case where an index may not help." },
+
+    { "id": "name-absent", "pattern": "zq7xkvq9plmw",           "kind": "name", "note": "File-name search, no matches." },
+    { "id": "name-rare",   "pattern": "paystack",               "kind": "name", "note": "File-name search: a handful of files. 'Where is that file?'" },
+    { "id": "name-medium", "pattern": "controller",             "kind": "name", "note": "File-name search: thousands of files." },
+    { "id": "name-common", "pattern": ".json",                  "kind": "name", "note": "File-name search: tens of thousands of files. Output volume dominates." }
   ],
 
   "contenders": {
@@ -45,8 +51,9 @@
         "ignore_case": ["--ignore-case"],
         "scope:all": ["-uu"]
       },
+      "names_argv": ["rg", "--no-config", "--files", "-uu", "--iglob", "*{pattern}*", "{root}"],
       "ok_codes": [0, 1],
-      "note": "Baseline. Scans files at query time."
+      "note": "Baseline. Scans files at query time. Names mode: lists every file (-uu) and keeps those whose name matches."
     },
     "mtseek": {
       "argv": ["../target/release/mtseek.exe", "{flags}", "--", "{pattern}", "{root}"],
@@ -57,8 +64,11 @@
         "ignore_case": ["--ignore-case"],
         "scope:all": ["-uu"]
       },
+      "names_argv": ["../target/release/mtseek.exe", "--names", "--", "{pattern}", "{root}"],
+      "names_env": { "MTSEEK_CACHE_DIR": "results/cache/mtseek-names" },
+      "names_reset": ["results/cache/mtseek-names"],
       "ok_codes": [0, 1],
-      "note": "The tool we are building (not built yet). Expected to take rg-compatible flags."
+      "note": "The tool we are building. Content modes: rg-compatible flags. Names mode: its cache is emptied before each cell, so `first` is a cold index build and the timed runs reuse the saved index."
     },
     "csearch": {
       "argv": ["csearch", "{flags}", "{pattern}"],
