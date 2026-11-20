@@ -58,6 +58,7 @@ unwrap_used = "warn"
 dbg_macro = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
+or_fun_call = "warn" # eager `ok_or(f())` in a hot loop once cost 2.5 s
 
 [profile.release]
 lto = "thin"

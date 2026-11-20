@@ -210,7 +210,7 @@ fn run(args: &Args) -> mtseek_core::Result<ExitCode> {
     let write_error = write_error
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(err) = write_error.or(flushed.err()) {
+    if let Some(err) = write_error.or_else(|| flushed.err()) {
         // A closed pipe (`mtseek foo | head`) is a normal way to stop, not a failure.
         if err.kind() == io::ErrorKind::BrokenPipe {
             return Ok(ExitCode::SUCCESS);

@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn unicode_case_folding() {
         let mut idx = NameIndex::new(0, "/r");
-        idx.upsert(1, 0, "ÉCOLE.txt", Kind::File);
+        idx.insert(1, 0, "ÉCOLE.txt", Kind::File);
         let q = NameQuery::new("école", CaseMode::Smart);
         assert_eq!(
             idx.search(&q, None, 0),
@@ -254,16 +254,21 @@ mod tests {
         ) {
             let mut idx = NameIndex::new(0, "/r");
             for (i, name) in names.iter().enumerate() {
-                idx.upsert(i as u64 + 1, 0, name, Kind::File);
+                idx.insert(i as u64 + 1, 0, name, Kind::File);
             }
             let mut live: Vec<(u64, &String)> =
                 names.iter().enumerate().map(|(i, n)| (i as u64 + 1, n)).collect();
             for r in removed {
                 let (id, _) = live[r.index(live.len())];
-                idx.remove(id);
                 live.retain(|(i, _)| *i != id);
                 if live.is_empty() { break; }
             }
+            // Removal happens by re-listing the directory without the removed names.
+            let listing = live
+                .iter()
+                .map(|(id, n)| crate::Child { id: *id, name: (*n).clone(), kind: Kind::File })
+                .collect();
+            idx.replace_children(vec![(0, listing)]);
             let q = NameQuery::new(&pattern, CaseMode::Smart);
             let mut expected: Vec<PathBuf> = live
                 .iter()

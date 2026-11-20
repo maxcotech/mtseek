@@ -11,9 +11,20 @@ use std::process::Command;
 
 use mtseek_testkit::CorpusSpec;
 
+/// Runs `mtseek --names` with a throwaway cache, so every run builds from scratch.
 fn mtseek(args: &[&str], root: &Path) -> (Option<i32>, Vec<String>) {
+    let cache = tempfile::tempdir().expect("temp dir");
+    let (code, lines, _) = mtseek_cached(cache.path(), args, root);
+    (code, lines)
+}
+
+/// Runs `mtseek --names --stats` with the given cache. Returns exit code, stdout lines and
+/// stderr.
+fn mtseek_cached(cache: &Path, args: &[&str], root: &Path) -> (Option<i32>, Vec<String>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_mtseek"))
+        .env("MTSEEK_CACHE_DIR", cache)
         .arg("--names")
+        .arg("--stats")
         .args(args)
         .arg("--")
         .arg(root)
@@ -24,7 +35,8 @@ fn mtseek(args: &[&str], root: &Path) -> (Option<i32>, Vec<String>) {
         .lines()
         .map(str::to_owned)
         .collect();
-    (out.status.code(), lines)
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status.code(), lines, stderr)
 }
 
 fn names(lines: &[String]) -> Vec<String> {
@@ -135,4 +147,36 @@ fn content_only_flags_are_rejected_with_names() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+}
+
+/// The second run loads the saved index and applies only the journal since, so it sees a
+/// file created between runs. Needs an NTFS temp directory (any Windows machine).
+#[cfg(windows)]
+#[test]
+fn later_runs_reuse_the_saved_index_and_see_changes() {
+    let cache = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/old.rs"), "").unwrap();
+
+    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    assert_eq!((code, names(&out)), (Some(0), vec!["old.rs".to_owned()]));
+    // Elevated (CI), the first run reads the MFT; otherwise it walks. Either way it saves.
+    assert!(!stats.contains("snapshot"), "{stats}");
+    assert!(stats.contains("saved "), "first run saves: {stats}");
+
+    std::fs::write(root.join("src/new.rs"), "").unwrap();
+    std::fs::remove_file(root.join("src/old.rs")).unwrap();
+    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    assert_eq!((code, names(&out)), (Some(0), vec!["new.rs".to_owned()]));
+    assert!(stats.contains("snapshot"), "{stats}");
+
+    // A corrupt cache is rebuilt, not trusted.
+    for entry in std::fs::read_dir(cache.path()).unwrap() {
+        std::fs::write(entry.unwrap().path(), b"garbage").unwrap();
+    }
+    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    assert_eq!((code, names(&out)), (Some(0), vec!["new.rs".to_owned()]));
+    assert!(!stats.contains("snapshot"), "{stats}");
 }

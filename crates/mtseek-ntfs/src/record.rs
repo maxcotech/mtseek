@@ -16,6 +16,10 @@ pub mod reason {
     pub const RENAME_OLD_NAME: u32 = 0x0000_1000;
     /// The record carries the name *after* a rename.
     pub const RENAME_NEW_NAME: u32 = 0x0000_2000;
+    /// A hard link to the file was added or removed.
+    pub const HARD_LINK_CHANGE: u32 = 0x0001_0000;
+    /// A reparse point (symbolic link, junction) was added, changed or removed.
+    pub const REPARSE_POINT_CHANGE: u32 = 0x0010_0000;
     /// The file's data changed (overwrite, extend or truncate).
     pub const DATA_CHANGED: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
     /// The last handle to the file was closed; the record summarises all changes since open.

@@ -32,6 +32,11 @@ mtseek -uu "TODO\(\w+\)" C:\Dev            # include ignored + hidden files
 mtseek --names "paystack .cs" C:\Dev       # file names: every term must match
 ```
 
+`--names` keeps its index in `%LOCALAPPDATA%\mtseek\cache` and updates it from the NTFS change
+journal on each run, so only the first run on a folder takes seconds. Run it once as administrator
+to index the whole drive from the master file table; later runs don't need admin.
+Deleting the cache is always safe.
+
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
 output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`
 work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md)).
@@ -41,7 +46,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | | Milestone | |
 |---|---|---|
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
-| M1 | Name engine: MFT + USN journal, instant file-name search | in progress |
+| M1 | Name engine: MFT + USN journal, instant file-name search | ✅ (M1c: hard links from the MFT) |
 | M2 | Content engine: trigram index + content store, under 100 ms | |
 | M3 | Background service, live updates, per-user access control | |
 | M4 | MCP server for AI agents, `--json` | |

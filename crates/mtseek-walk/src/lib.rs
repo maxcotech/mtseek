@@ -184,7 +184,8 @@ fn default_threads() -> usize {
 
 fn walker(scope: &Scope, options: Options) -> ignore::WalkParallel {
     let mut roots = scope.roots.iter();
-    let mut builder = WalkBuilder::new(roots.next().map_or(Path::new("."), |p| p.as_path()));
+    let mut builder =
+        WalkBuilder::new(roots.next().map_or_else(|| Path::new("."), |p| p.as_path()));
     for root in roots {
         builder.add(root);
     }

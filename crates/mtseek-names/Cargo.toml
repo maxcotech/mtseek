@@ -11,6 +11,9 @@ publish.workspace = true
 mtseek-core.workspace = true
 memchr.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+mtseek-ntfs.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

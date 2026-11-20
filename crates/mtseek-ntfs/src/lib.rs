@@ -1,24 +1,35 @@
-//! NTFS master file table enumeration and USN change journal reading.
+//! NTFS access for the name index: master file table enumeration, change journal reads, and
+//! directory listings that carry file reference numbers.
 //!
-//! Two layers:
+//! * [`record`] and [`dir`]: safe, portable parsers for the buffers NTFS returns. They are
+//!   pure byte parsing, so they are property-tested on any machine, no admin needed.
+//! * [`Volume`] (Windows only, needs admin): enumerates the MFT through `\\.\C:`. Without
+//!   admin rights [`Volume::open`] returns [`VolumeError::NotElevated`], and callers walk
+//!   directories instead.
+//! * [`Journal`] (Windows only, no admin needed): the volume's USN change journal, read
+//!   through a directory handle. Unprivileged records carry no names, only the file's and
+//!   its parent directory's reference numbers.
+//! * [`Directory`] (Windows only): lists a directory with each entry's reference number.
 //!
-//! * [`record`]: a safe, portable parser for the USN record buffers that NTFS returns.
-//!   It is pure byte parsing, so it is property-tested on any machine, no admin needed.
-//! * [`Volume`] (Windows only): opens `\\.\C:` and issues the three control codes mtseek
-//!   needs. All `unsafe` in the project lives in this crate's private `sys` module.
-//!
-//! Opening a volume needs administrator rights. Without them [`Volume::open`] returns
-//! [`VolumeError::NotElevated`], and callers fall back to walking directories.
+//! All `unsafe` in the project lives in this crate's private `sys` module.
 
+pub mod dir;
+#[cfg(windows)]
+mod journal;
 pub mod record;
 #[cfg(windows)]
 mod sys;
 #[cfg(windows)]
 mod volume;
 
+pub use dir::DirEntry;
+#[cfg(windows)]
+pub use dir::{DirBuffer, Directory};
+#[cfg(windows)]
+pub use journal::{Journal, JournalInfo};
 pub use record::{RecordError, Records, UsnRecord};
 #[cfg(windows)]
-pub use volume::{JournalInfo, Volume, VolumeError, file_ref};
+pub use volume::{Volume, VolumeError, file_ref};
 
 /// Splits an NTFS file reference number into (MFT record number, sequence number).
 ///

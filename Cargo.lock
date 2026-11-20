@@ -459,6 +459,7 @@ version = "0.0.1"
 dependencies = [
  "memchr",
  "mtseek-core",
+ "mtseek-ntfs",
  "proptest",
  "tempfile",
 ]

@@ -1,22 +1,19 @@
-//! A handle to an NTFS volume and the three control codes mtseek uses on it.
+//! A handle to an NTFS volume, for enumerating its master file table (needs admin).
 
 use std::io;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
-    GENERIC_READ,
+    ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
-use windows_sys::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
-};
+use windows_sys::Win32::System::Ioctl::FSCTL_ENUM_USN_DATA;
 
 use crate::record::{Records, UsnRecord};
 use crate::sys;
 
-/// Output buffer size for enumeration and journal reads. 1 MiB holds ~10k records per call.
+/// Output buffer size for enumeration. 1 MiB holds ~10k records per call.
 const BUFFER_SIZE: usize = 1 << 20;
 
 /// Why a volume operation failed.
@@ -56,17 +53,6 @@ pub enum VolumeError {
     },
 }
 
-/// Identity and range of a volume's change journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JournalInfo {
-    /// Changes when the journal is deleted and recreated; saved positions are then invalid.
-    pub journal_id: u64,
-    /// Oldest position still in the journal.
-    pub first_usn: i64,
-    /// Position the next change will get.
-    pub next_usn: i64,
-}
-
 /// An open NTFS volume, e.g. `\\.\C:`.
 #[derive(Debug)]
 pub struct Volume {
@@ -96,18 +82,6 @@ impl Volume {
         self.letter
     }
 
-    /// Queries the change journal (`FSCTL_QUERY_USN_JOURNAL`).
-    pub fn journal(&self) -> Result<JournalInfo, VolumeError> {
-        let mut out = [0u8; 64]; // USN_JOURNAL_DATA_V0 is 56 bytes
-        sys::ioctl(&self.handle, FSCTL_QUERY_USN_JOURNAL, &[], &mut out)
-            .map_err(|e| self.error(e))?;
-        Ok(JournalInfo {
-            journal_id: u64::from_le_bytes(word(&out, 0)),
-            first_usn: i64::from_le_bytes(word(&out, 8)),
-            next_usn: i64::from_le_bytes(word(&out, 16)),
-        })
-    }
-
     /// Lists every file and directory on the volume (`FSCTL_ENUM_USN_DATA`).
     ///
     /// Records arrive in MFT order, so a child can come before its parent directory.
@@ -134,43 +108,6 @@ impl Volume {
                 on_record(record.map_err(|source| self.bad_record(source))?);
                 count += 1;
             }
-        }
-    }
-
-    /// Reads journal records from `from_usn` up to the current end (`FSCTL_READ_USN_JOURNAL`).
-    ///
-    /// Returns the position to resume from next time.
-    pub fn read_changes(
-        &self,
-        journal: &JournalInfo,
-        from_usn: i64,
-        on_record: &mut dyn FnMut(UsnRecord),
-    ) -> Result<i64, VolumeError> {
-        let mut out = vec![0u8; BUFFER_SIZE];
-        let mut usn = from_usn;
-        loop {
-            // READ_USN_JOURNAL_DATA_V0 { StartUsn, ReasonMask, ReturnOnlyOnClose, Timeout,
-            //                            BytesToWaitFor, UsnJournalID }
-            let mut input = [0u8; 40];
-            input[0..8].copy_from_slice(&usn.to_le_bytes());
-            input[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-            input[32..40].copy_from_slice(&journal.journal_id.to_le_bytes());
-            let returned = match sys::ioctl(&self.handle, FSCTL_READ_USN_JOURNAL, &input, &mut out)
-            {
-                Ok(n) => n,
-                Err(e) if e.raw_os_error() == Some(code(ERROR_JOURNAL_ENTRY_DELETED)) => {
-                    return Err(VolumeError::JournalWrapped(self.letter));
-                }
-                Err(e) => return Err(self.error(e)),
-            };
-            let next = i64::from_le_bytes(word(&out, 0));
-            if returned <= 8 || next == usn {
-                return Ok(next);
-            }
-            for record in Records::new(&out[8..returned]) {
-                on_record(record.map_err(|source| self.bad_record(source))?);
-            }
-            usn = next;
         }
     }
 
@@ -256,9 +193,6 @@ mod tests {
             }
             Err(e) => panic!("{e}"),
         };
-        let journal = volume.journal().unwrap();
-        assert!(journal.next_usn >= journal.first_usn);
-
         let windows = file_ref(Path::new(r"C:\Windows")).unwrap();
         let mut found_windows = false;
         let mut count = 0u64;
@@ -273,17 +207,5 @@ mod tests {
             found_windows,
             "C:\\Windows missing from the MFT enumeration"
         );
-
-        // A file created now must show up in the journal.
-        let dir = tempfile::tempdir().unwrap();
-        let start = volume.journal().unwrap().next_usn;
-        std::fs::write(dir.path().join("mtseek-journal-probe.txt"), "x").unwrap();
-        let mut seen = false;
-        volume
-            .read_changes(&journal, start, &mut |r| {
-                seen |= r.name == "mtseek-journal-probe.txt";
-            })
-            .unwrap();
-        assert!(seen, "journal did not report the new file");
     }
 }

@@ -1,6 +1,7 @@
 # 0007: Name engine: flat arenas, parent links, two sources
 
-**Status:** Accepted, 2026-11-19
+**Status:** Accepted, 2026-11-19. Partly superseded by [0008](0008-persisted-name-index.md):
+ids, hard links and how journal changes are applied.
 
 ## Context
 

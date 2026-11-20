@@ -12,10 +12,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, OPEN_EXISTING,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -87,6 +88,44 @@ pub(crate) fn file_index(handle: &OwnedHandle) -> io::Result<u64> {
     // SAFETY: the call succeeded, which means it filled in `info`.
     let info = unsafe { info.assume_init() };
     Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+}
+
+/// One `GetFileInformationByHandleEx(FileIdBothDirectory[Restart]Info)` call on a directory
+/// handle. Returns the whole buffer as bytes (the records chain from offset 0), or `None`
+/// once the directory has no more entries.
+pub(crate) fn query_directory<'a>(
+    handle: &OwnedHandle,
+    buf: &'a mut [u64],
+    restart: bool,
+) -> io::Result<Option<&'a [u8]>> {
+    let class = if restart {
+        FileIdBothDirectoryRestartInfo
+    } else {
+        FileIdBothDirectoryInfo
+    };
+    let bytes = size_of_val(buf);
+    // SAFETY: `buf` is writable, 8-byte aligned (as FILE_ID_BOTH_DIR_INFO requires) and
+    // `bytes` long. The handle is synchronous, so the call is finished when it returns.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            class,
+            buf.as_mut_ptr().cast(),
+            len_u32(bytes),
+        )
+    };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == i32::try_from(ERROR_NO_MORE_FILES).ok() {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    // SAFETY: `u8` has no alignment or validity requirements, and the slice covers exactly
+    // the memory of `buf`, which stays borrowed for the slice's lifetime.
+    Ok(Some(unsafe {
+        std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes)
+    }))
 }
 
 fn len_u32(len: usize) -> u32 {
