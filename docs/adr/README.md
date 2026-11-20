@@ -11,3 +11,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0004](0004-service-security.md) | SYSTEM service that filters results by the caller's ACLs | Accepted |
 | [0005](0005-ripgrep-compatible-contract.md) | ripgrep is the behavioural contract | Accepted |
 | [0006](0006-windows-first.md) | Windows (NTFS) first | Accepted |
+| [0007](0007-name-engine.md) | Name engine: flat arenas, parent links, two sources | Accepted |

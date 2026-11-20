@@ -14,7 +14,11 @@ path = "src/main.rs"
 [dependencies]
 mtseek-core.workspace = true
 mtseek-walk.workspace = true
+mtseek-names.workspace = true
 clap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mtseek-ntfs.workspace = true
 
 [dev-dependencies]
 mtseek-testkit.workspace = true

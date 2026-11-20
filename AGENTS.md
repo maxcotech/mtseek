@@ -21,7 +21,9 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | Generate a test corpus | `cargo xtask corpus <empty-dir>` |
 | Run the CLI | `cargo run -p mtseek-cli -- -F needle C:\some\dir` |
 
-The toolchain is pinned in `rust-toolchain.toml`. No admin rights are needed for anything in M0.
+The toolchain is pinned in `rust-toolchain.toml`. Nothing needs admin rights except the MFT/USN
+test in `mtseek-ntfs`, which skips when not elevated (CI is elevated and sets `MTSEEK_REQUIRE_ADMIN=1`).
+To run it locally, run `cargo test -p mtseek-ntfs` from an elevated terminal.
 
 ## Rules
 
@@ -52,6 +54,8 @@ crates/mtseek-core     shared types: Query, Scope, Filter, Error (no I/O)
 crates/mtseek-walk     reference scanner = test oracle + fallback (ripgrep's crates)
 crates/mtseek-cli      `mtseek` binary; tests/parity.rs runs rg vs mtseek
 crates/mtseek-testkit  deterministic edge-case corpus generator
+crates/mtseek-ntfs     MFT + USN journal (Win32 FFI; all unsafe in src/sys.rs)
+crates/mtseek-names    file-name index (arenas + parent links), MFT or walk source
 xtask/                 cargo xtask ci | fmt | bench | corpus
 bench/                 bench.py + bench.json + TARGETS.md (ripgrep baseline)
 docs/                  ARCHITECTURE.md, adr/

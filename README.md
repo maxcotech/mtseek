@@ -29,6 +29,7 @@ cargo install --path crates/mtseek-cli   # until there's an installer
 mtseek -F "ConnectionString" C:\Dev        # same flags and output as ripgrep
 mtseek -l -i paystack C:\Dev               # files only, case-insensitive
 mtseek -uu "TODO\(\w+\)" C:\Dev            # include ignored + hidden files
+mtseek --names "paystack .cs" C:\Dev       # file names: every term must match
 ```
 
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
@@ -40,7 +41,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | | Milestone | |
 |---|---|---|
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
-| M1 | Name engine: MFT + USN journal, instant file-name search | next |
+| M1 | Name engine: MFT + USN journal, instant file-name search | in progress |
 | M2 | Content engine: trigram index + content store, under 100 ms | |
 | M3 | Background service, live updates, per-user access control | |
 | M4 | MCP server for AI agents, `--json` | |

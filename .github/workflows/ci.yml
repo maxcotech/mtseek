@@ -13,6 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   MTSEEK_REQUIRE_RG: "1" # the ripgrep parity test must run, not skip
+  MTSEEK_REQUIRE_ADMIN: "1" # GitHub's Windows runners are elevated: the MFT/USN test must run
 
 jobs:
   check:
