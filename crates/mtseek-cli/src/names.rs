@@ -151,17 +151,23 @@ fn drive_index(
         return Some((letter, under));
     }
     match mtseek_names::build_from_mft(letter) {
-        Ok((index, checkpoint)) => {
+        Ok(built) => {
+            let how = match built.method {
+                mtseek_names::MftMethod::Raw => {
+                    format!("NTFS MFT (raw records, {} unreadable)", built.bad_records)
+                }
+                mtseek_names::MftMethod::Enumeration => "NTFS MFT (enumeration)".to_owned(),
+            };
             let snapshot = Snapshot {
-                index,
+                index: built.index,
                 origin: Origin::Mft,
-                checkpoint,
+                checkpoint: built.checkpoint,
             };
             drives.insert(
                 letter,
                 Loaded {
                     snapshot,
-                    how: "NTFS MFT".into(),
+                    how,
                     took: started.elapsed(),
                     save_to: path,
                 },

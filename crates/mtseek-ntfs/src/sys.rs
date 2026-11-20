@@ -9,7 +9,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
@@ -45,7 +45,7 @@ pub(crate) fn open(path: &OsStr, access: u32, flags: u32) -> io::Result<OwnedHan
 
 /// Synchronous `DeviceIoControl`. Returns the number of bytes written to `output`.
 pub(crate) fn ioctl(
-    handle: &OwnedHandle,
+    handle: BorrowedHandle<'_>,
     code: u32,
     input: &[u8],
     output: &mut [u8],

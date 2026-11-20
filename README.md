@@ -46,7 +46,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | | Milestone | |
 |---|---|---|
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
-| M1 | Name engine: MFT + USN journal, instant file-name search | ✅ (M1c: hard links from the MFT) |
+| M1 | Name engine: MFT + USN journal, instant file-name search | ✅ |
 | M2 | Content engine: trigram index + content store, under 100 ms | |
 | M3 | Background service, live updates, per-user access control | |
 | M4 | MCP server for AI agents, `--json` | |

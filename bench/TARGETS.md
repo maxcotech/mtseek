@@ -88,6 +88,16 @@ gap is real and repeatable (M0 measured it too), but nobody has explained it yet
 thread count, rg's per-file work that mtseek skips, and build flags (mtseek is built with
 thin LTO and one codegen unit). The content target needs the trigram index (M2).
 
+### 2026-11-20, M1c: whole-drive index from raw MFT records (admin)
+
+Measured with `mtseek --names --stats` in an elevated terminal, since the benchmark harness
+doesn't run elevated.
+
+| whole-drive build of `C:` | entries | build time | `C:\Dev` files missing vs `rg --files -uu` |
+|---|---:|---:|---:|
+| `FSCTL_ENUM_USN_DATA` (M1) | 2,433,531 | 5.6 s | 3,877 (extra hard links) |
+| raw MFT records (M1c) | 2,509,479 | **2.56 s** | **0** of 1,060,747 |
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

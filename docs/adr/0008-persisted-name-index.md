@@ -1,6 +1,7 @@
 # 0008: Persisted name index, caught up from the journal without admin
 
-**Status:** Accepted, 2026-11-20. Supersedes the "USN records apply directly as `Change`s"
+**Status:** Accepted, 2026-11-20. Its known hard-link gap is closed by
+[0009](0009-raw-mft-records.md). Supersedes the "USN records apply directly as `Change`s"
 part of [0007](0007-name-engine.md); the rest of 0007 stands.
 
 ## Context

@@ -26,7 +26,7 @@ mod snapshot;
 mod walk;
 
 #[cfg(windows)]
-pub use live::{CatchUp, build_from_mft, catch_up, checkpoint_now};
+pub use live::{CatchUp, MftBuild, MftMethod, build_from_mft, catch_up, checkpoint_now};
 pub use query::NameQuery;
 pub use snapshot::{Checkpoint, Origin, Snapshot};
 pub use walk::{WalkStats, walk, walk_into};

@@ -7,7 +7,8 @@
 //! and the reason for the change, which is enough to know which directories to re-list.
 
 use std::io;
-use std::os::windows::io::OwnedHandle;
+use std::os::windows::io::{AsHandle, OwnedHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
@@ -61,8 +62,13 @@ impl Journal {
     /// The journal's identity and current range (`FSCTL_QUERY_USN_JOURNAL`).
     pub fn info(&self) -> Result<JournalInfo, VolumeError> {
         let mut out = [0u8; 64]; // USN_JOURNAL_DATA_V0 is 56 bytes
-        sys::ioctl(&self.handle, FSCTL_QUERY_USN_JOURNAL, &[], &mut out)
-            .map_err(|e| self.error(e))?;
+        sys::ioctl(
+            self.handle.as_handle(),
+            FSCTL_QUERY_USN_JOURNAL,
+            &[],
+            &mut out,
+        )
+        .map_err(|e| self.error(e))?;
         Ok(JournalInfo {
             journal_id: u64::from_le_bytes(word(&out, 0)),
             first_usn: i64::from_le_bytes(word(&out, 8)),
@@ -94,7 +100,7 @@ impl Journal {
             input[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
             input[32..40].copy_from_slice(&journal.journal_id.to_le_bytes());
             let returned = match sys::ioctl(
-                &self.handle,
+                self.handle.as_handle(),
                 FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
                 &input,
                 &mut out,
@@ -122,6 +128,21 @@ impl Journal {
         }
     }
 
+    /// The journal position of the first change at most `age` old: where to replay from
+    /// to cover everything that happened in the last `age`. Reads the whole journal, which
+    /// takes tens of milliseconds, so it is for full builds, not every run.
+    pub fn position_since(&self, journal: &JournalInfo, age: Duration) -> Result<i64, VolumeError> {
+        let cutoff =
+            filetime_now().saturating_sub(i64::try_from(age.as_nanos() / 100).unwrap_or(i64::MAX));
+        let mut found = None;
+        let next = self.read(journal, journal.first_usn, &mut |r| {
+            if found.is_none() && r.timestamp >= cutoff {
+                found = Some(r.usn);
+            }
+        })?;
+        Ok(found.unwrap_or(next))
+    }
+
     fn error(&self, source: io::Error) -> VolumeError {
         if source.raw_os_error() == code(ERROR_JOURNAL_NOT_ACTIVE) {
             return VolumeError::NoJournal(self.letter);
@@ -131,6 +152,15 @@ impl Journal {
             source,
         }
     }
+}
+
+/// Now, as a Windows `FILETIME`: 100 ns ticks since 1601-01-01 UTC.
+fn filetime_now() -> i64 {
+    const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+    let since_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos() / 100).unwrap_or(i64::MAX));
+    UNIX_EPOCH_AS_FILETIME.saturating_add(since_unix)
 }
 
 fn word(buf: &[u8], at: usize) -> [u8; 8] {
@@ -171,6 +201,40 @@ mod tests {
             .unwrap();
         assert!(created, "journal did not report the new file");
         assert!(next > info.next_usn);
+    }
+
+    #[test]
+    fn finds_the_position_of_recent_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = dir.path().to_string_lossy().chars().next().unwrap();
+        let journal = Journal::open(letter).unwrap();
+        let path = dir.path().join("mtseek-recent.txt");
+        std::fs::write(&path, "x").unwrap();
+        let created = crate::file_ref(&path).unwrap();
+        let info = journal.info().unwrap();
+
+        // Replaying the last minute must include the file just created, with a real time.
+        let since = journal
+            .position_since(&info, Duration::from_secs(60))
+            .unwrap();
+        assert!(since >= info.first_usn && since < info.next_usn);
+        let mut create_time = None;
+        journal
+            .read(&info, since, &mut |r| {
+                if r.file_ref == created && r.reason & crate::record::reason::FILE_CREATE != 0 {
+                    create_time = Some(r.timestamp);
+                }
+            })
+            .unwrap();
+        let create_time = create_time.expect("the create is within the last minute");
+        assert!(
+            (filetime_now() - create_time).abs() < 600_000_000,
+            "within a minute"
+        );
+
+        // Nothing is newer than now, so a zero age points past the newest record.
+        let none = journal.position_since(&info, Duration::ZERO).unwrap();
+        assert!(none > since);
     }
 
     #[test]

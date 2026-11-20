@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use mtseek_ntfs::record::reason;
 use mtseek_ntfs::{Journal, Volume, VolumeError, file_ref};
@@ -16,6 +17,9 @@ use mtseek_ntfs::{Journal, Volume, VolumeError, file_ref};
 use crate::snapshot::Checkpoint;
 use crate::walk::{Lister, walk_into};
 use crate::{FileId, Kind, NameIndex};
+
+/// The record-number part of a file reference.
+const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 /// Journal reasons that can add, remove or rename a directory entry. Data writes and
 /// attribute changes don't affect names, and are most of the journal.
@@ -52,25 +56,88 @@ pub fn checkpoint_now(letter: char) -> Option<Checkpoint> {
     })
 }
 
+/// How the MFT was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MftMethod {
+    /// Raw records: every name of every file, hard links included.
+    Raw,
+    /// `FSCTL_ENUM_USN_DATA`: one name per file. Used when the raw records can't be read.
+    Enumeration,
+}
+
+/// A whole-volume index fresh from the MFT.
+#[derive(Debug)]
+pub struct MftBuild {
+    /// The index.
+    pub index: NameIndex,
+    /// Where it is up to date in the journal.
+    pub checkpoint: Checkpoint,
+    /// How the MFT was read.
+    pub method: MftMethod,
+    /// Raw records skipped because they failed to parse.
+    pub bad_records: u64,
+}
+
+/// How far back to replay the journal after reading raw MFT records. NTFS writes record
+/// changes to disk lazily, so the on-disk MFT can miss the last few seconds of changes.
+/// The journal has them, and replaying a minute of it costs a handful of re-listings.
+const RAW_MFT_LAG: Duration = Duration::from_secs(60);
+
+/// NTFS's own metadata files (`$MFT`, `$Bitmap`, ...) live in records 0-15, and 16-23 are
+/// reserved. None of them is visible to directory listings, so none belongs in the index.
+const FIRST_USER_RECORD: u64 = 24;
+
 /// Builds an index of the whole volume from its master file table. Needs administrator
 /// rights; without them this fails with [`VolumeError::NotElevated`].
-pub fn build_from_mft(letter: char) -> Result<(NameIndex, Checkpoint), VolumeError> {
+///
+/// Reads raw MFT records, which list every hard link. If they can't be parsed, falls back
+/// to `FSCTL_ENUM_USN_DATA` (one name per file). Either way, the journal is then replayed
+/// from a minute before the read, so the index is current when this returns.
+pub fn build_from_mft(letter: char) -> Result<MftBuild, VolumeError> {
     let volume = Volume::open(letter)?;
     let letter = volume.letter();
-    let journal = Journal::open(letter)?.info()?;
+    let journal = Journal::open(letter)?;
+    let info = journal.info()?;
+    let replay_from = journal.position_since(&info, RAW_MFT_LAG)?;
     let root = format!(r"{letter}:\");
     let root_id =
         file_ref(Path::new(&root)).map_err(|source| VolumeError::Io { letter, source })?;
-    let mut index = NameIndex::new(root_id, root);
-    volume.enumerate(&mut |r| {
-        let kind = if r.is_dir() { Kind::Dir } else { Kind::File };
-        index.insert(r.file_ref, r.parent_ref, &r.name, kind);
-    })?;
-    let checkpoint = Checkpoint {
-        journal_id: journal.journal_id,
-        usn: journal.next_usn,
+
+    let mut index = NameIndex::new(root_id, root.clone());
+    let raw = volume.read_mft(&mut |n| {
+        let record = n.file_ref & RECORD_NUMBER_MASK;
+        if record >= FIRST_USER_RECORD || n.file_ref == root_id {
+            let kind = if n.is_dir { Kind::Dir } else { Kind::File };
+            index.insert(n.file_ref, n.parent_ref, &n.name, kind);
+        }
+    });
+    let (method, bad_records) = match raw {
+        // A handful of torn records is normal on a live volume (the journal replay
+        // repairs them); many means mtseek misreads this volume.
+        Ok(stats) if stats.bad_records * 1000 <= stats.records.max(1) => {
+            (MftMethod::Raw, stats.bad_records)
+        }
+        Ok(_) | Err(VolumeError::BadMft { .. }) => {
+            index = NameIndex::new(root_id, root);
+            volume.enumerate(&mut |r| {
+                let kind = if r.is_dir() { Kind::Dir } else { Kind::File };
+                index.insert(r.file_ref, r.parent_ref, &r.name, kind);
+            })?;
+            (MftMethod::Enumeration, 0)
+        }
+        Err(e) => return Err(e),
     };
-    Ok((index, checkpoint))
+    let from = Checkpoint {
+        journal_id: info.journal_id,
+        usn: replay_from,
+    };
+    let caught_up = catch_up(&mut index, letter, from)?;
+    Ok(MftBuild {
+        index,
+        checkpoint: caught_up.checkpoint,
+        method,
+        bad_records,
+    })
 }
 
 /// Applies every change since `from` to `index`, whose files live on drive `letter`.
@@ -159,6 +226,53 @@ mod tests {
 
     fn letter(path: &Path) -> char {
         path.to_string_lossy().chars().next().unwrap()
+    }
+
+    /// End to end, with admin: a whole-drive build lists both links of a hard-linked file
+    /// and agrees with a walk of the same directory. The files are seconds old, so this
+    /// also covers the journal replay that makes up for the on-disk MFT lagging behind.
+    #[test]
+    fn mft_build_lists_every_hard_link_when_elevated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("one")).unwrap();
+        fs::create_dir_all(root.join("two")).unwrap();
+        fs::write(root.join("one").join("linked.txt"), "x").unwrap();
+        fs::hard_link(
+            root.join("one").join("linked.txt"),
+            root.join("two").join("linked-again.txt"),
+        )
+        .unwrap();
+
+        let built = match build_from_mft(letter(root)) {
+            Ok(built) => built,
+            Err(VolumeError::NotElevated) => {
+                assert!(
+                    std::env::var_os("MTSEEK_REQUIRE_ADMIN").is_none(),
+                    "MTSEEK_REQUIRE_ADMIN is set but the test is not elevated"
+                );
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(built.method, MftMethod::Raw, "raw records must parse on C:");
+        let under = file_ref(root).unwrap();
+        let found = built
+            .index
+            .search(&NameQuery::new("linked", CaseMode::Smart), Some(under), 0);
+        assert_eq!(
+            found,
+            [
+                root.join("one").join("linked.txt"),
+                root.join("two").join("linked-again.txt")
+            ]
+        );
+        let (walked, _) = walk(root).unwrap();
+        let everything_under =
+            built
+                .index
+                .search(&NameQuery::new("", CaseMode::Smart), Some(under), 0);
+        assert_eq!(everything_under, everything(&walked));
     }
 
     /// Builds an index, changes the tree in every way catch-up must handle, catches up,

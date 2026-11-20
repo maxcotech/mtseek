@@ -1,7 +1,7 @@
 //! NTFS access for the name index: master file table enumeration, change journal reads, and
 //! directory listings that carry file reference numbers.
 //!
-//! * [`record`] and [`dir`]: safe, portable parsers for the buffers NTFS returns. They are
+//! * [`record`], [`dir`] and [`mft`]: safe, portable parsers for the buffers NTFS returns. They are
 //!   pure byte parsing, so they are property-tested on any machine, no admin needed.
 //! * [`Volume`] (Windows only, needs admin): enumerates the MFT through `\\.\C:`. Without
 //!   admin rights [`Volume::open`] returns [`VolumeError::NotElevated`], and callers walk
@@ -16,6 +16,7 @@
 pub mod dir;
 #[cfg(windows)]
 mod journal;
+pub mod mft;
 pub mod record;
 #[cfg(windows)]
 mod sys;

@@ -42,6 +42,8 @@ pub struct UsnRecord {
     pub parent_ref: u64,
     /// Journal position of this change. Zero for records from MFT enumeration.
     pub usn: i64,
+    /// When the change happened, as a Windows `FILETIME` (100 ns ticks since 1601, UTC).
+    pub timestamp: i64,
     /// What changed: a bit set of [`reason`] flags. Zero for records from MFT enumeration.
     pub reason: u32,
     /// `FILE_ATTRIBUTE_*` flags.
@@ -82,7 +84,7 @@ impl UsnRecord {
         out.extend_from_slice(&self.file_ref.to_le_bytes());
         out.extend_from_slice(&self.parent_ref.to_le_bytes());
         out.extend_from_slice(&self.usn.to_le_bytes());
-        out.extend_from_slice(&0i64.to_le_bytes()); // timestamp
+        out.extend_from_slice(&self.timestamp.to_le_bytes());
         out.extend_from_slice(&self.reason.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // source info
         out.extend_from_slice(&0u32.to_le_bytes()); // security id
@@ -203,7 +205,7 @@ fn parse_one(rest: &[u8], offset: usize) -> Result<(UsnRecord, usize), RecordErr
         (u64_at(record, 8), u64_at(record, 24), 40)
     };
     let usn = i64_at(record, base);
-    // base + 8 is the timestamp, which mtseek does not use yet.
+    let timestamp = i64_at(record, base + 8);
     let reason = u32_at(record, base + 16);
     // base + 20 source info, base + 24 security id.
     let attributes = u32_at(record, base + 28);
@@ -223,6 +225,7 @@ fn parse_one(rest: &[u8], offset: usize) -> Result<(UsnRecord, usize), RecordErr
             file_ref,
             parent_ref,
             usn,
+            timestamp,
             reason,
             attributes,
             name,
@@ -259,6 +262,7 @@ mod tests {
             file_ref: 0x0003_0000_0000_1234,
             parent_ref: 0x0005_0000_0000_0005,
             usn: 4096,
+            timestamp: 133_000_000_000_000_000,
             reason: reason::FILE_CREATE | reason::CLOSE,
             attributes: ATTRIBUTE_DIRECTORY,
             name: name.into(),
@@ -289,7 +293,7 @@ mod tests {
         buf.extend_from_slice(&r.parent_ref.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&r.usn.to_le_bytes());
-        buf.extend_from_slice(&0i64.to_le_bytes());
+        buf.extend_from_slice(&r.timestamp.to_le_bytes());
         buf.extend_from_slice(&r.reason.to_le_bytes());
         buf.extend_from_slice(&[0; 8]);
         buf.extend_from_slice(&r.attributes.to_le_bytes());
@@ -340,10 +344,10 @@ mod tests {
     proptest! {
         #[test]
         fn roundtrips_any_record(
-            file_ref: u64, parent_ref: u64, usn: i64, reason: u32, attributes: u32,
+            file_ref: u64, parent_ref: u64, usn: i64, timestamp: i64, reason: u32, attributes: u32,
             name in "\\PC{0,40}",
         ) {
-            let r = UsnRecord { file_ref, parent_ref, usn, reason, attributes, name };
+            let r = UsnRecord { file_ref, parent_ref, usn, timestamp, reason, attributes, name };
             let parsed: Vec<_> = Records::new(&r.to_v2_bytes()).collect::<Result<_, _>>().unwrap();
             prop_assert_eq!(parsed, vec![r]);
         }

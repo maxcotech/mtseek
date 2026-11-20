@@ -13,3 +13,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0006](0006-windows-first.md) | Windows (NTFS) first | Accepted |
 | [0007](0007-name-engine.md) | Name engine: flat arenas, parent links, two sources | Accepted, partly superseded by 0008 |
 | [0008](0008-persisted-name-index.md) | Persisted name index, caught up from the journal without admin | Accepted |
+| [0009](0009-raw-mft-records.md) | Read raw MFT records for whole-drive indexes | Accepted |
