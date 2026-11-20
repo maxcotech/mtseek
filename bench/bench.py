@@ -23,11 +23,14 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# Contenders' caches. Outside every scope's root, so they are never part of the corpus.
+SCRATCH = (Path(tempfile.gettempdir()) / "mtseek-bench").resolve()
 
 
 # --------------------------------------------------------------------------- #
@@ -136,11 +139,13 @@ class Contender:
         # File-name search ("names" mode) has its own command line, environment, and
         # directories (caches) to empty before each cell. Contenders without one sit it out.
         self.names_argv: list[str] | None = spec.get("names_argv")
-        # Values are paths, relative to bench/.
+        # Values are paths under the harness's scratch directory, which lives in the system
+        # temp folder: a cache inside a searched root would be part of the corpus, and would
+        # differ between contenders' runs.
         self.names_env: dict[str, str] = {
-            k: str((HERE / v).resolve()) for k, v in spec.get("names_env", {}).items()
+            k: str(SCRATCH / v) for k, v in spec.get("names_env", {}).items()
         }
-        self.names_reset: list[Path] = [(HERE / p).resolve() for p in spec.get("names_reset", [])]
+        self.names_reset: list[Path] = [SCRATCH / p for p in spec.get("names_reset", [])]
 
     def supports(self, mode: str) -> bool:
         return mode != "names" or self.names_argv is not None
@@ -155,7 +160,7 @@ class Contender:
         if mode != "names":
             return
         for d in self.names_reset:
-            if d.is_relative_to(HERE / "results"):  # never delete anything outside bench/results
+            if d.resolve().is_relative_to(SCRATCH):  # never delete outside the scratch dir
                 shutil.rmtree(d, ignore_errors=True)
 
     @property

@@ -62,7 +62,8 @@ pass parity, mtseek has to index the same file set for a scope.
 takes part in `names` only if it has a `names_argv`. Its `names_reset` directories are
 emptied before each cell, so the cell's `first` run includes building any index, and the
 timed runs show what a user sees from then on. mtseek's index cache lives in
-`results/cache/mtseek-names`, not in the user's own cache.
+`%TEMP%\mtseek-bench\mtseek-names`: not in the user's own cache, and not under any scope's
+root, where it would become part of the corpus being searched.
 
 ## Queries
 

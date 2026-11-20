@@ -88,6 +88,30 @@ gap is real and repeatable (M0 measured it too), but nobody has explained it yet
 thread count, rg's per-file work that mtseek skips, and build flags (mtseek is built with
 thin LTO and one codegen unit). The content target needs the trigram index (M2).
 
+### 2026-11-20, listing everything (`--names ""`)
+
+Listing every name used to build each full path and then sort them with `Path`'s
+component-by-component comparison. That took 9.1 s of search time for the 1.2M entries
+under `C:\Dev` (from `--stats`), slower than `rg --files`. Now entries are grouped by
+folder, each folder's names are sorted when the walk enters it, and a depth-first walk
+emits paths already in order:
+
+| `mtseek --names "" C:\Dev` | search time (`--stats`) |
+|---|---:|
+| before | 9,118 ms |
+| after | 696–905 ms |
+
+`cargo xtask bench --modes names` after the change, with a busier machine than the run
+above (rg medians 7.0–7.6 s instead of 4.3–5.3 s). Parity ✓ in every cell.
+
+| query | matching files | rg median | mtseek median | speedup |
+|---|---:|---:|---:|---:|
+| name-absent | 0 | 7.63 s | 227 ms | 34× |
+| name-rare | 7 | 7.39 s | 294 ms | 25× |
+| name-medium | 1,825 | 7.45 s | 316 ms | 24× |
+| name-common | 38,317 | 7.01 s | 329 ms | 21× |
+| name-all (new) | 1,060,855 | 7.49 s | 1.45 s | 5.2× |
+
 ### 2026-11-20, M1c: whole-drive index from raw MFT records (admin)
 
 Measured with `mtseek --names --stats` in an elevated terminal, since the benchmark harness

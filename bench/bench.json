@@ -38,7 +38,8 @@
     { "id": "name-absent", "pattern": "zq7xkvq9plmw",           "kind": "name", "note": "File-name search, no matches." },
     { "id": "name-rare",   "pattern": "paystack",               "kind": "name", "note": "File-name search: a handful of files. 'Where is that file?'" },
     { "id": "name-medium", "pattern": "controller",             "kind": "name", "note": "File-name search: thousands of files." },
-    { "id": "name-common", "pattern": ".json",                  "kind": "name", "note": "File-name search: tens of thousands of files. Output volume dominates." }
+    { "id": "name-common", "pattern": ".json",                  "kind": "name", "note": "File-name search: tens of thousands of files. Output volume dominates." },
+    { "id": "name-all",    "pattern": "",                       "kind": "name", "note": "Every name under the root (rg: --iglob **). A million results: listing and output cost only." }
   ],
 
   "contenders": {
@@ -65,8 +66,8 @@
         "scope:all": ["-uu"]
       },
       "names_argv": ["../target/release/mtseek.exe", "--names", "--", "{pattern}", "{root}"],
-      "names_env": { "MTSEEK_CACHE_DIR": "results/cache/mtseek-names" },
-      "names_reset": ["results/cache/mtseek-names"],
+      "names_env": { "MTSEEK_CACHE_DIR": "mtseek-names" },
+      "names_reset": ["mtseek-names"],
       "ok_codes": [0, 1],
       "note": "The tool we are building. Content modes: rg-compatible flags. Names mode: its cache is emptied before each cell, so `first` is a cold index build and the timed runs reuse the saved index."
     },
