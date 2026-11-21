@@ -71,6 +71,20 @@
       "ok_codes": [0, 1],
       "note": "The tool we are building. Content modes: rg-compatible flags. Names mode: its cache is emptied before each cell, so `first` is a cold index build and the timed runs reuse the saved index."
     },
+    "mtseek-index": {
+      "argv": ["../target/release/mtseek.exe", "--index", "{flags}", "--", "{pattern}", "{root}"],
+      "flags": {
+        "files": ["--files-with-matches"],
+        "lines": ["--line-number", "--no-heading", "--with-filename"],
+        "literal": ["--fixed-strings"],
+        "ignore_case": ["--ignore-case"],
+        "scope:all": ["-uu"]
+      },
+      "env": { "MTSEEK_CACHE_DIR": "mtseek-content" },
+      "reset": ["mtseek-content"],
+      "ok_codes": [0, 1],
+      "note": "mtseek through its content index (M2). The index is emptied before each cell, so `first` includes building it; the timed runs search the saved index without opening a user file."
+    },
     "csearch": {
       "argv": ["csearch", "{flags}", "{pattern}"],
       "flags": { "files": ["-l"], "lines": ["-n"], "ignore_case": ["-i"] },

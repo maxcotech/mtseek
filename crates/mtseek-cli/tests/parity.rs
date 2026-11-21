@@ -34,12 +34,19 @@ const QUERIES: &[(&str, &[&str])] = &[
 
 /// Files whose ripgrep output is not reproducible, so they are left out of the comparison.
 ///
-/// `binary-late.bin` (a match, then a NUL ~200 KiB later): when it has *just* been written,
-/// both `rg` and `mtseek` sometimes skip it entirely and sometimes report the match plus
-/// the binary warning, flipping between runs. Searched alone a moment later, rg is 20/20 stable.
-/// The likely cause is Windows Defender scanning the fresh file. mtseek's own handling of it is pinned by
-/// `mtseek-walk`'s `binary_after_match_reports_lines_and_offset` unit test.
+/// `binary-late.bin` (a match, then a NUL ~200 KiB later): `rg` sometimes skips it entirely
+/// and sometimes reports the match plus the binary warning, flipping between runs. Each rg
+/// thread reuses one searcher, whose line buffer grows to fit `long-line.txt` and is never
+/// shrunk. A thread that searched that file first reads the NUL in its first buffer fill
+/// and quits before searching the match (`grep-searcher`'s `ReadByLine::fill`). Searched
+/// alone, rg always reports the match. mtseek gives every such file a fresh buffer, so it
+/// always gives the searched-alone answer: pinned by `mtseek-walk`'s
+/// `a_long_line_earlier_does_not_hide_a_match_before_a_late_nul` and
+/// `binary_after_match_reports_lines_and_offset` unit tests.
 const UNSTABLE: &[&str] = &["binary-late.bin"];
+
+/// mtseek runs every case twice: scanning, and through the content index (`--index`).
+const MTSEEK_VARIANTS: &[&[&str]] = &[&[], &["--index"]];
 
 const SCOPES: &[&[&str]] = &[&[], &["-u"], &["-uu"]];
 const FILES_MODE: &[&str] = &["--files-with-matches"];
@@ -52,6 +59,7 @@ fn output_matches_ripgrep() {
     }
     let dir = tempfile::tempdir().unwrap();
     mtseek_testkit::generate(dir.path(), &CorpusSpec::default()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
 
     let mut failures = Vec::new();
     let mut cases = 0;
@@ -64,17 +72,21 @@ fn output_matches_ripgrep() {
                     .chain(mode)
                     .copied()
                     .collect();
-                let expected = run("rg", &["--no-config"], &flags, pattern, dir.path());
-                let actual = run(
-                    env!("CARGO_BIN_EXE_mtseek"),
-                    &[],
-                    &flags,
-                    pattern,
-                    dir.path(),
-                );
-                cases += 1;
-                if expected != actual {
-                    failures.push(describe(pattern, &flags, &expected, &actual));
+                let expected = run("rg", &["--no-config"], &flags, pattern, dir.path(), None);
+                for variant in MTSEEK_VARIANTS {
+                    let actual = run(
+                        env!("CARGO_BIN_EXE_mtseek"),
+                        variant,
+                        &flags,
+                        pattern,
+                        dir.path(),
+                        Some(cache.path()),
+                    );
+                    cases += 1;
+                    if expected != actual {
+                        let all_flags: Vec<&str> = variant.iter().chain(&flags).copied().collect();
+                        failures.push(describe(pattern, &all_flags, &expected, &actual));
+                    }
                 }
             }
         }
@@ -94,8 +106,19 @@ struct Outcome {
     lines: BTreeMap<Vec<u8>, usize>,
 }
 
-fn run(exe: &str, pre: &[&str], flags: &[&str], pattern: &str, root: &Path) -> Outcome {
-    let output = Command::new(exe)
+fn run(
+    exe: &str,
+    pre: &[&str],
+    flags: &[&str],
+    pattern: &str,
+    root: &Path,
+    cache: Option<&Path>,
+) -> Outcome {
+    let mut command = Command::new(exe);
+    if let Some(cache) = cache {
+        command.env("MTSEEK_CACHE_DIR", cache);
+    }
+    let output = command
         .args(pre)
         .args(flags)
         .arg("--")

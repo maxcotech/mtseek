@@ -146,20 +146,25 @@ class Contender:
             k: str(SCRATCH / v) for k, v in spec.get("names_env", {}).items()
         }
         self.names_reset: list[Path] = [SCRATCH / p for p in spec.get("names_reset", [])]
+        # The same two for the content modes (files, lines): an index-backed contender keeps
+        # its index in the scratch directory and has it emptied before each cell.
+        self.content_env: dict[str, str] = {
+            k: str(SCRATCH / v) for k, v in spec.get("env", {}).items()
+        }
+        self.content_reset: list[Path] = [SCRATCH / p for p in spec.get("reset", [])]
 
     def supports(self, mode: str) -> bool:
         return mode != "names" or self.names_argv is not None
 
     def env(self, mode: str) -> dict[str, str] | None:
-        if mode != "names" or not self.names_env:
+        extra = self.names_env if mode == "names" else self.content_env
+        if not extra:
             return None
-        return {**os.environ, **self.names_env}
+        return {**os.environ, **extra}
 
     def reset(self, mode: str) -> None:
         """Empties the contender's caches, so the cell's first run starts cold."""
-        if mode != "names":
-            return
-        for d in self.names_reset:
+        for d in self.names_reset if mode == "names" else self.content_reset:
             if d.resolve().is_relative_to(SCRATCH):  # never delete outside the scratch dir
                 shutil.rmtree(d, ignore_errors=True)
 

@@ -4,9 +4,11 @@
 in file names *and* file contents, in under 100 ms. Results are always up to date, and nothing
 rescans in the background.
 
-> **Status: pre-alpha (milestone M0, foundation).** The `mtseek` CLI works today and gives
-> ripgrep-identical results, but it still *scans*. That makes it as fast as ripgrep, not faster
-> yet. The index arrives in M2. See the [roadmap](#roadmap).
+> **Status: pre-alpha (milestone M2 in progress).** The `mtseek` CLI gives ripgrep-identical
+> results. File-name search (`--names`) is indexed and kept current. Content search scans by
+> default. With `--index` it answers from a content index, 5–18× faster than ripgrep on the
+> benchmark, but that index isn't yet updated when files change (M2b). See the
+> [roadmap](#roadmap).
 
 ## Why
 
@@ -30,12 +32,18 @@ mtseek -F "ConnectionString" C:\Dev        # same flags and output as ripgrep
 mtseek -l -i paystack C:\Dev               # files only, case-insensitive
 mtseek -uu "TODO\(\w+\)" C:\Dev            # include ignored + hidden files
 mtseek --names "paystack .cs" C:\Dev       # file names: every term must match
+mtseek --index -l -F Paystack C:\Dev       # contents, through the content index (preview)
 ```
 
 `--names` keeps its index in `%LOCALAPPDATA%\mtseek\cache` and updates it from the NTFS change
 journal on each run, so only the first run on a folder takes seconds. Run it once as administrator
 to index the whole drive from the master file table; later runs don't need admin.
 Deleting the cache is always safe.
+
+`--index` (preview) builds a content index of the folders and filters you search, in the same
+cache, on first use: about 2 s and 37 MB for a 15,000-file source tree. Later searches read the
+index instead of your files. Until M2b it shows files as they were when it was built, so run
+`--reindex` after changes.
 
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
 output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`
@@ -47,7 +55,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 |---|---|---|
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
 | M1 | Name engine: MFT + USN journal, instant file-name search | ✅ |
-| M2 | Content engine: trigram index + content store, under 100 ms | |
+| M2 | Content engine: trigram index + content store, under 100 ms | M2a ✅ (`--index`); M2b: live updates |
 | M3 | Background service, live updates, per-user access control | |
 | M4 | MCP server for AI agents, `--json` | |
 | M5 | Desktop app (GPUI): global-hotkey palette with preview | |
