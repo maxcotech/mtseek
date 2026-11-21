@@ -305,7 +305,7 @@ pub(crate) fn walk_tree(
             let rel = relative(entry.path, &walk_root, start);
             if entry.is_dir {
                 let listing = ntfs::list_dir(entry.path).unwrap_or_default();
-                let controls: Vec<Entry> = listing
+                let mut controls: Vec<Entry> = listing
                     .entries
                     .iter()
                     .filter(|e| ntfs::is_control(&e.name))
@@ -316,6 +316,13 @@ pub(crate) fn walk_tree(
                         flags: 0,
                     })
                     .collect();
+                if listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(".git"))
+                {
+                    controls.extend(git_info(entry.path, &rel, root_u32));
+                }
                 let mut found = lock(&found);
                 found.dirs.push(Entry {
                     frn: listing.frn,
@@ -351,6 +358,9 @@ pub(crate) fn walk_tree(
         },
     );
     let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if start.as_os_str().is_empty() {
+        found.controls.extend(above(root_path, root_u32));
+    }
     let walks: Vec<(u8, Listing)> = narrower(&scope.filter)
         .map(|bit| {
             let filter = membership::filter(bit);
@@ -359,6 +369,95 @@ pub(crate) fn walk_tree(
         .collect();
     mark(&mut found, &walks, within);
     found
+}
+
+/// The `.git\info` folder of the repository at `dir` (relative path `rel`) and its
+/// `exclude` file, as control entries: `exclude` holds ignore rules the walk honours.
+/// `.git` itself is not watched beyond its own entry, because git writes there constantly.
+pub(crate) fn git_info(dir: &Path, rel: &Path, root: u32) -> Vec<Entry> {
+    let info = rel.join(".git").join("info");
+    let Ok(listing) = ntfs::list_dir(&dir.join(".git").join("info")) else {
+        return Vec::new();
+    };
+    let mut out = vec![Entry {
+        frn: listing.frn,
+        root,
+        path: info.clone(),
+        flags: 0,
+    }];
+    out.extend(
+        listing
+            .entries
+            .iter()
+            .filter(|e| e.name.eq_ignore_ascii_case("exclude"))
+            .map(|e| Entry {
+                frn: e.frn,
+                root,
+                path: info.join(&e.name),
+                flags: 0,
+            }),
+    );
+    out
+}
+
+/// The folders above the root and their control files (and `.git\info` contents), as
+/// control entries whose paths start with `..`: the walk reads the ignore files of every
+/// folder above its root (ADR 0012).
+fn above(root_path: &Path, root: u32) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut rel = PathBuf::new();
+    for dir in root_path.ancestors().skip(1) {
+        rel.push("..");
+        let Ok(listing) = ntfs::list_dir(dir) else {
+            continue;
+        };
+        out.push(Entry {
+            frn: listing.frn,
+            root,
+            path: rel.clone(),
+            flags: 0,
+        });
+        for e in listing.entries.iter().filter(|e| ntfs::is_control(&e.name)) {
+            out.push(Entry {
+                frn: e.frn,
+                root,
+                path: rel.join(&e.name),
+                flags: 0,
+            });
+            if e.name.eq_ignore_ascii_case(".git") {
+                out.extend(git_info(dir, &rel, root));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a control entry's path is above the root (starts with `..`).
+pub(crate) fn is_above(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::ParentDir)
+    )
+}
+
+/// For a control entry inside a `.git\info` folder, or that folder itself: the folder of
+/// the repository it belongs to. `None` for other control entries.
+pub(crate) fn repo_of(path: &Path) -> Option<&Path> {
+    let names: Vec<&std::ffi::OsStr> = path.iter().collect();
+    let is = |i: usize, name: &str| {
+        names
+            .get(i)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    };
+    let n = names.len();
+    if n >= 2 && is(n - 2, ".git") && is(n - 1, "info") {
+        path.parent()?.parent()
+    } else if n >= 3 && is(n - 3, ".git") && is(n - 2, "info") {
+        path.parent()?.parent()?.parent()
+    } else {
+        None
+    }
 }
 
 /// The direct entries of directory `dir` (relative to root `root`) that ripgrep's walker

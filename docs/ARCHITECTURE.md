@@ -102,9 +102,12 @@ These are properties the code must keep. Each one has a test that enforces it.
    For the content index (M2b, ADR 0011): every search catches the index up from the change
    journal first. Enforced by `crates/mtseek-index/tests/live.rs`: random sequences of
    changes, after each of which the caught-up index must equal a fresh build. The CLI test
-   `tests/content_index.rs` checks the same end to end. Known gap: ignore rules outside the
-   walked folders (`.git/info/exclude`, global excludes) need `--reindex`. From M3 the
-   daemon's dirty set makes this immediate instead of per search.
+   `tests/content_index.rs` checks the same end to end. Since ADR 0012 `.git/info/exclude`
+   and the ignore files above an indexed folder are tracked too (an edit above the folder
+   rebuilds). Known gaps: git's global excludes file, a `.git/info` folder created after
+   the index was built, and repositories whose `.git` is a file (worktrees, submodules)
+   need `--reindex`. From M3 the daemon's dirty set makes catch-up immediate instead of per
+   search.
 4. **Crash-safe index.** Killing `mtseekd` at any instant leaves an index that opens and is correct.
    Commits are write-new-then-rename of a versioned manifest, with fsync.
 5. **No privilege leak.** (M3) A user never sees a path or a line from a file their own

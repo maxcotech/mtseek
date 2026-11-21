@@ -44,9 +44,9 @@ about 1.5 s and 38 MB for a 15,000-file source tree. From then on every content 
 those folders, or of any folder inside them, uses it, as long as its filters list no more
 files (`-uu` covers `-u`, `--hidden` and the defaults). Each run first applies what the change journal recorded since the
 last one (about 1 ms if nothing changed there, about 40 ms after an edit), then reads the
-index instead of your files. `--no-index` scans instead, `--reindex` rebuilds. Ignore rules
-outside the folders (`.git/info/exclude`, git's global excludes) only take effect after
-`--reindex`.
+index instead of your files. `--no-index` scans instead, `--reindex` rebuilds. Changes to
+`.gitignore`, `.ignore`, `.git/info/exclude` and ignore files in folders above are picked up
+too; git's global excludes file only takes effect after `--reindex`.
 
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
 output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`

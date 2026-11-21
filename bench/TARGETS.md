@@ -262,6 +262,11 @@ build, 5 runs after a warmup:
 
 The 25 ms includes opening the index (3.6 ms), catch-up (1.5 ms) and looking up the folder.
 
+**Ignore sources outside the walk** (`.git/info/exclude`, ignore files above the root) are
+tracked since the second M3a step. Catch-up with nothing relevant changed went from
+1.2–1.3 ms to **1.5–1.9 ms** on `C:\Dev` (7 runs, release build). The extra time decodes the
+control-file table to check the folders above the root.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

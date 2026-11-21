@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use mtseek_core::Scope;
 use mtseek_walk::Options;
 
-use crate::build::{Found, coverage, list_level, new_build_id, read_file, walk_tree};
+use crate::build::{
+    Found, coverage, is_above, list_level, new_build_id, read_file, repo_of, walk_tree,
+};
 use crate::{
     Checkpoint, Content, Doc, Entry, IndexError, Location, Meta, Segment, SegmentInfo, StoredError,
     WriteStats, membership, ntfs,
@@ -194,6 +196,11 @@ impl Index {
         if records.is_empty() {
             return Ok(CatchUp::Current { records: 0 });
         }
+        if self.above_changed(scope, &records)? {
+            return Ok(CatchUp::NeedsRebuild(
+                "an ignore file above the indexed folder changed",
+            ));
+        }
         // Most records are about the rest of the drive. Check cheaply before loading paths.
         if records.len() <= MAX_SKIPPED_RECORDS && !self.any_tracked(&records)? {
             return Ok(CatchUp::Current {
@@ -233,11 +240,88 @@ impl Index {
             tracked.extend((0..segment.len()).map(|id| segment.frn(id)));
         }
         tracked.extend(newest.dirs()?.into_iter().map(|e| e.frn));
-        tracked.extend(newest.controls()?.into_iter().map(|e| e.frn));
+        tracked.extend(
+            newest
+                .controls()?
+                .into_iter()
+                .filter(|e| !is_above(&e.path))
+                .map(|e| e.frn),
+        );
         tracked.remove(&0);
         Ok(records
             .iter()
             .any(|(frn, parent)| tracked.contains(frn) || tracked.contains(parent)))
+    }
+
+    /// Whether a record shows that an ignore source above the root changed (ADR 0012): an
+    /// ignore file there was edited, or a folder above the root (or its `.git\info`) now
+    /// holds other control files than when the index was built. Such a change can alter
+    /// every file's membership, so the caller rebuilds.
+    fn above_changed(&self, scope: &Scope, records: &[(u64, u64)]) -> Result<bool, IndexError> {
+        let above: Vec<Entry> = self
+            .newest()
+            .controls()?
+            .into_iter()
+            .filter(|e| is_above(&e.path))
+            .collect();
+        if above.is_empty() {
+            return Ok(false);
+        }
+        let files: HashSet<u64> = above
+            .iter()
+            .filter(|e| !is_folder_entry(&e.path) && e.frn != 0)
+            .map(|e| e.frn)
+            .collect();
+        let folders: HashMap<u64, &Entry> = above
+            .iter()
+            .filter(|e| is_folder_entry(&e.path) && e.frn != 0)
+            .map(|e| (e.frn, e))
+            .collect();
+        let mut check: Vec<&Entry> = Vec::new();
+        for (frn, parent) in records {
+            if files.contains(frn) {
+                return Ok(true);
+            }
+            if let Some(&folder) = folders.get(parent)
+                && !check.iter().any(|c| c.path == folder.path)
+            {
+                check.push(folder);
+            }
+        }
+        for folder in check {
+            let Some(real) = resolve_above(&scope.roots[folder.root as usize], &folder.path) else {
+                return Ok(true);
+            };
+            let in_info = repo_of(&folder.path).is_some();
+            let wanted = |name: &str| {
+                if in_info {
+                    name.eq_ignore_ascii_case("exclude")
+                } else {
+                    ntfs::is_control(name)
+                }
+            };
+            let Ok(listing) = ntfs::list_dir(&real) else {
+                return Ok(true);
+            };
+            let now: BTreeSet<(String, u64)> = listing
+                .entries
+                .iter()
+                .filter(|e| wanted(&e.name))
+                .map(|e| (e.name.to_ascii_lowercase(), e.frn))
+                .collect();
+            let recorded: BTreeSet<(String, u64)> = above
+                .iter()
+                .filter(|e| e.path.parent() == Some(folder.path.as_path()))
+                .filter_map(|e| {
+                    let name = e.path.file_name()?.to_str()?;
+                    wanted(name).then(|| (name.to_ascii_lowercase(), e.frn))
+                })
+                .collect();
+            if now != recorded {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn write_delta(
@@ -516,7 +600,19 @@ impl State {
         }
         let docs = by_frn(self.docs.iter().map(|(k, l)| (k, l.frn)));
         let dirs = by_frn(self.dirs.iter().map(|(k, &(f, _))| (k, f)));
-        let controls = by_frn(self.controls.iter().map(|(k, &f)| (k, f)));
+        let controls = by_frn(
+            self.controls
+                .iter()
+                .filter(|(k, _)| !is_above(&k.1))
+                .map(|(k, &f)| (k, f)),
+        );
+        // `.git\info` folders: anything created or renamed in one may be a new `exclude`.
+        let infos = by_frn(
+            self.controls
+                .iter()
+                .filter(|(k, _)| !is_above(&k.1) && is_folder_entry(&k.1))
+                .map(|(k, &f)| (k, f)),
+        );
         let mut work = Work::default();
         for &(frn, parent) in records {
             for key in dirs.get(&parent).into_iter().flatten() {
@@ -532,7 +628,10 @@ impl State {
                 }
             }
             for key in controls.get(&frn).into_iter().flatten() {
-                work.rewalk.insert(parent_of(key));
+                work.rewalk.insert(owner_of(key));
+            }
+            for key in infos.get(&parent).into_iter().flatten() {
+                work.rewalk.insert(owner_of(key));
             }
         }
         work
@@ -795,6 +894,37 @@ fn is_under(key: &Key, dir: &Key) -> bool {
     key.0 == dir.0 && key.1.starts_with(&*dir.1)
 }
 
+/// The folder whose walk a control entry affects: its repository for `.git\info` and
+/// `exclude`, else its parent.
+fn owner_of(k: &Key) -> Key {
+    match repo_of(&k.1) {
+        Some(repo) => key_of(k.0, repo),
+        None => parent_of(k),
+    }
+}
+
+/// Whether a control entry is a folder: one above the root (`..`, `..\..`) or a `.git\info`.
+fn is_folder_entry(path: &Path) -> bool {
+    matches!(
+        path.components().next_back(),
+        Some(std::path::Component::ParentDir)
+    ) || (repo_of(path).is_some()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("info")))
+}
+
+/// The real path of an entry above the root: `..\..\x` under `C:\a\b\c` is `C:\a\x`.
+fn resolve_above(root: &Path, path: &Path) -> Option<PathBuf> {
+    let up = path
+        .components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count();
+    let rest: PathBuf = path.components().skip(up).collect();
+    Some(root.ancestors().nth(up)?.join(rest))
+}
+
 fn parent_of(k: &Key) -> Key {
     make_key(k.0, k.1.parent().map(Path::to_path_buf).unwrap_or_default())
 }
@@ -810,5 +940,5 @@ fn children<'a, V>(
 ) -> impl Iterator<Item = (&'a Key, &'a V)> {
     map.range(dir.clone()..)
         .take_while(move |(k, _)| is_under(k, dir))
-        .filter(move |(k, _)| k.1.parent() == Some(&*dir.1))
+        .filter(move |(k, _)| k.1.parent() == Some(&*dir.1) && !is_above(&k.1))
 }
