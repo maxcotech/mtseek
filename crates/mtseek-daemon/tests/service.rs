@@ -143,11 +143,7 @@ fn programs(bin: &Path, mtseek: &Path) -> (PathBuf, PathBuf) {
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success());
-    if runs {
-        copies
-    } else {
-        (rg, copies.1)
-    }
+    if runs { copies } else { (rg, copies.1) }
 }
 
 /// The tree (everyone may read it, but one private file), the output folder (everyone may
