@@ -199,6 +199,17 @@ impl Segment {
         u64_at(self.doc(doc), 24)
     }
 
+    /// Which filters list `doc`, and whether its stored bytes were cut at a NUL
+    /// ([`crate::membership`]).
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn flags(&self, doc: u32) -> u8 {
+        // Checked when the segment was opened.
+        u8::try_from(u32_at(self.doc(doc), 32)).unwrap_or(0)
+    }
+
     /// The root `doc` was found under and its path relative to that root.
     ///
     /// # Panics
@@ -424,7 +435,7 @@ fn check_docs(
                 .get(b as usize)
                 .is_some_and(|&raw| u64::from(offset) + u64::from(len) <= u64::from(raw)),
         };
-        if !in_block || root >= roots {
+        if !in_block || root >= roots || u32_at(d, 32) > u32::from(u8::MAX) {
             return Err("file entry out of bounds");
         }
         let start = path_offset as usize;
@@ -467,6 +478,7 @@ fn parse_errors(mut bytes: &[u8], count: u32, roots: u32) -> Option<Vec<StoredEr
     let mut errors = Vec::new();
     for _ in 0..count {
         let root = u32_at(take(&mut bytes, 4)?, 0);
+        let flags = u8::try_from(u32_at(take(&mut bytes, 4)?, 0)).ok()?;
         let path_len = u32_at(take(&mut bytes, 4)?, 0);
         let path = format::decode_path(
             take(&mut bytes, (path_len & !UTF16_PATH) as usize)?,
@@ -484,6 +496,7 @@ fn parse_errors(mut bytes: &[u8], count: u32, roots: u32) -> Option<Vec<StoredEr
             root,
             path,
             message,
+            flags,
         });
     }
     bytes.is_empty().then_some(errors)

@@ -2,7 +2,9 @@
 //!
 //! 1. [`plan()`] turns the pattern into a trigram query.
 //! 2. The query runs against the postings of each layer of the index (base and delta);
-//!    base files the delta replaced are skipped. The result is the candidate files.
+//!    base files the delta replaced are skipped, and so are files outside the searched
+//!    folder or not listed by the search's filter (ADR 0012). The result is the candidate
+//!    files.
 //! 3. Each candidate's stored bytes are searched by the reference scanner's own
 //!    [`FileSearcher`], so what matches, and how lines and binary files are reported, is
 //!    exactly what `mtseek-walk` (and ripgrep) would report.
@@ -13,12 +15,12 @@ mod plan;
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use mtseek_core::{Error, Query, Result, Scope};
-use mtseek_index::{Index, IndexError, Location, Segment};
+use mtseek_core::{Error, Filter, Query, Result};
+use mtseek_index::{Index, IndexError, Location, Segment, membership};
 use mtseek_walk::{FileHit, FileSearcher, Mode, Options, Summary};
 
 pub use plan::{Plan, plan};
@@ -34,19 +36,30 @@ pub struct SearchStats {
     pub blocks: u64,
 }
 
-/// Searches the files of `index` for `query`, the way [`mtseek_walk::scan`] searches the
-/// files of `scope`.
-///
-/// `scope` must be the scope the index was built for (same roots in the same order, same
-/// filter; compare [`mtseek_index::scope_key`] with [`Segment::key`]). Paths are reported
-/// joined onto `scope.roots` as given, exactly like the scanner reports them.
+/// What a search of an index looks at (ADR 0012).
+#[derive(Debug, Clone, Copy)]
+pub struct Target<'a> {
+    /// The search root as the user gave it. Results are joined onto it, exactly as the
+    /// scanner would join them.
+    pub root: &'a Path,
+    /// The folder of the index that `root` names, relative to the index's root: empty for the
+    /// root itself. The walk that built the index must enter it with the search's filter
+    /// ([`Index::entered`]).
+    pub dir: &'a Path,
+    /// The search's filter. It must list no more than the index's coverage filter does
+    /// ([`membership::covered`]) and must not follow links.
+    pub filter: Filter,
+}
+
+/// Searches the files of `index` under `target` for `query`, the way [`mtseek_walk::scan`]
+/// searches a scope with root `target.root` and filter `target.filter`.
 ///
 /// Files that couldn't be read are reported to `on_error`. An error reading the index
 /// itself ends the search with that error: the caller should rebuild the index or fall back
 /// to scanning.
 pub fn search(
     index: &Index,
-    scope: &Scope,
+    target: Target<'_>,
     query: &Query,
     mode: Mode,
     options: Options,
@@ -54,31 +67,49 @@ pub fn search(
     on_error: &(dyn Fn(&Error) + Sync),
 ) -> Result<(Summary, SearchStats)> {
     let matcher = mtseek_walk::build_matcher(query)?;
-    if index.base().roots() != scope.roots.len() {
+    if index.base().roots() != 1 {
         return Err(Error::Io {
-            path: scope.roots.first().cloned().unwrap_or_default(),
+            path: target.root.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "the content index was built for different roots",
+                "a content index covers one root",
             ),
         });
     }
+    let bit = membership::bit(&target.filter);
     let plan = plan::plan(query);
     let layers = index.layers();
     let mut per_layer = Vec::with_capacity(layers.len());
     for &(segment, skip) in &layers {
-        let found = match candidates(&plan, segment)? {
-            Some(list) => list,
-            None => (0..segment.len()).collect(),
+        let (lo, hi) = range_under(segment, target.dir);
+        let mut found: Vec<u32> = match candidates(&plan, segment)? {
+            Some(list) => list.into_iter().filter(|&d| d >= lo && d < hi).collect(),
+            None => (lo..hi).collect(),
         };
-        per_layer.push(difference(&found, skip));
+        if target.filter.include_binary {
+            // The trigrams of a cut file stop at its first NUL, but binary mode reads on: it
+            // is a candidate whatever the plan says, and is read from disk.
+            let cut: Vec<u32> = (lo..hi)
+                .filter(|&d| segment.flags(d) & membership::TRUNCATED != 0)
+                .collect();
+            found = union(&found, &cut);
+        }
+        let mut found = difference(&found, skip);
+        found.retain(|&d| segment.flags(d) & bit != 0);
+        per_layer.push(found);
     }
     let candidates: u64 = per_layer.iter().map(|c| c.len() as u64).sum();
 
     let errors = AtomicU64::new(0);
     for stored in index.errors() {
+        if stored.flags & bit == 0 {
+            continue;
+        }
         let path = match stored.root {
-            Some(root) => scope.roots[root as usize].join(&stored.path),
+            Some(_) => match stored.path.strip_prefix(target.dir) {
+                Ok(rest) => target.root.join(rest),
+                Err(_) => continue,
+            },
             None => stored.path.clone(),
         };
         errors.fetch_add(1, Ordering::Relaxed);
@@ -101,7 +132,7 @@ pub fn search(
             threads_scope.spawn(|| {
                 let worker = Worker {
                     layers: &layers,
-                    scope,
+                    target,
                     on_hit,
                     on_error,
                     stop: &stop,
@@ -178,7 +209,7 @@ struct Work<'a> {
 
 struct Worker<'a> {
     layers: &'a [(&'a Segment, &'a [u32])],
-    scope: &'a Scope,
+    target: Target<'a>,
     on_hit: &'a (dyn Fn(&FileHit<'_>) -> ControlFlow<()> + Sync),
     on_error: &'a (dyn Fn(&Error) + Sync),
     stop: &'a AtomicBool,
@@ -199,7 +230,11 @@ impl Worker<'_> {
         for (segment, _) in self.layers {
             readers.push(segment.block_reader()?);
         }
-        let mut searcher = FileSearcher::new(self.scope.filter, mode);
+        let mut searcher = FileSearcher::new(self.target.filter, mode);
+        // In binary mode ripgrep reads past the first NUL, which the store cut off.
+        let from_disk = |doc: u32, segment: &Segment| {
+            self.target.filter.include_binary && segment.flags(doc) & membership::TRUNCATED != 0
+        };
         while !self.stop.load(Ordering::Relaxed) {
             let Some(&item) = work.get(next.fetch_add(1, Ordering::Relaxed)) else {
                 break;
@@ -213,9 +248,13 @@ impl Worker<'_> {
                 None => &[],
             };
             for &doc in item.docs {
-                let (root, relative) = segment.path(doc);
-                let path = self.scope.roots[root].join(relative);
+                let (_, relative) = segment.path(doc);
+                let path = match relative.strip_prefix(self.target.dir) {
+                    Ok(rest) => self.target.root.join(rest),
+                    Err(_) => continue, // outside the folder: excluded by the range already
+                };
                 let found = match segment.location(doc) {
+                    _ if from_disk(doc, segment) => searcher.search_path(matcher, &path),
                     Location::Block { offset, len, .. } => {
                         let bytes = &raw[offset as usize..(offset + len) as usize];
                         searcher.search_bytes(matcher, bytes)
@@ -246,6 +285,30 @@ impl Worker<'_> {
         }
         Ok(())
     }
+}
+
+/// The files of `segment` under folder `dir` (relative to its root): a range of ids, because
+/// files are sorted by path and a folder's files are contiguous in that order.
+fn range_under(segment: &Segment, dir: &Path) -> (u32, u32) {
+    if dir.as_os_str().is_empty() {
+        return (0, segment.len());
+    }
+    let first = |pred: &dyn Fn(&Path) -> bool| -> u32 {
+        // The first id for which `pred` is false; `pred` holds for a prefix of the ids.
+        let (mut lo, mut hi) = (0u32, segment.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pred(&segment.path(mid).1) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    let lo = first(&|p| p < dir);
+    let hi = first(&|p| p < dir || p.starts_with(dir));
+    (lo, hi)
 }
 
 /// `a` without the elements of `b` (both increasing).
@@ -370,18 +433,6 @@ fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
     out
-}
-
-/// Where the segment for `scope` lives in `cache_dir`, and the key it must carry.
-pub fn segment_path(
-    cache_dir: &std::path::Path,
-    scope: &Scope,
-) -> std::io::Result<(PathBuf, String)> {
-    let key = mtseek_index::scope_key(scope)?;
-    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    Ok((cache_dir.join(format!("content-{hash:016x}.idx")), key))
 }
 
 #[cfg(test)]

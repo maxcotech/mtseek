@@ -3,6 +3,12 @@
 use std::borrow::Cow;
 use std::io::Read;
 
+/// Whether `stored` bytes were cut at a NUL by [`stored_len`] (or the file's only NUL is its
+/// last byte): ripgrep in binary mode would read past it.
+pub fn is_cut(stored: &[u8]) -> bool {
+    !has_utf16_bom(stored) && memchr_nul(stored).is_some()
+}
+
 /// How many leading bytes of `bytes` must be stored for the search to behave exactly as
 /// it does on the whole file.
 ///

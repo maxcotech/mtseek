@@ -41,7 +41,8 @@ Deleting the cache is always safe.
 
 `--index` builds a content index of the folders and filters you search, in the same cache:
 about 1.5 s and 38 MB for a 15,000-file source tree. From then on every content search of
-those folders uses it. Each run first applies what the change journal recorded since the
+those folders, or of any folder inside them, uses it, as long as its filters list no more
+files (`-uu` covers `-u`, `--hidden` and the defaults). Each run first applies what the change journal recorded since the
 last one (about 1 ms if nothing changed there, about 40 ms after an edit), then reads the
 index instead of your files. `--no-index` scans instead, `--reindex` rebuilds. Ignore rules
 outside the folders (`.git/info/exclude`, git's global excludes) only take effect after

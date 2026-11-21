@@ -59,13 +59,13 @@ Crates land with the milestone that needs them. There are no empty placeholder c
 |---|---|---|
 | `mtseek-core` | M0 ✅ | Shared vocabulary: `Query`, `Scope`, `Filter`, `Error`. No I/O. |
 | `mtseek-walk` | M0 ✅ | The **reference scanner**: walks a scope and searches every file with ripgrep-identical semantics. Used as the test oracle, as the fallback for non-NTFS volumes and index-hostile patterns, and to search the dirty set. Its `list` (the scope's files and directories) and `FileSearcher` (one file's search) are what the content index builds from and verifies with. |
-| `mtseek-cli` | M0 ✅ | The `mtseek` binary. ripgrep's flags and output format (ADR 0005). Talks to `mtseekd` from M3 on. Until then it searches a scope's content index when it has one (built with `--index`, caught up on every run), and scans otherwise. |
+| `mtseek-cli` | M0 ✅ | The `mtseek` binary. ripgrep's flags and output format (ADR 0005). Talks to `mtseekd` from M3 on. Until then it searches through the content index of a covering folder when one can answer exactly (ADR 0012: registered with `--index`, caught up on every run), and scans the rest. |
 | `mtseek-testkit` | M0 ✅ | Deterministic synthetic corpora full of edge cases. |
 | `xtask` | M0 ✅ | `cargo xtask ci / bench / corpus / fmt`. |
 | `mtseek-ntfs` | M1 ✅ | Raw MFT record reading with every hard link (ADR 0009) and MFT enumeration as its fallback, both needing admin; unprivileged USN journal reads through a directory handle, directory listings with file reference numbers, long paths. Safe parsers for every buffer format, property-tested against random and malformed input. **The only crate allowed `unsafe`**, confined to `src/sys.rs`. |
 | `mtseek-names` | M1 ✅ | File-name index: flat name arenas + parent links, parallel SIMD substring scan (ADR 0007). Built from the MFT or by a parallel directory walk; saved as a snapshot and caught up from the USN journal by re-listing changed directories (ADR 0008). |
-| `mtseek-index` | M2 ✅ | Segment file (ADR 0010): trigram dictionary, delta-varint postings, document table, zstd content store of raw file bytes cut where ripgrep stops reading. Built from a scope's file list; opened with every section bounds-checked. Kept current (ADR 0011): file, folder and control-file reference numbers plus journal checkpoints in the segment, catch-up by re-listing dirty folders into a delta segment over the immutable base, rebuild when the delta grows past 1/8 of the base. |
-| `mtseek-query` | M2 ✅ | Regex → trigram plan (`regex-syntax` HIR, Russ Cox's analysis), posting-list execution, verification of candidates with `mtseek-walk`'s `FileSearcher` on stored bytes. |
+| `mtseek-index` | M2 ✅ | Segment file (ADR 0010): trigram dictionary, delta-varint postings, document table, zstd content store of raw file bytes cut where ripgrep stops reading. Built from a scope's file list; opened with every section bounds-checked. Kept current (ADR 0011): file, folder and control-file reference numbers plus journal checkpoints in the segment, catch-up by re-listing dirty folders into a delta segment over the immutable base, rebuild when the delta grows past 1/8 of the base. Coverage (ADR 0012): each file, folder and error records which of the four ignore/hidden filter combinations would list it, so one index answers its subfolders and every narrower filter; files cut at a NUL are flagged for binary-mode searches. |
+| `mtseek-query` | M2 ✅ | Regex → trigram plan (`regex-syntax` HIR, Russ Cox's analysis), posting-list execution limited to the searched folder and filter, verification of candidates with `mtseek-walk`'s `FileSearcher` on stored bytes. |
 | `mtseek-ipc` | M3 | JSON-RPC protocol types + versioning, shared by every client. |
 | `mtseekd` | M3 | Service host, scheduler, IPC server, ACL enforcement. |
 | `mtseek-mcp` | M4 | MCP server for AI agents. |
@@ -94,7 +94,10 @@ These are properties the code must keep. Each one has a test that enforces it.
    `crates/mtseek-query/tests/oracle.rs` (random corpora with BOMs, NULs and non-ASCII case
    variants, random regexes, every filter level, plus the edge-case corpus) and by the parity
    test, which runs every case through `--index` too. The planner may only over-approximate;
-   anything it can't analyse plans "all files".
+   anything it can't analyse plans "all files". Since ADR 0012 the oracle also searches
+   subfolders of the index with every filter it covers, and
+   `subfolder_searches_through_a_parent_index_match_ripgrep` checks the same against `rg`.
+   Both rest on the subtree rule, enforced by `crates/mtseek-walk/tests/subtree.rs`.
 3. **No stale results.** A file saved before a query starts is searched as saved.
    For the content index (M2b, ADR 0011): every search catches the index up from the change
    journal first. Enforced by `crates/mtseek-index/tests/live.rs`: random sequences of
@@ -131,7 +134,7 @@ These are properties the code must keep. Each one has a test that enforces it.
 | **M0** | Foundation | Workspace, CI, xtask, ADRs, benchmark harness with ripgrep baseline, parity test passing. |
 | **M1** | Name engine | `mtseek --names` from MFT or parallel walk; index persisted between runs and caught up from the USN journal without admin (ADR 0008). Whole-drive indexes list every hard link from raw MFT records (M1c, ADR 0009). |
 | M2 | Content engine | Trigram index + content store; `dev` scope queries under 100 ms with parity. M2a (ADR 0010): index built with `--index`, parity in every benchmark cell. M2b (ADR 0011): caught up from the USN journal on every search, used automatically once a scope has one. 12 of 16 `dev` cells under 100 ms; the rest are output volume, the no-literal regex and noise (`bench/TARGETS.md`). |
-| M3 | Daemon | Service, IPC, ACL filtering, dirty set, admin-free fallback mode. |
+| M3 | Daemon | Service, IPC, ACL filtering, dirty set, admin-free fallback mode. M3a so far: coverage roots (ADR 0012) in the CLI's direct mode. |
 | M4 | Agents | MCP server, `--json`, docs/mcp.md; Claude Code uses it end to end. |
 | M5 | Desktop app | GPUI palette, preview, settings, onboarding, tray. Preceded by a GPUI spike. |
 | M6 | Ship | Signed MSI, winget, auto-update, docs site. |

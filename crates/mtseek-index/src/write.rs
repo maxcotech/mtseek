@@ -19,6 +19,9 @@ pub struct Doc {
     pub path: PathBuf,
     /// Its NTFS file reference number, or 0 if unknown (ADR 0011).
     pub frn: u64,
+    /// The filters whose walk lists it ([`crate::membership`]). The writer sets
+    /// [`crate::membership::TRUNCATED`] itself, from the content.
+    pub flags: u8,
     /// What the index holds for it.
     pub content: Content,
 }
@@ -62,6 +65,8 @@ pub struct StoredError {
     pub path: PathBuf,
     /// The error message.
     pub message: String,
+    /// The filters whose walk reports it ([`crate::membership`]).
+    pub flags: u8,
 }
 
 /// Sizes of a written segment.
@@ -289,6 +294,16 @@ fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
     };
     let mut current = Vec::new();
     for doc in docs.iter_mut() {
+        let truncated = match &doc.content {
+            Content::Stored(bytes) => text::is_cut(bytes),
+            Content::External => false,
+        };
+        let flags = (doc.flags & !crate::membership::TRUNCATED)
+            | if truncated {
+                crate::membership::TRUNCATED
+            } else {
+                0
+            };
         let (block, offset, len) = match &mut doc.content {
             Content::External => {
                 packed.external += 1;
@@ -331,6 +346,9 @@ fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
             packed.docs.extend_from_slice(&field.to_le_bytes());
         }
         packed.docs.extend_from_slice(&doc.frn.to_le_bytes());
+        packed
+            .docs
+            .extend_from_slice(&u32::from(flags).to_le_bytes());
     }
     if !current.is_empty() {
         packed.blocks.push(current);
@@ -377,6 +395,7 @@ fn error_records(errors: &[StoredError]) -> Vec<u8> {
         let message = error.message.as_bytes();
         let message_len = u32::try_from(message.len()).unwrap_or(0);
         out.extend_from_slice(&error.root.unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&u32::from(error.flags).to_le_bytes());
         out.extend_from_slice(&(path_len | if utf16 { UTF16_PATH } else { 0 }).to_le_bytes());
         out.extend_from_slice(&path[..path_len as usize]);
         out.extend_from_slice(&message_len.to_le_bytes());

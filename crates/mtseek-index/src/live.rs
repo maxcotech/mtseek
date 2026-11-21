@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use mtseek_core::Scope;
 use mtseek_walk::Options;
 
-use crate::build::{Found, list_level, new_build_id, read_file, walk_tree};
+use crate::build::{Found, coverage, list_level, new_build_id, read_file, walk_tree};
 use crate::{
     Checkpoint, Content, Doc, Entry, IndexError, Location, Meta, Segment, SegmentInfo, StoredError,
-    WriteStats, ntfs,
+    WriteStats, membership, ntfs,
 };
 
 /// A delta holding more files than this (or 1/8 of the base, if more) is folded into a
@@ -134,6 +134,29 @@ impl Index {
         self.layers().iter().map(|(s, _)| s.file_bytes()).sum()
     }
 
+    /// The membership bits of folder `dir` (relative to the root): which filters' walks enter
+    /// it. `None` if the walk that built the index doesn't enter it (ADR 0012).
+    pub fn entered(&self, dir: &Path) -> Result<Option<u8>, IndexError> {
+        if dir.as_os_str().is_empty() {
+            return Ok(Some(membership::covered(&self.coverage())));
+        }
+        Ok(self
+            .newest()
+            .dirs()?
+            .into_iter()
+            .find(|e| e.root == 0 && e.path == dir)
+            .map(|e| e.flags))
+    }
+
+    /// The coverage filter the index was built with, read from its key.
+    pub fn coverage(&self) -> mtseek_core::Filter {
+        let key = self.base.key();
+        let mut filter = mtseek_core::Filter::unrestricted(0);
+        filter.respect_ignore_files = !key.contains("ignore files=false");
+        filter.include_hidden = key.contains("hidden=true");
+        filter
+    }
+
     fn newest(&self) -> &Segment {
         self.delta.as_ref().unwrap_or(&self.base)
     }
@@ -145,6 +168,10 @@ impl Index {
         if scope.filter.follow_links {
             return Ok(CatchUp::NeedsRebuild("the scope follows links"));
         }
+        let scope = &Scope {
+            roots: scope.roots.clone(),
+            filter: coverage(scope.filter),
+        };
         let meta = self.meta().clone();
         if meta.checkpoints.is_empty() {
             return Ok(CatchUp::NeedsRebuild("no change journal"));
@@ -248,6 +275,7 @@ impl Index {
                 root,
                 path,
                 frn: live.frn,
+                flags: live.flags,
                 content,
             });
         }
@@ -257,13 +285,26 @@ impl Index {
             .filter(|&(_, &kept)| !kept)
             .map(|(id, _)| id)
             .collect();
-        let entries = |map: BTreeMap<Key, u64>| -> Vec<Entry> {
-            map.into_iter()
-                .map(|((root, SortPath { path, .. }), frn)| Entry { frn, root, path })
-                .collect()
-        };
-        let dirs = entries(state.dirs);
-        let controls = entries(state.controls);
+        let dirs: Vec<Entry> = state
+            .dirs
+            .into_iter()
+            .map(|((root, SortPath { path, .. }), (frn, flags))| Entry {
+                frn,
+                root,
+                path,
+                flags,
+            })
+            .collect();
+        let controls: Vec<Entry> = state
+            .controls
+            .into_iter()
+            .map(|((root, SortPath { path, .. }), frn)| Entry {
+                frn,
+                root,
+                path,
+                flags: 0,
+            })
+            .collect();
         let meta = Meta {
             build_id: new_build_id(),
             base_id: self.base.meta().build_id,
@@ -311,6 +352,8 @@ enum Source {
 #[derive(Debug)]
 struct Live {
     frn: u64,
+    /// Membership bits ([`membership::FILTERS`] only).
+    flags: u8,
     source: Source,
 }
 
@@ -380,10 +423,11 @@ fn make_key(root: u32, path: PathBuf) -> Key {
     (root, SortPath::new(path))
 }
 
-/// The index as an editable set of files, directories, control files and errors.
+/// The index as an editable set of files, directories (FRN and membership bits), control
+/// files and errors.
 struct State {
     docs: BTreeMap<Key, Live>,
-    dirs: BTreeMap<Key, u64>,
+    dirs: BTreeMap<Key, (u64, u8)>,
     controls: BTreeMap<Key, u64>,
     errors: Vec<StoredError>,
 }
@@ -426,6 +470,7 @@ impl State {
                     make_key(root, path),
                     Live {
                         frn: segment.frn(id),
+                        flags: segment.flags(id) & membership::FILTERS,
                         source,
                     },
                 ));
@@ -435,16 +480,18 @@ impl State {
         docs.sort_by(|a, b| a.0.cmp(&b.0));
         let docs: BTreeMap<Key, Live> = docs.into_iter().collect();
         let newest = index.newest();
-        let map = |entries: Vec<Entry>| -> BTreeMap<Key, u64> {
-            entries
-                .into_iter()
-                .map(|e| (make_key(e.root, e.path), e.frn))
-                .collect()
-        };
         Ok(Self {
             docs,
-            dirs: map(newest.dirs()?),
-            controls: map(newest.controls()?),
+            dirs: newest
+                .dirs()?
+                .into_iter()
+                .map(|e| (make_key(e.root, e.path), (e.frn, e.flags)))
+                .collect(),
+            controls: newest
+                .controls()?
+                .into_iter()
+                .map(|e| (make_key(e.root, e.path), e.frn))
+                .collect(),
             errors: newest.errors().to_vec(),
         })
     }
@@ -468,7 +515,7 @@ impl State {
             map
         }
         let docs = by_frn(self.docs.iter().map(|(k, l)| (k, l.frn)));
-        let dirs = by_frn(self.dirs.iter().map(|(k, &f)| (k, f)));
+        let dirs = by_frn(self.dirs.iter().map(|(k, &(f, _))| (k, f)));
         let controls = by_frn(self.controls.iter().map(|(k, &f)| (k, f)));
         let mut work = Work::default();
         for &(frn, parent) in records {
@@ -506,8 +553,12 @@ impl State {
         } = work;
         let mut walked: Vec<Key> = Vec::new();
         for key in &rewalk {
-            if !walked.iter().any(|w| is_under(key, w)) {
-                self.rewalk(scope, options, key, stats);
+            if walked.iter().any(|w| is_under(key, w)) {
+                continue;
+            }
+            // A folder the index doesn't hold is settled by its parent's re-listing.
+            if let Some(&(_, within)) = self.dirs.get(key) {
+                self.rewalk(scope, options, key, within, stats);
                 walked.push(key.clone());
             }
         }
@@ -551,6 +602,9 @@ impl State {
     ) -> Relisted {
         let (root, dir) = key;
         let full = scope.roots[*root as usize].join(dir);
+        let Some(&(frn_before, within)) = self.dirs.get(key) else {
+            return Relisted::Done;
+        };
         let Ok(listing) = ntfs::list_dir(&full) else {
             self.remove_under(key);
             return Relisted::Gone;
@@ -566,8 +620,8 @@ impl State {
         let controls_before: BTreeMap<Key, u64> = children(&self.controls, key)
             .map(|(k, &f)| (k.clone(), f))
             .collect();
-        if self.dirs.get(key) != Some(&listing.frn) || controls_now != controls_before {
-            self.rewalk(scope, options, key, stats);
+        if frn_before != listing.frn || controls_now != controls_before {
+            self.rewalk(scope, options, key, within, stats);
             return Relisted::Walked;
         }
         let frns: HashMap<&str, u64> = listing
@@ -581,20 +635,22 @@ impl State {
                 .and_then(|n| frns.get(n).copied())
                 .unwrap_or(0)
         };
-        let level = list_level(scope, *root as usize, dir);
+        let level = list_level(scope, *root as usize, dir, within);
 
         self.refresh_files(scope, key, &level.files, &frn_of, changed, stats);
+        let listed_files: HashSet<&PathBuf> = level.files.iter().map(|(p, _)| p).collect();
         self.errors.retain(|e| {
             !(e.root == Some(*root)
                 && (e.path == dir.path
                     || (e.path.parent() == Some(&**dir)
                         && !self.dirs.contains_key(&key_of(*root, &e.path))
-                        && !level.files.contains(&e.path))))
+                        && !listed_files.contains(&e.path))))
         });
         self.errors.extend(level.errors);
 
-        // Subdirectories: walk the new or replaced, drop the vanished.
-        let listed_dirs: HashSet<&PathBuf> = level.dirs.iter().collect();
+        // Subdirectories: walk the new, the replaced and those whose membership changed (it
+        // changes for everything under them); drop the vanished.
+        let listed_dirs: HashSet<&PathBuf> = level.dirs.iter().map(|(p, _)| p).collect();
         let vanished: Vec<Key> = children(&self.dirs, key)
             .filter(|(k, _)| !listed_dirs.contains(&k.1.path))
             .map(|(k, _)| k.clone())
@@ -602,11 +658,11 @@ impl State {
         for k in vanished {
             self.remove_under(&k);
         }
-        for path in &level.dirs {
+        for (path, flags) in &level.dirs {
             let sub = key_of(*root, path);
             let frn = frn_of(path);
-            if frn == 0 || self.dirs.get(&sub) != Some(&frn) {
-                self.rewalk(scope, options, &sub, stats);
+            if frn == 0 || self.dirs.get(&sub) != Some(&(frn, *flags)) {
+                self.rewalk(scope, options, &sub, *flags, stats);
             }
         }
         Relisted::Done
@@ -618,13 +674,13 @@ impl State {
         &mut self,
         scope: &Scope,
         key: &Key,
-        listed: &[PathBuf],
+        listed: &[(PathBuf, u8)],
         frn_of: &dyn Fn(&Path) -> u64,
         changed: &HashSet<u64>,
         stats: &mut Stats,
     ) {
         let root = &key.0;
-        let wanted: HashSet<&PathBuf> = listed.iter().collect();
+        let wanted: HashSet<&PathBuf> = listed.iter().map(|(p, _)| p).collect();
         let gone: Vec<Key> = children(&self.docs, key)
             .filter(|(k, _)| !wanted.contains(&k.1.path))
             .map(|(k, _)| k.clone())
@@ -635,13 +691,13 @@ impl State {
         // Errors about these files are recomputed below.
         self.errors
             .retain(|e| !(e.root == Some(*root) && wanted.contains(&e.path)));
-        for path in listed {
+        for (path, flags) in listed {
+            let flags = *flags;
             let frn = frn_of(path);
             let doc_key = key_of(*root, path);
-            let unchanged = self
-                .docs
-                .get(&doc_key)
-                .is_some_and(|l| frn != 0 && l.frn == frn && !changed.contains(&frn));
+            let unchanged = self.docs.get(&doc_key).is_some_and(|l| {
+                frn != 0 && l.frn == frn && l.flags == flags && !changed.contains(&frn)
+            });
             if unchanged {
                 continue;
             }
@@ -653,6 +709,7 @@ impl State {
                         doc_key,
                         Live {
                             frn,
+                            flags,
                             source: Source::New(content),
                         },
                     );
@@ -663,33 +720,43 @@ impl State {
                         root: Some(*root),
                         path: path.clone(),
                         message: e.to_string(),
+                        flags,
                     });
                 }
             }
         }
     }
 
-    /// Drops everything under directory `key` and walks it again.
-    fn rewalk(&mut self, scope: &Scope, options: Options, key: &Key, stats: &mut Stats) {
+    /// Drops everything under directory `key` and walks it again. `within` is the membership
+    /// of `key` itself.
+    fn rewalk(
+        &mut self,
+        scope: &Scope,
+        options: Options,
+        key: &Key,
+        within: u8,
+        stats: &mut Stats,
+    ) {
         self.remove_under(key);
         let (root, dir) = key;
         if !scope.roots[*root as usize].join(dir).is_dir() {
             return; // gone: its parent's re-listing (it is dirty too) settles the rest
         }
         stats.walked += 1;
-        let found: Found = walk_tree(scope, *root as usize, dir, options);
+        let found: Found = walk_tree(scope, *root as usize, dir, within, options);
         stats.read += found.docs.len();
         for doc in found.docs {
             self.docs.insert(
                 make_key(doc.root, doc.path),
                 Live {
                     frn: doc.frn,
+                    flags: doc.flags,
                     source: Source::New(doc.content),
                 },
             );
         }
         for e in found.dirs {
-            self.dirs.insert(make_key(e.root, e.path), e.frn);
+            self.dirs.insert(make_key(e.root, e.path), (e.frn, e.flags));
         }
         for e in found.controls {
             self.controls.insert(make_key(e.root, e.path), e.frn);

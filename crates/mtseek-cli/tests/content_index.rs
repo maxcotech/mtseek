@@ -84,3 +84,49 @@ fn an_indexed_scope_is_searched_through_its_index_and_stays_current() {
     let (code, names, _) = mtseek(cache.path(), &[], root);
     assert_eq!((code, names), (Some(1), Vec::<String>::new()));
 }
+
+/// ADR 0012: one index answers searches of its subfolders, other spellings of its paths and
+/// narrower filters. Folders its walk skips, and searches that follow links, are scanned.
+#[test]
+fn a_covering_index_answers_subfolders_spellings_and_narrower_filters() {
+    let tree = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("temp dir");
+    let root = tree.path();
+    for dir in ["a", ".hid", "node"] {
+        fs::create_dir(root.join(dir)).expect("mkdir");
+        fs::write(root.join(dir).join("n.txt"), "needle\n").expect("write");
+    }
+    fs::create_dir(root.join(".git")).expect("mkdir");
+    fs::write(root.join(".gitignore"), "node/\n").expect("write");
+    let used = |stderr: &str| stderr.contains("candidates");
+
+    let (code, names, stderr) = mtseek(cache.path(), &["--index", "-uu"], root);
+    assert_eq!(code, Some(0));
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(stderr.contains("built"), "{stderr}");
+
+    // A subfolder, typed in another case: answered from the index, printed as typed.
+    let upper = std::path::PathBuf::from(root.join("a").to_string_lossy().to_uppercase());
+    let (code, names, stderr) = mtseek(cache.path(), &[], &upper);
+    assert_eq!((code, names), (Some(0), vec!["n.txt".to_owned()]));
+    assert!(used(&stderr), "{stderr}");
+
+    // Narrower filters: the defaults skip the hidden folder and the ignored one.
+    let (_, names, stderr) = mtseek(cache.path(), &[], root);
+    assert_eq!(names, vec![format!("a{}n.txt", std::path::MAIN_SEPARATOR)]);
+    assert!(used(&stderr) && !stderr.contains("built"), "{stderr}");
+
+    // An ignored folder searched by name is searched, like rg does, by scanning it.
+    let (_, names, stderr) = mtseek(cache.path(), &[], &root.join("node"));
+    assert_eq!(names, vec!["n.txt".to_owned()]);
+    assert!(stderr.contains("scanned instead"), "{stderr}");
+
+    // Registering a folder inside a covering index changes nothing.
+    let (_, _, stderr) = mtseek(cache.path(), &["--index"], &root.join("a"));
+    assert!(used(&stderr) && !stderr.contains("built"), "{stderr}");
+
+    // Following links never uses an index.
+    let (_, names, stderr) = mtseek(cache.path(), &["-L"], root);
+    assert_eq!(names.len(), 1);
+    assert!(!used(&stderr), "{stderr}");
+}

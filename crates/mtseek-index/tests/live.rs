@@ -1,6 +1,7 @@
 //! Invariant 3 for the content index (ADR 0011): after any sequence of changes, an index
 //! caught up from the change journal holds exactly what a fresh build holds. Same files,
-//! same stored bytes, same directories, control files and errors.
+//! same stored bytes, same directories, control files and errors, with the same membership
+//! bits for every coverage filter (ADR 0012).
 //!
 //! Windows only: the journal is NTFS's. Needs no admin rights.
 
@@ -12,16 +13,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mtseek_core::{Filter, Scope};
-use mtseek_index::{CatchUp, Index, Location};
+use mtseek_index::{CatchUp, Index, Location, membership};
 use mtseek_walk::Options;
 use proptest::prelude::*;
+
+/// A file as the index holds it: its stored bytes (`None` if read from disk) and flags.
+type Held = (Option<Vec<u8>>, u8);
 
 /// Everything an index answers with, keyed by (root, relative path).
 #[derive(Debug, PartialEq, Eq)]
 struct View {
-    files: BTreeMap<(usize, PathBuf), Option<Vec<u8>>>,
-    dirs: Vec<(u32, PathBuf)>,
-    controls: Vec<(u32, PathBuf)>,
+    files: BTreeMap<(usize, PathBuf), Held>,
+    dirs: Vec<(u32, PathBuf, u8)>,
+    controls: Vec<(u32, PathBuf, u8)>,
     errors: Vec<String>,
 }
 
@@ -41,7 +45,7 @@ fn view(index: &Index) -> View {
                     Some(raw[offset as usize..(offset + len) as usize].to_vec())
                 }
             };
-            let previous = files.insert(segment.path(id), bytes);
+            let previous = files.insert(segment.path(id), (bytes, segment.flags(id)));
             assert!(
                 previous.is_none(),
                 "{:?} is in two layers",
@@ -51,14 +55,25 @@ fn view(index: &Index) -> View {
     }
     let newest = index.delta().unwrap_or_else(|| index.base());
     let paths = |entries: Vec<mtseek_index::Entry>| {
-        let mut out: Vec<(u32, PathBuf)> = entries.into_iter().map(|e| (e.root, e.path)).collect();
+        let mut out: Vec<(u32, PathBuf, u8)> = entries
+            .into_iter()
+            .map(|e| (e.root, e.path, e.flags))
+            .collect();
         out.sort();
         out
     };
     let mut errors: Vec<String> = index
         .errors()
         .iter()
-        .map(|e| format!("{:?} {}: {}", e.root, e.path.display(), e.message))
+        .map(|e| {
+            format!(
+                "{:?} {} [{}]: {}",
+                e.root,
+                e.path.display(),
+                e.flags,
+                e.message
+            )
+        })
         .collect();
     errors.sort();
     View {
@@ -115,6 +130,10 @@ enum Op {
         file: usize,
         hidden: bool,
     },
+    HideDir {
+        dir: usize,
+        hidden: bool,
+    },
 }
 
 const DIRS: &[&str] = &["", "a", "a/b", "c", "c/d", ".h"];
@@ -143,7 +162,8 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (d.clone(), 0..PATTERNS.len()).prop_map(|(dir, pattern)| Op::Ignore { dir, pattern }),
         1 => d.clone().prop_map(|dir| Op::RemoveIgnore { dir }),
         1 => d.clone().prop_map(|dir| Op::MakeGit { dir }),
-        1 => (d, f, any::<bool>()).prop_map(|(dir, file, hidden)| Op::Hide { dir, file, hidden }),
+        1 => (d.clone(), f, any::<bool>()).prop_map(|(dir, file, hidden)| Op::Hide { dir, file, hidden }),
+        1 => (d, any::<bool>()).prop_map(|(dir, hidden)| Op::HideDir { dir, hidden }),
     ]
 }
 
@@ -222,11 +242,24 @@ fn apply(root: &Path, op: &Op) {
                     .output();
             }
         }
+        Op::HideDir { dir: d, hidden } => {
+            if d != 0 && dir(d).is_dir() {
+                let _ = Command::new("attrib")
+                    .arg(if hidden { "+h" } else { "-h" })
+                    .arg(dir(d))
+                    .output();
+            }
+        }
     }
 }
 
 fn scope(root: &Path, level: u8) -> Scope {
     Scope::new([root]).with_filter(Filter::unrestricted(level))
+}
+
+/// A scope with one of the four coverage filters (`which` in 0..4).
+fn coverage_scope(root: &Path, which: u8) -> Scope {
+    Scope::new([root]).with_filter(membership::filter(1 << which))
 }
 
 /// Catches `index` up and checks it against a fresh build of the same scope.
@@ -243,20 +276,22 @@ fn check(index: &mut Index, scope: &Scope, cache: &Path) -> Result<(), TestCaseE
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
+    ))]
 
     #[test]
     fn a_caught_up_index_equals_a_fresh_build(
         setup in proptest::collection::vec(op(), 0..12),
         batches in proptest::collection::vec(proptest::collection::vec(op(), 1..8), 1..4),
-        level in 0u8..=3,
+        which in 0u8..4,
     ) {
         let tree = tempfile::tempdir().expect("temp dir");
         let cache = tempfile::tempdir().expect("temp dir");
         for op in &setup {
             apply(tree.path(), op);
         }
-        let scope = scope(tree.path(), level);
+        let scope = coverage_scope(tree.path(), which);
         let (mut index, _) =
             Index::build(&scope, Options::default(), &cache.path().join("idx")).expect("build");
         for batch in &batches {
@@ -303,7 +338,7 @@ fn an_edit_a_new_folder_and_a_save_by_rename_are_picked_up() {
     let done = index.catch_up(&scope, Options::default()).unwrap();
     assert!(matches!(done, CatchUp::Updated { .. }), "{done:?}");
     let files = view(&index).files;
-    let get = |p: &str| files.get(&(0, PathBuf::from(p))).cloned().flatten();
+    let get = |p: &str| files.get(&(0, PathBuf::from(p))).and_then(|f| f.0.clone());
     assert_eq!(get("a.txt").as_deref(), Some(&b"new"[..]));
     assert_eq!(get("b.txt").as_deref(), Some(&b"second"[..]));
     assert_eq!(

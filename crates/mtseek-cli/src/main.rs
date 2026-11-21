@@ -218,10 +218,18 @@ fn run(args: &Args) -> mtseek_core::Result<ExitCode> {
     let options = Options {
         threads: args.threads,
     };
-    let summary = match index::search(args, &scope, &query, mode, options, &on_hit, &on_error)? {
-        Some(summary) => summary,
-        None => mtseek_walk::scan(&scope, &query, mode, options, &on_hit, &on_error)?,
-    };
+    let indexed = index::search(args, &scope, &query, mode, options, &on_hit, &on_error)?;
+    let mut summary = indexed.summary;
+    if !indexed.rest.is_empty() {
+        let rest = Scope {
+            roots: indexed.rest,
+            filter: scope.filter,
+        };
+        let scanned = mtseek_walk::scan(&rest, &query, mode, options, &on_hit, &on_error)?;
+        summary.files_searched += scanned.files_searched;
+        summary.files_matched += scanned.files_matched;
+        summary.errors += scanned.errors;
+    }
 
     let flushed = out
         .into_inner()

@@ -99,6 +99,81 @@ fn output_matches_ripgrep() {
     );
 }
 
+/// Searches of subfolders, and of other spellings of a path, answered from the index of a
+/// covering folder (ADR 0012), match rg on the same paths.
+#[test]
+fn subfolder_searches_through_a_parent_index_match_ripgrep() {
+    if !ripgrep_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    mtseek_testkit::generate(dir.path(), &CorpusSpec::default()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // Index the whole corpus with the widest filters, so that every search below can use it.
+    run(
+        env!("CARGO_BIN_EXE_mtseek"),
+        &["--index", "-uu", "-l"],
+        &[],
+        tokens::ABSENT,
+        dir.path(),
+        Some(cache.path()),
+    );
+    let mut roots: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    roots.sort();
+    roots.push(dir.path().join("edge").join(".hidden-dir"));
+    // The same folder typed in another case is the same index entry, printed as typed.
+    let upper = std::path::PathBuf::from(dir.path().to_string_lossy().to_uppercase());
+    roots.push(upper.join("edge"));
+
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for root in &roots {
+        for (pattern, query_flags) in &QUERIES[..6] {
+            for scope_flags in [&[][..], &["-u"], &["-uu"], &["--hidden"]] {
+                for mode in [FILES_MODE, LINES_MODE] {
+                    let flags: Vec<&str> = query_flags
+                        .iter()
+                        .chain(scope_flags)
+                        .chain(mode)
+                        .copied()
+                        .collect();
+                    let expected = run("rg", &["--no-config"], &flags, pattern, root, None);
+                    let actual = run(
+                        env!("CARGO_BIN_EXE_mtseek"),
+                        &[],
+                        &flags,
+                        pattern,
+                        root,
+                        Some(cache.path()),
+                    );
+                    cases += 1;
+                    if expected != actual {
+                        let mut all = flags.clone();
+                        let shown = root.to_string_lossy();
+                        all.push(&shown);
+                        failures.push(describe(pattern, &all, &expected, &actual));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {cases} cases differ from rg:
+
+{}",
+        failures.len(),
+        failures.join(
+            "
+"
+        )
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
     code: Option<i32>,

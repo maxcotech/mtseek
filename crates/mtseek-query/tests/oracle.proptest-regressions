@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d16a922dac5ff6aed57759487c2bbc32a773e96f8d338879b371c583908f3539 # shrinks to files = [(GenFile { text: "a", encoding: 0, hidden: true }, 0)], queries = [Query { pattern: "(?:a)*", kind: Regex, case: Sensitive }], ignores = [], repo = false, coverage = 3, search = (0, false, Index(0))

@@ -22,7 +22,7 @@ mod write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use build::{build, read_file, scope_key};
+pub use build::{build, coverage, read_file, scope_key};
 pub use live::{CatchUp, Index, delta_path};
 pub use read::{BlockReader, Location, Segment};
 pub use write::{Content, Doc, SegmentInfo, StoredError, WriteStats, write_segment};
@@ -36,6 +36,70 @@ pub struct Entry {
     pub root: u32,
     /// Its path relative to that root (empty for the root itself).
     pub path: PathBuf,
+    /// For a directory: the filters whose walk enters it ([`membership`]). 0 for control
+    /// files.
+    pub flags: u8,
+}
+
+/// Which walks list an entry (ADR 0012).
+///
+/// An index covers a root at one filter: its *coverage filter*. Every file, directory and
+/// error in it records which of the four combinations of "honour ignore files" and "include
+/// hidden entries" would list it too, as long as that combination lists no more than the
+/// coverage filter does. A search with a narrower filter is then answered from the same index,
+/// exactly. Binary mode (`-uuu`) and following links are not part of this: binary mode reads
+/// [`membership::TRUNCATED`] files from disk, and a search that follows links never uses the
+/// index.
+pub mod membership {
+    use mtseek_core::Filter;
+
+    /// Ignore files honoured, hidden entries skipped: ripgrep's defaults.
+    pub const DEFAULT: u8 = 1;
+    /// Ignore files not honoured, hidden entries skipped (`-u`, `--no-ignore`).
+    pub const NO_IGNORE: u8 = 2;
+    /// Ignore files honoured, hidden entries included (`--hidden`).
+    pub const HIDDEN: u8 = 4;
+    /// Neither (`-uu`).
+    pub const ALL: u8 = 8;
+    /// All four filter bits.
+    pub const FILTERS: u8 = DEFAULT | NO_IGNORE | HIDDEN | ALL;
+    /// Files only: the stored bytes end at a NUL (ripgrep stops reading there unless it
+    /// searches binary files). A binary-mode search reads the file from disk.
+    pub const TRUNCATED: u8 = 16;
+
+    /// The bit of `filter`'s walk.
+    pub fn bit(filter: &Filter) -> u8 {
+        match (filter.respect_ignore_files, filter.include_hidden) {
+            (true, false) => DEFAULT,
+            (false, false) => NO_IGNORE,
+            (true, true) => HIDDEN,
+            (false, true) => ALL,
+        }
+    }
+
+    /// The bits of every walk that lists no more than `filter`'s walk: the filters an index
+    /// built with `filter` can answer.
+    pub fn covered(filter: &Filter) -> u8 {
+        let mut bits = DEFAULT;
+        if !filter.respect_ignore_files {
+            bits |= NO_IGNORE;
+        }
+        if filter.include_hidden {
+            bits |= HIDDEN;
+        }
+        if !filter.respect_ignore_files && filter.include_hidden {
+            bits |= ALL;
+        }
+        bits
+    }
+
+    /// The filter of walk `bit`, with binary files skipped and links not followed.
+    pub fn filter(bit: u8) -> Filter {
+        let mut f = Filter::unrestricted(0);
+        f.respect_ignore_files = bit & (DEFAULT | HIDDEN) != 0;
+        f.include_hidden = bit & (HIDDEN | ALL) != 0;
+        f
+    }
 }
 
 /// Where a segment is up to date in one drive's change journal.
@@ -151,6 +215,7 @@ mod tests {
             root,
             path: PathBuf::from(path),
             frn: bytes.len() as u64 + 1,
+            flags: membership::DEFAULT,
             content: Content::Stored(bytes.to_vec()),
         }
     }
@@ -203,6 +268,7 @@ mod tests {
                 root: 0,
                 path: PathBuf::from("huge"),
                 frn: 99,
+                flags: membership::DEFAULT | membership::ALL,
                 content: Content::External,
             },
         ];
@@ -210,6 +276,7 @@ mod tests {
             root: Some(0),
             path: PathBuf::from("locked"),
             message: "Access is denied. (os error 5)".into(),
+            flags: membership::NO_IGNORE,
         }];
         let stats = write(&path, 2, &mut docs, &errors);
         assert_eq!((stats.files, stats.external), (6, 1));
@@ -254,17 +321,20 @@ mod tests {
                 frn: 1,
                 root: 0,
                 path: PathBuf::new(),
+                flags: membership::FILTERS,
             },
             Entry {
                 frn: 2,
                 root: 0,
                 path: PathBuf::from("src"),
+                flags: membership::ALL,
             },
         ];
         let controls = vec![Entry {
             frn: 3,
             root: 0,
             path: PathBuf::from(".gitignore"),
+            flags: 0,
         }];
         let meta = Meta {
             build_id: 10,
