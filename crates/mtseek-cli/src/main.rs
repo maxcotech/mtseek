@@ -2,7 +2,9 @@
 //!
 //! The flags and output format follow ripgrep (see `docs/adr/0005-ripgrep-compatible-contract.md`),
 //! so scripts, editors and AI agents that already speak `rg` work unchanged.
-//! Until the index lands (milestone M2) every query runs on the reference scanner.
+//! Content queries run through the scope's content index when it has one (built with
+//! `--index`, caught up from the change journal on every run; ADR 0010, 0011), and on the
+//! reference scanner otherwise.
 
 use std::io::{self, BufWriter, Write};
 use std::ops::ControlFlow;
@@ -14,6 +16,7 @@ use clap::{ArgAction, Parser};
 use mtseek_core::{CaseMode, Filter, PatternKind, Query, Scope};
 use mtseek_walk::{FileHit, Mode, Options};
 
+mod index;
 mod names;
 
 /// Instant full-disk search. Takes ripgrep's flags and prints ripgrep's output format.
@@ -97,12 +100,26 @@ struct Args {
     /// master file table when run as administrator; otherwise walks directories.
     #[arg(
         long,
-        conflicts_with_all = ["fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden", "no_ignore", "follow"]
+        conflicts_with_all = ["fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden", "no_ignore", "follow", "index", "reindex", "no_index"]
     )]
     names: bool,
 
-    /// With --names: print timings and index size to stderr.
-    #[arg(long, requires = "names")]
+    /// Build a content index of the paths (each a directory) with these filters, kept in the
+    /// cache, and search it. Once a scope has an index, every search of it uses the index,
+    /// caught up from the NTFS change journal first, so results stay current.
+    #[arg(long, conflicts_with = "no_index")]
+    index: bool,
+
+    /// Rebuild the content index, then search it (implies --index).
+    #[arg(long, conflicts_with = "no_index")]
+    reindex: bool,
+
+    /// Scan the files even if the paths have a content index.
+    #[arg(long)]
+    no_index: bool,
+
+    /// With --names or --index: print timings and index size to stderr.
+    #[arg(long)]
     stats: bool,
 }
 
@@ -201,7 +218,10 @@ fn run(args: &Args) -> mtseek_core::Result<ExitCode> {
     let options = Options {
         threads: args.threads,
     };
-    let summary = mtseek_walk::scan(&scope, &query, mode, options, &on_hit, &on_error)?;
+    let summary = match index::search(args, &scope, &query, mode, options, &on_hit, &on_error)? {
+        Some(summary) => summary,
+        None => mtseek_walk::scan(&scope, &query, mode, options, &on_hit, &on_error)?,
+    };
 
     let flushed = out
         .into_inner()

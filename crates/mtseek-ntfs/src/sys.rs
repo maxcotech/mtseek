@@ -78,7 +78,7 @@ pub(crate) fn ioctl(
 }
 
 /// The 64-bit file index (on NTFS: the file reference number) of an open handle.
-pub(crate) fn file_index(handle: &OwnedHandle) -> io::Result<u64> {
+pub(crate) fn file_index(handle: BorrowedHandle<'_>) -> io::Result<u64> {
     let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
     // SAFETY: `info` is a writable, correctly typed buffer and `handle` is open.
     let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle(), info.as_mut_ptr()) };

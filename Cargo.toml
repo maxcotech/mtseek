@@ -18,6 +18,8 @@ mtseek-walk = { path = "crates/mtseek-walk" }
 mtseek-testkit = { path = "crates/mtseek-testkit" }
 mtseek-ntfs = { path = "crates/mtseek-ntfs" }
 mtseek-names = { path = "crates/mtseek-names" }
+mtseek-index = { path = "crates/mtseek-index" }
+mtseek-query = { path = "crates/mtseek-query" }
 
 # Search primitives: the same crates ripgrep is built from, so semantics match rg exactly.
 grep-matcher = "0.1.9"
@@ -25,6 +27,10 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.34"
 regex-syntax = "0.8.12"
+encoding_rs_io = "0.1.8" # the decoder grep-searcher uses, so the index sees UTF-16 text as rg does
+
+# Content store (ADR 0002, 0010): zstd level 3, measured against lz4 on the dev scope.
+zstd = { version = "0.13.5", default-features = false }
 
 # Everything else
 anyhow = "1.0.104"

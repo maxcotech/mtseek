@@ -370,7 +370,12 @@ pub fn file_ref(path: &Path) -> io::Result<u64> {
         FILE_READ_ATTRIBUTES,
         FILE_FLAG_BACKUP_SEMANTICS,
     )?;
-    sys::file_index(&handle)
+    sys::file_index(handle.as_handle())
+}
+
+/// The NTFS file reference number of an already open file or directory.
+pub fn file_ref_of(file: &impl AsHandle) -> io::Result<u64> {
+    sys::file_index(file.as_handle())
 }
 
 fn word(buf: &[u8], at: usize) -> [u8; 8] {

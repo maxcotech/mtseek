@@ -76,9 +76,14 @@ should *not* be expected to help. It is there to keep the comparison honest.
 Add an entry under `contenders` in `bench.json`. `argv` is a template:
 `{flags}` expands to the flags for the cell (`files`/`lines`, `literal`,
 `ignore_case`, `scope:<name>`), and `{pattern}` / `{root}` are substituted.
-Tools without a fixed-string mode can set `"literal": "escape"`. `mtseek` and
-`csearch` (Russ Cox codesearch) entries are already there. Zoekt can be added
-the same way. Contenders that aren't installed are skipped automatically.
+Tools without a fixed-string mode can set `"literal": "escape"`. An index-backed
+contender can set `env` (variables whose values are folders under
+`%TEMP%\mtseek-bench`) and `reset` (folders there emptied before each cell, so
+`first` includes building the index), as `mtseek-index` does. The `mtseek` contender
+passes `--no-index`, so it always measures scanning, even if the cache holds an index for
+the scope. `mtseek`,
+`mtseek-index` and `csearch` (Russ Cox codesearch) entries are already there. Zoekt
+can be added the same way. Contenders that aren't installed are skipped automatically.
 
 ## Caveats on this machine
 

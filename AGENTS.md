@@ -16,6 +16,8 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | Tests only | `cargo test --workspace` |
 | One crate's tests | `cargo test -p mtseek-walk` |
 | ripgrep parity test | `cargo test -p mtseek-cli --test parity` (needs `rg` on PATH) |
+| Index = scanner test | `cargo test -p mtseek-query --test oracle` |
+| Caught-up index = fresh build | `cargo test -p mtseek-index --test live` (Windows) |
 | Format | `cargo xtask fmt` |
 | Benchmark vs ripgrep | `cargo xtask bench --queries rare,absent --modes files` |
 | Generate a test corpus | `cargo xtask corpus <empty-dir>` |
@@ -57,6 +59,8 @@ crates/mtseek-cli      `mtseek` binary; tests/parity.rs runs rg vs mtseek
 crates/mtseek-testkit  deterministic edge-case corpus generator
 crates/mtseek-ntfs     MFT + USN journal (Win32 FFI; all unsafe in src/sys.rs)
 crates/mtseek-names    file-name index (arenas + parent links), MFT or walk source
+crates/mtseek-index    content index: segments (postings + zstd store), live catch-up; tests/live.rs
+crates/mtseek-query    regex -> trigram plan, candidate lookup, verification; tests/oracle.rs
 xtask/                 cargo xtask ci | fmt | bench | corpus
 bench/                 bench.py + bench.json + TARGETS.md (ripgrep baseline)
 docs/                  ARCHITECTURE.md, adr/
@@ -69,7 +73,10 @@ docs/                  ARCHITECTURE.md, adr/
   `tests/parity.rs`. Don't "fix" parity by special-casing more files without an explanation there.
 - `.gitignore` only applies inside a git repo (ripgrep's `require_git`). Tests that need it
   create a `.git` directory.
-- `mtseek --names` caches its index in `%LOCALAPPDATA%\mtseek\cache`. Tests must set
-  `MTSEEK_CACHE_DIR` to a temp dir (see `tests/names.rs`) so they never touch the real cache.
+- `mtseek --names` and `mtseek --index` cache their indexes in `%LOCALAPPDATA%\mtseek\cache`.
+  Tests must set `MTSEEK_CACHE_DIR` to a temp dir (see `tests/names.rs`, `tests/parity.rs`)
+  so they never touch the real cache.
+- The content index must never change *what* matches, only how fast. If the oracle test
+  fails, the index is wrong. Fix the planner or the stored bytes, never the test.
 - Paths print exactly as the walker joins them onto the root you pass. Don't canonicalise
   paths in output, or parity breaks.
