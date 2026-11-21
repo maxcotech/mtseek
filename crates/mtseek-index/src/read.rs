@@ -16,7 +16,7 @@ use crate::format::{
     self, BLOCK_LEN, DICT_LEN, DOC_LEN, END_MAGIC, HEADER_LEN, MAGIC, NO_BLOCK, SECTIONS,
     TRAILER_LEN, UTF16_PATH, VERSION, section, u32_at, u64_at,
 };
-use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, StoredError};
+use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, Sd, StoredError};
 
 /// An open segment.
 #[derive(Debug)]
@@ -33,6 +33,7 @@ pub struct Segment {
     errors: Vec<StoredError>,
     tombstones: Vec<u32>,
     meta: Meta,
+    descriptors: Vec<Sd>,
     postings: (u64, u64),
     store: (u64, u64),
     dirs: (u64, u64),
@@ -155,6 +156,8 @@ impl Segment {
         let tombstone_bytes = read_section(section::TOMBSTONES)?;
         let meta =
             format::parse_meta(&read_section(section::META)?).ok_or_else(|| corrupt("bad meta"))?;
+        let descriptors = format::parse_descriptors(&read_section(section::DESCRIPTORS)?)
+            .ok_or_else(|| corrupt("bad descriptors"))?;
 
         if docs.len() as u64 != u64::from(doc_count) * DOC_LEN as u64
             || dictionary.len() as u64 != u64::from(trigram_count) * DICT_LEN as u64
@@ -165,7 +168,7 @@ impl Segment {
         let store = ranges[section::STORE];
         let postings = ranges[section::POSTINGS];
         let block_raw = check_blocks(&blocks, store.1).map_err(corrupt)?;
-        check_docs(&docs, &paths, &block_raw, roots).map_err(corrupt)?;
+        check_docs(&docs, &paths, &block_raw, roots, descriptors.len()).map_err(corrupt)?;
         check_dictionary(&dictionary, doc_count, postings.1).map_err(corrupt)?;
         let errors =
             parse_errors(&error_bytes, error_count, roots).ok_or_else(|| corrupt("bad errors"))?;
@@ -188,6 +191,7 @@ impl Segment {
             errors,
             tombstones,
             meta,
+            descriptors,
             postings,
             store,
             dirs: ranges[section::DIRS],
@@ -264,6 +268,30 @@ impl Segment {
     pub fn flags(&self, doc: u32) -> u8 {
         // Checked when the segment was opened.
         u8::try_from(u32_at(self.doc(doc), 32)).unwrap_or(0)
+    }
+
+    /// The distinct security descriptors files, directories and control files refer to.
+    pub fn descriptors(&self) -> &[Sd] {
+        &self.descriptors
+    }
+
+    /// The number of `doc`'s security descriptor in [`Segment::descriptors`].
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn descriptor_id(&self, doc: u32) -> u32 {
+        u32_at(self.doc(doc), 36)
+    }
+
+    /// `doc`'s security descriptor (ADR 0014); empty if unknown.
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn descriptor(&self, doc: u32) -> &Sd {
+        // Checked when the segment was opened.
+        &self.descriptors[self.descriptor_id(doc) as usize]
     }
 
     /// The root `doc` was found under and its path relative to that root.
@@ -371,7 +399,7 @@ impl Segment {
                 path: self.path.clone(),
                 source,
             })?;
-        format::parse_entries(&bytes, self.roots).ok_or_else(corrupt)
+        format::parse_entries(&bytes, self.roots, &self.descriptors).ok_or_else(corrupt)
     }
 
     fn doc(&self, doc: u32) -> &[u8] {
@@ -481,6 +509,7 @@ fn check_docs(
     paths: &[u8],
     block_raw: &[u32],
     roots: u32,
+    descriptors: usize,
 ) -> Result<(), &'static str> {
     let (entries, _) = docs.as_chunks::<DOC_LEN>();
     for d in entries {
@@ -492,7 +521,11 @@ fn check_docs(
                 .get(b as usize)
                 .is_some_and(|&raw| u64::from(offset) + u64::from(len) <= u64::from(raw)),
         };
-        if !in_block || root >= roots || u32_at(d, 32) > u32::from(u8::MAX) {
+        if !in_block
+            || root >= roots
+            || u32_at(d, 32) > u32::from(u8::MAX)
+            || u32_at(d, 36) as usize >= descriptors
+        {
             return Err("file entry out of bounds");
         }
         let start = path_offset as usize;

@@ -25,6 +25,16 @@ pub fn user_sid() -> io::Result<String> {
 /// The SID of the service account a service-mode daemon runs as.
 pub const LOCAL_SYSTEM: &str = "S-1-5-18";
 
+/// The service's pipe (ADR 0014).
+pub const SERVICE_PIPE: &str = r"\\.\pipe\mtseek";
+
+/// The service pipe's DACL: network logons denied; SYSTEM, Administrators and the pipe's
+/// owner (the process that created it) in full; interactive users may read and write
+/// (`0x12019b`: generic read, write data, write attributes and extended attributes) but not
+/// create instances of the pipe, so none can serve on it.
+pub const SERVICE_PIPE_SDDL: &str =
+    "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;IU)";
+
 /// The name of this user's console-mode daemon pipe: `\\.\pipe\mtseek-<SID>`.
 pub fn user_pipe_name() -> io::Result<String> {
     Ok(format!(r"\\.\pipe\mtseek-{}", user_sid()?))
@@ -42,7 +52,12 @@ impl Listener {
     /// Creates pipe `name`, open only to the user this process runs as. Fails with
     /// [`io::ErrorKind::AlreadyExists`] if another process holds the name.
     pub fn bind(name: &str) -> io::Result<Self> {
-        let descriptor = sys::security_descriptor(&format!("D:P(A;;GA;;;{})", user_sid()?))?;
+        Self::bind_with(name, &format!("D:P(A;;GA;;;{})", user_sid()?))
+    }
+
+    /// Creates pipe `name` with the DACL in `sddl` (the service's: [`SERVICE_PIPE_SDDL`]).
+    pub fn bind_with(name: &str, sddl: &str) -> io::Result<Self> {
+        let descriptor = sys::security_descriptor(sddl)?;
         let next = sys::create_pipe(OsStr::new(name), true, &descriptor).map_err(|err| {
             // A first instance that exists already: access denied, by design of the flag.
             if err.kind() == io::ErrorKind::PermissionDenied {

@@ -254,15 +254,21 @@ fn run(args: &Args) -> Result<ExitCode, Failure> {
     let request = args.search_request();
     let printer = Printer::new(request.mode, args.format(&args.scope()));
     let started = Instant::now();
-    let answered = match daemon::connect(args)? {
-        Some(mut client) => daemon::search(&mut client, &request, &printer).map(|outcome| {
-            let by = daemon::answered_by(&client, started);
-            (outcome, by)
-        }),
-        None => Engine::direct(Engine::default_cache_dir())
+    let direct = |by: String| {
+        Engine::direct(Engine::default_cache_dir())
             .search(&request, &printer)
-            .map(|outcome| (Some(outcome), "answered in this process".to_owned()))
-            .map_err(Failure::from),
+            .map(|outcome| (Some(outcome), by))
+            .map_err(Failure::from)
+    };
+    let answered = match daemon::connect(args)? {
+        Some(mut client) => match daemon::search(&mut client, &request, &printer) {
+            Ok(daemon::Answer::Done(outcome)) => {
+                Ok((outcome, daemon::answered_by(&client, started)))
+            }
+            Ok(daemon::Answer::Declined(why)) => direct(daemon::declined_by(&client, &why)),
+            Err(err) => Err(err),
+        },
+        None => direct("answered in this process".to_owned()),
     };
     // Flush what was found even if the search then failed.
     let finished = printer.finish();
@@ -282,17 +288,22 @@ fn run(args: &Args) -> Result<ExitCode, Failure> {
 fn run_names(args: &Args) -> Result<ExitCode, Failure> {
     let request = args.names_request();
     let started = Instant::now();
+    let mut by = "answered in this process".to_owned();
     if let Some(mut client) = daemon::connect(args)? {
-        let (matched, mut stats) = daemon::names(&mut client, &request)?;
-        if args.stats {
-            stats.push(daemon::answered_by(&client, started));
-            print_stats(&stats);
+        match daemon::names(&mut client, &request)? {
+            Ok((matched, mut stats)) => {
+                if args.stats {
+                    stats.push(daemon::answered_by(&client, started));
+                    print_stats(&stats);
+                }
+                return Ok(if matched == 0 {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                });
+            }
+            Err(why) => by = daemon::declined_by(&client, &why),
         }
-        return Ok(if matched == 0 {
-            ExitCode::from(1)
-        } else {
-            ExitCode::SUCCESS
-        });
     }
     let printer = Printer::new(Mode::Files, Format::default());
     let mut engine = Engine::direct(Engine::default_cache_dir());
@@ -306,7 +317,7 @@ fn run_names(args: &Args) -> Result<ExitCode, Failure> {
     // Saved after answering, so the caller never waits for it.
     stats.extend(engine.save(Duration::ZERO));
     if args.stats {
-        stats.push("answered in this process".to_owned());
+        stats.push(by);
         print_stats(&stats);
     }
     Ok(if found.paths.is_empty() {

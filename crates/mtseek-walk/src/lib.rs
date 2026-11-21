@@ -245,6 +245,24 @@ pub fn list(
     }
 }
 
+/// Git's global excludes file as ripgrep finds it for this process (from git's
+/// configuration and the environment), and its contents (empty if it doesn't exist).
+/// `None` if there is no such file to look for.
+pub fn global_excludes() -> Option<(std::path::PathBuf, Vec<u8>)> {
+    let path = ignore::gitignore::gitconfig_excludes_path()?;
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    Some((path, bytes))
+}
+
+/// Whether an ignore file's contents hold any rule: a line that is neither blank nor a
+/// comment.
+pub fn has_ignore_rules(bytes: &[u8]) -> bool {
+    bytes.split(|&b| b == b'\n').any(|line| {
+        let line = line.trim_ascii();
+        !line.is_empty() && !line.starts_with(b"#")
+    })
+}
+
 /// Compiles a [`Query`] into the matcher ripgrep would build for it.
 pub fn build_matcher(query: &Query) -> Result<RegexMatcher> {
     let mut builder = RegexMatcherBuilder::new();

@@ -322,6 +322,54 @@ catch-up rebuilds the editable state from all 15,423 paths and re-packs the whol
 Keeping that state resident in the daemon and appending to the delta is the next step for
 edit latency.
 
+### 2026-11-21, M3c: service mode, every search checked against the caller's access (`bench.py`, 5 timed runs)
+
+ADR 0014 checks what each caller may see against the security descriptors the index recorded.
+That happens in direct mode and the console daemon too, with their own token. Secret-looking
+files are now listed but never stored, so each search reads them from disk. To compare like
+with like, this run added M3b (`staging` at `e8dcee5`, built in a worktree) as two more
+contenders: `m3b-index` and `m3b-daemon`. Parity ✓ in all 16 cells for every contender. Raw:
+`bench/results/20261121-191806` (an earlier run, `20261121-191207`, was before the
+visibility-pass fix below).
+
+| query | mode | rg | M3c direct | M3b direct | M3c daemon | M3b daemon |
+|---|---|---:|---:|---:|---:|---:|
+| absent | files | 621 ms | 49 ms | 40 ms | 39 ms | 35 ms |
+| rare | files | 696 ms | 50 ms | 47 ms | 46 ms | 42 ms |
+| uncommon | files | 586 ms | 43 ms | 40 ms | 39 ms | 34 ms |
+| medium | files | 653 ms | 56 ms | 53 ms | 50 ms | 45 ms |
+| common | files | 675 ms | 89 ms | 85 ms | 75 ms | 72 ms |
+| icase | files | 674 ms | 59 ms | 59 ms | 53 ms | 49 ms |
+| regex-lit | files | 658 ms | 54 ms | 51 ms | 48 ms | 45 ms |
+| regex-nolit | files | 653 ms | 101 ms | 100 ms | 99 ms | 93 ms |
+| absent | lines | 632 ms | 45 ms | 39 ms | 36 ms | 34 ms |
+| rare | lines | 607 ms | 50 ms | 47 ms | 45 ms | 43 ms |
+| uncommon | lines | 624 ms | 43 ms | 40 ms | 41 ms | 36 ms |
+| medium | lines | 631 ms | 61 ms | 55 ms | 54 ms | 52 ms |
+| common | lines | 759 ms | 112 ms | 109 ms | 147 ms | 159 ms |
+| icase | lines | 626 ms | 53 ms | 52 ms | 48 ms | 45 ms |
+| regex-lit | lines | 601 ms | 55 ms | 51 ms | 49 ms | 46 ms |
+| regex-nolit | lines | 668 ms | 110 ms | 109 ms | 106 ms | 107 ms |
+
+M3c costs 0–6 ms per search over M3b (about 3 ms typically), in both modes. Where it goes
+(`--stats`, `absent`, direct mode):
+
+- **Secret files read from disk: about 2 ms.** `C:\Dev` has 7 `.env*` files. They are
+  candidates for every search now (31 candidates instead of 24), and each is opened. That is
+  the cost of keeping secrets out of the index (ADR 0012 §4). The same change fixed a gap:
+  files over 256 MiB were never candidates before, so searches through the index missed
+  them.
+- **The visible set: under 1 ms.** The first version took 2 ms, because it parsed the
+  folder table a second time and hashed a descriptor for every folder. Now the open index
+  keeps the parsed folders (the daemon re-parses only after a change), and decisions are
+  looked up by the shared descriptor: one `AccessCheck` per distinct descriptor, of which
+  `C:\Dev` has one.
+
+**Build**: `--reindex` of `C:\Dev` at level 0, release, median of 3, alternating builds:
+1,432 ms (M3c) against 1,300 ms (M3b), +10%. That is one `GetSecurityInfo` per file and one
+extra open per folder, as ADR 0014 expected. On disk: 38.3 MiB for both. The descriptor table
+holds one entry, and each file entry grew by 4 bytes.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

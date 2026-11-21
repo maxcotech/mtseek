@@ -1,10 +1,13 @@
-//! Answering through the daemon (ADR 0013).
+//! Answering through the daemon (ADR 0013, 0014).
 //!
-//! The CLI tries the user's daemon pipe with a short timeout. No daemon, a daemon that
-//! speaks another protocol version, or one running as another user: the CLI searches in
+//! The CLI tries the user's daemon pipe, then the service's, each with a short timeout. No
+//! daemon, a daemon that speaks another protocol version, or one running as someone it
+//! shouldn't (another user; for the service, anyone but `LocalSystem`): the CLI searches in
 //! this process instead, silently (`--daemon` makes that an error). The daemon gets the
-//! search exactly as parsed, plus this process's working directory, and sends back what the
-//! direct engine would have printed.
+//! search exactly as parsed, plus this process's working directory, which folder each root
+//! is and git's global excludes file, and sends back what the direct engine would have
+//! printed. The service may decline a search it can't answer exactly; the CLI then
+//! searches in this process, and `--stats` says why.
 
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[cfg(windows)]
 pub(crate) use imp::Client;
+
+/// What the daemon did with a search.
+pub(crate) enum Answer {
+    /// Answered; `None` if the printer stopped it (stdout closed).
+    Done(Option<Outcome>),
+    /// Left to this process, for this reason (ADR 0014 §6). Nothing was printed.
+    Declined(String),
+}
 
 /// The daemon to answer this run, or `None` to search in this process.
 #[cfg(windows)]
@@ -45,39 +56,52 @@ pub(crate) fn connect(args: &Args) -> Result<Option<Client>, Failure> {
     Ok(None)
 }
 
-/// Runs a content search on the daemon, printing as results arrive. `Ok(None)` if the
-/// printer stopped it (stdout closed).
+/// Runs a content search on the daemon, printing as results arrive.
 #[cfg(windows)]
 pub(crate) fn search(
     client: &mut Client,
     request: &SearchRequest,
     printer: &Printer,
-) -> Result<Option<Outcome>, Failure> {
+) -> Result<Answer, Failure> {
     imp::search(client, request, printer)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn search(
-    _: &mut Client,
-    _: &SearchRequest,
-    _: &Printer,
-) -> Result<Option<Outcome>, Failure> {
+pub(crate) fn search(_: &mut Client, _: &SearchRequest, _: &Printer) -> Result<Answer, Failure> {
     unreachable!("no client without Windows")
 }
 
 /// Runs a name search on the daemon, printing paths as they arrive. Returns how many
-/// matched and the `--stats` lines.
+/// matched and the `--stats` lines, or why the daemon declined.
 #[cfg(windows)]
 pub(crate) fn names(
     client: &mut Client,
     request: &NamesRequest,
-) -> Result<(u64, Vec<String>), Failure> {
+) -> Result<Result<(u64, Vec<String>), String>, Failure> {
     imp::names(client, request)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn names(_: &mut Client, _: &NamesRequest) -> Result<(u64, Vec<String>), Failure> {
+pub(crate) fn names(
+    _: &mut Client,
+    _: &NamesRequest,
+) -> Result<Result<(u64, Vec<String>), String>, Failure> {
     unreachable!("no client without Windows")
+}
+
+/// The `--stats` line for a search the daemon left to this process.
+#[cfg(windows)]
+pub(crate) fn declined_by(client: &Client, why: &str) -> String {
+    format!(
+        "{} (pid {}) declined: {why}; answered in this process",
+        client.info().server,
+        client.info().pid
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn declined_by(_: &Client, _: &str) -> String {
+    String::new()
 }
 
 /// The `--stats` line saying who answered.
@@ -107,29 +131,77 @@ mod imp {
     use mtseek_engine::{IndexUse, NamesRequest, Outcome, Report, SearchRequest};
     pub(crate) use mtseek_ipc::client::Client;
     use mtseek_ipc::client::{ClientError, Sink};
-    use mtseek_ipc::{Case, Hit, IndexMode, NamesParams, SearchMode, SearchParams, WirePath};
+    use mtseek_ipc::{
+        Case, GlobalExcludes, Hit, IndexMode, NamesParams, RootId, SearchMode, SearchParams,
+        WirePath, code,
+    };
     use mtseek_walk::{FileHit, LineHit, Mode, Summary};
 
-    use super::CONNECT_TIMEOUT;
+    use super::{Answer, CONNECT_TIMEOUT};
     use crate::{Failure, PathWriter, Printer, hint};
 
+    /// The global excludes file is sent whole up to this size; the service only needs to
+    /// know whether it holds rules.
+    const MAX_EXCLUDES: usize = 1 << 20;
+
+    /// This user's daemon, else the service.
     pub(super) fn connect() -> Result<Option<Client>, Failure> {
         let pipe = mtseek_ipc::client::default_pipe()?;
         let sid = mtseek_ntfs::pipe::user_sid()?;
-        Ok(Client::connect(&pipe, CONNECT_TIMEOUT, &sid)?)
+        let mine = Client::connect(&pipe, CONNECT_TIMEOUT, &sid);
+        if let Ok(Some(client)) = mine {
+            return Ok(Some(client));
+        }
+        let Some(service) = mtseek_ipc::client::service_pipe() else {
+            return Ok(mine?);
+        };
+        match Client::connect(&service, CONNECT_TIMEOUT, mtseek_ntfs::pipe::LOCAL_SYSTEM) {
+            Ok(Some(client)) => Ok(Some(client)),
+            Ok(None) | Err(_) => Ok(mine?),
+        }
+    }
+
+    /// Which folder each root is, for the service to check (ADR 0014 §5).
+    fn root_ids(roots: &[PathBuf], cwd: &std::path::Path) -> Vec<Option<RootId>> {
+        roots
+            .iter()
+            .map(|root| {
+                mtseek_ntfs::identity(&cwd.join(root))
+                    .ok()
+                    .map(|(volume, frn)| RootId { volume, frn })
+            })
+            .collect()
+    }
+
+    /// Git's global excludes file as this process's `rg` would read it.
+    fn global_excludes() -> GlobalExcludes {
+        match mtseek_walk::global_excludes() {
+            Some((path, mut bytes)) => {
+                bytes.truncate(MAX_EXCLUDES);
+                GlobalExcludes {
+                    path: Some(WirePath::new(&path)),
+                    b64: mtseek_ipc::base64::encode(&bytes),
+                }
+            }
+            None => GlobalExcludes {
+                path: None,
+                b64: String::new(),
+            },
+        }
     }
 
     pub(super) fn search(
         client: &mut Client,
         request: &SearchRequest,
         printer: &Printer,
-    ) -> Result<Option<Outcome>, Failure> {
+    ) -> Result<Answer, Failure> {
+        let cwd = std::env::current_dir()?;
         let params = SearchParams {
             pattern: request.query.pattern.clone(),
             fixed: request.query.kind == PatternKind::Literal,
             case: case(request.query.case),
             roots: request.roots.iter().map(|r| WirePath::new(r)).collect(),
-            cwd: WirePath::new(&std::env::current_dir()?),
+            cwd: WirePath::new(&cwd),
             ignore_files: request.filter.respect_ignore_files,
             hidden: request.filter.include_hidden,
             binary: request.filter.include_binary,
@@ -145,30 +217,37 @@ mod imp {
                 IndexUse::Rebuild => IndexMode::Rebuild,
                 IndexUse::Off => IndexMode::Off,
             },
+            root_ids: Some(root_ids(&request.roots, &cwd)),
+            global_excludes: Some(global_excludes()),
         };
         let mut forward = Forward {
             printer,
             paths: None,
             bad: None,
         };
-        let done = client.search(&params, &mut forward).map_err(failure)?;
+        let done = match client.search(&params, &mut forward) {
+            Err(ClientError::Server(err)) if err.code == code::DECLINED => {
+                return Ok(Answer::Declined(err.message));
+            }
+            done => done.map_err(failure)?,
+        };
         if let Some(bad) = forward.bad {
             return Err(bad.into());
         }
-        Ok(done.map(|result| Outcome {
+        Ok(Answer::Done(done.map(|result| Outcome {
             summary: Summary {
                 files_searched: result.summary.searched,
                 files_matched: result.summary.matched,
                 errors: result.summary.errors,
             },
             stats: result.stats,
-        }))
+        })))
     }
 
     pub(super) fn names(
         client: &mut Client,
         request: &NamesRequest,
-    ) -> Result<(u64, Vec<String>), Failure> {
+    ) -> Result<Result<(u64, Vec<String>), String>, Failure> {
         let params = NamesParams {
             pattern: request.pattern.clone(),
             case: case(request.case),
@@ -186,8 +265,13 @@ mod imp {
         if let Some(out) = forward.paths.take() {
             out.finish()?;
         }
-        let done = done.map_err(failure)?;
-        Ok(done.map_or((1, Vec::new()), |r| (r.matched, r.stats)))
+        let done = match done {
+            Err(ClientError::Server(err)) if err.code == code::DECLINED => {
+                return Ok(Err(err.message));
+            }
+            done => done.map_err(failure)?,
+        };
+        Ok(Ok(done.map_or((1, Vec::new()), |r| (r.matched, r.stats))))
     }
 
     /// A failed search prints the daemon's message, exactly as direct mode prints its error.

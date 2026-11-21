@@ -2,6 +2,8 @@
 
 **Status:** Accepted, 2026-11-21. Changes how [0010](0010-content-index-format.md) and
 [0011](0011-live-content-index.md) decide which files an index holds. First decision of M3.
+Partly superseded by [0014](0014-service-mode.md): the service doesn't read a caller's global
+excludes file while impersonating it (§3), and has no default coverage (§5).
 
 ## Context
 

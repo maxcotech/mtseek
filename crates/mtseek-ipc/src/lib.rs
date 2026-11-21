@@ -217,6 +217,34 @@ pub struct SearchParams {
     /// Index use.
     #[serde(default)]
     pub index: IndexMode,
+    /// Which folder each root is, as the client opened it (ADR 0014): the service checks
+    /// that the same path names the same folder for it. `None` for a root the client
+    /// couldn't open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_ids: Option<Vec<Option<RootId>>>,
+    /// Git's global excludes file as the client's `rg` would read it (ADR 0014 §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_excludes: Option<GlobalExcludes>,
+}
+
+/// A folder's identity: its volume's serial number and its file reference number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootId {
+    /// The volume serial number.
+    pub volume: u32,
+    /// The file reference number.
+    pub frn: u64,
+}
+
+/// Git's global excludes file of a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalExcludes {
+    /// Where it is, if git's configuration names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<WirePath>,
+    /// Its contents, in base64 (empty if it doesn't exist).
+    #[serde(default)]
+    pub b64: String,
 }
 
 /// `$/hit`: a matching file.
@@ -374,6 +402,9 @@ pub mod code {
     pub const UNSUPPORTED_VERSION: i64 = -32001;
     /// A request before `initialize`.
     pub const NOT_INITIALIZED: i64 = -32002;
+    /// The service won't answer this search exactly: the client runs it itself
+    /// (ADR 0014 §6). Nothing was sent for it.
+    pub const DECLINED: i64 = -32003;
     /// Stopped by `$/cancel`.
     pub const CANCELLED: i64 = -32800;
 }
@@ -679,6 +710,41 @@ mod tests {
             let back: Line = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(back.n, n);
             prop_assert_eq!(back.bytes(), Some(bytes));
+        }
+
+        /// Other users' requests are untrusted input for the service (ADR 0014): a damaged
+        /// request, cut or with any byte changed, is refused or parsed, never a panic.
+        #[test]
+        fn damaged_requests_are_refused_or_parsed(at in any::<prop::sample::Index>(), value in any::<u8>(), cut in any::<prop::sample::Index>()) {
+            let request = SearchParams {
+                pattern: "ne(e)dle".into(),
+                fixed: false,
+                case: Case::Smart,
+                roots: vec![WirePath::Text(r"C:\Dev".into()), WirePath::Wide { wide: vec![0x61, 0xD800] }],
+                cwd: WirePath::Text(r"C:\".into()),
+                ignore_files: true,
+                hidden: false,
+                binary: false,
+                follow: false,
+                mode: SearchMode::Lines,
+                threads: 0,
+                index: IndexMode::Auto,
+                root_ids: Some(vec![Some(RootId { volume: 7, frn: 9 }), None]),
+                global_excludes: Some(GlobalExcludes { path: None, b64: base64::encode(b"*.log
+    ") }),
+            };
+            let mut line = Vec::new();
+            super::request(&mut line, &Value::from(1), "search", &request);
+            let i = at.index(line.len());
+            line[i] = value;
+            line.truncate(cut.index(line.len() + 1));
+            if let Ok(message) = Incoming::parse(&line) {
+                let _ = message.params::<SearchParams>();
+                let _ = message.params::<InitializeParams>();
+                let _ = message.params::<CancelParams>();
+            }
+            let mut reader = Reader::new(&line[..]);
+            while let Ok(Some(_)) = reader.read_line() {}
         }
     }
 }

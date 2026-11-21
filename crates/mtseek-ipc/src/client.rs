@@ -25,6 +25,19 @@ pub fn default_pipe() -> io::Result<String> {
     mtseek_ntfs::pipe::user_pipe_name()
 }
 
+/// The service's pipe to try after this user's daemon (ADR 0014):
+/// `MTSEEK_SERVICE_PIPE` if set (tests); none when `MTSEEK_PIPE` is set without it, so a
+/// test's runs never reach a service installed on the machine; else `\\.\pipe\mtseek`.
+pub fn service_pipe() -> Option<String> {
+    if let Some(name) = std::env::var_os("MTSEEK_SERVICE_PIPE") {
+        return Some(name.to_string_lossy().into_owned());
+    }
+    if std::env::var_os("MTSEEK_PIPE").is_some() {
+        return None;
+    }
+    Some(mtseek_ntfs::pipe::SERVICE_PIPE.to_owned())
+}
+
 /// Why a call failed.
 #[derive(Debug)]
 pub enum ClientError {
