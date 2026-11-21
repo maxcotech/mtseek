@@ -490,6 +490,7 @@ dependencies = [
  "encoding_rs_io",
  "memchr",
  "mtseek-core",
+ "mtseek-ntfs",
  "mtseek-walk",
  "proptest",
  "tempfile",

@@ -169,6 +169,58 @@ The index, measured with `--stats`:
 - **Not yet covered:** the index is built once and not updated (M2b). Update latency, pass
   criterion 3, has no number until then.
 
+### 2026-11-21, M2b: the index stays current (`cargo xtask bench --modes files,lines`, 5 timed runs)
+
+From M2b on, every timed `mtseek-index` run first catches the index up from the change journal
+(ADR 0011). Parity ✓ in all 16 cells. The machine was still busy (rg 0.78–1.0 s).
+
+| query | mode | matches | rg | mtseek (scan) | mtseek-index | speedup vs rg |
+|---|---|---:|---:|---:|---:|---:|
+| absent | files | 6 | 899 ms | 633 ms | **58 ms** | 15.4× |
+| rare | files | 28 | 889 ms | 508 ms | **72 ms** | 12.4× |
+| uncommon | files | 87 | 908 ms | 501 ms | **59 ms** | 15.4× |
+| medium | files | 788 | 845 ms | 566 ms | **83 ms** | 10.2× |
+| common | files | 9,474 | 878 ms | 556 ms | 101 ms | 8.7× |
+| icase | files | 30 | 808 ms | 572 ms | **69 ms** | 11.7× |
+| regex-lit | files | 42 | 869 ms | 511 ms | **78 ms** | 11.2× |
+| regex-nolit | files | 4 | 997 ms | 723 ms | 284 ms | 3.5× |
+| absent | lines | 11 | 812 ms | 511 ms | **93 ms** | 8.8× |
+| rare | lines | 49 | 955 ms | 568 ms | **64 ms** | 15.0× |
+| uncommon | lines | 201 | 948 ms | 651 ms | **55 ms** | 17.3× |
+| medium | lines | 1,755 | 857 ms | 507 ms | **66 ms** | 13.1× |
+| common | lines | 53,343 | 849 ms | 564 ms | 132 ms | 6.4× |
+| icase | lines | 69 | 781 ms | 554 ms | **64 ms** | 12.2× |
+| regex-lit | lines | 89 | 790 ms | 549 ms | **73 ms** | 10.9× |
+| regex-nolit | lines | 8 | 845 ms | 562 ms | 147 ms | 5.8× |
+
+12 of 16 cells are under 100 ms. The `regex-nolit` files cell is noise: its samples ranged
+from 157 to 334 ms, while the identical work in lines mode held at 146–149 ms.
+
+**Update latency** (pass criterion 3), measured with `--stats` on `C:\Dev` (15,405 files),
+catch-up time on top of the search:
+
+| what changed since the last search | catch-up |
+|---|---:|
+| nothing under the scope (records about the rest of the drive only) | **1.2–1.3 ms** |
+| one file created, edited or deleted | **38–40 ms** |
+
+A new file is found by the very next search, and a deleted one is gone from it.
+
+- **Where the 38–40 ms goes:**
+  - load the editable index state: 6–8 ms
+  - re-list the folder and read the file: 4–5 ms
+  - write the delta, including fsync: 6 ms
+  - reopen the delta: 10 ms. My guess is that Defender scans the just-written file; not
+    measured.
+- **What got it there:**
+  - The first version took 75 ms even when nothing relevant changed, because it built its
+    path map before checking any record. It now compares file reference numbers first.
+  - That path map took 38 ms for 15,000 `PathBuf` keys. Keys now compare as raw bytes with
+    separators lowest: the same order, compared with `memcmp`.
+- **Build:** the base build lists every folder once more, for folder and control-file
+  reference numbers, with no measurable cost. Warm rebuilds take 1.34–1.38 s (M2a: 1.75 s,
+  measured once, colder). The first build after the cache had gone cold took 3.35 s.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

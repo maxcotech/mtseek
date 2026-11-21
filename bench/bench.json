@@ -57,7 +57,7 @@
       "note": "Baseline. Scans files at query time. Names mode: lists every file (-uu) and keeps those whose name matches."
     },
     "mtseek": {
-      "argv": ["../target/release/mtseek.exe", "{flags}", "--", "{pattern}", "{root}"],
+      "argv": ["../target/release/mtseek.exe", "--no-index", "{flags}", "--", "{pattern}", "{root}"],
       "flags": {
         "files": ["--files-with-matches"],
         "lines": ["--line-number", "--no-heading", "--with-filename"],

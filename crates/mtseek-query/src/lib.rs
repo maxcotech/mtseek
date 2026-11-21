@@ -1,7 +1,8 @@
-//! Content search through the index (ADR 0001, 0010).
+//! Content search through the index (ADR 0001, 0010, 0011).
 //!
 //! 1. [`plan()`] turns the pattern into a trigram query.
-//! 2. The query runs against the segment's postings. The result is the candidate files.
+//! 2. The query runs against the postings of each layer of the index (base and delta);
+//!    base files the delta replaced are skipped. The result is the candidate files.
 //! 3. Each candidate's stored bytes are searched by the reference scanner's own
 //!    [`FileSearcher`], so what matches, and how lines and binary files are reported, is
 //!    exactly what `mtseek-walk` (and ripgrep) would report.
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use mtseek_core::{Error, Query, Result, Scope};
-use mtseek_index::{IndexError, Location, Segment};
+use mtseek_index::{Index, IndexError, Location, Segment};
 use mtseek_walk::{FileHit, FileSearcher, Mode, Options, Summary};
 
 pub use plan::{Plan, plan};
@@ -33,18 +34,18 @@ pub struct SearchStats {
     pub blocks: u64,
 }
 
-/// Searches the files of `segment` for `query`, the way [`mtseek_walk::scan`] searches the
+/// Searches the files of `index` for `query`, the way [`mtseek_walk::scan`] searches the
 /// files of `scope`.
 ///
-/// `scope` must be the scope the segment was built for (same roots in the same order, same
+/// `scope` must be the scope the index was built for (same roots in the same order, same
 /// filter; compare [`mtseek_index::scope_key`] with [`Segment::key`]). Paths are reported
 /// joined onto `scope.roots` as given, exactly like the scanner reports them.
 ///
-/// Files that couldn't be read when the segment was built are reported to `on_error`.
-/// An error reading the segment itself ends the search with that error: the caller should
-/// rebuild the index or fall back to scanning.
+/// Files that couldn't be read are reported to `on_error`. An error reading the index
+/// itself ends the search with that error: the caller should rebuild the index or fall back
+/// to scanning.
 pub fn search(
-    segment: &Segment,
+    index: &Index,
     scope: &Scope,
     query: &Query,
     mode: Mode,
@@ -53,7 +54,7 @@ pub fn search(
     on_error: &(dyn Fn(&Error) + Sync),
 ) -> Result<(Summary, SearchStats)> {
     let matcher = mtseek_walk::build_matcher(query)?;
-    if segment.roots() != scope.roots.len() {
+    if index.base().roots() != scope.roots.len() {
         return Err(Error::Io {
             path: scope.roots.first().cloned().unwrap_or_default(),
             source: std::io::Error::new(
@@ -63,13 +64,19 @@ pub fn search(
         });
     }
     let plan = plan::plan(query);
-    let candidates = match candidates(&plan, segment)? {
-        Some(list) => list,
-        None => (0..segment.len()).collect(),
-    };
+    let layers = index.layers();
+    let mut per_layer = Vec::with_capacity(layers.len());
+    for &(segment, skip) in &layers {
+        let found = match candidates(&plan, segment)? {
+            Some(list) => list,
+            None => (0..segment.len()).collect(),
+        };
+        per_layer.push(difference(&found, skip));
+    }
+    let candidates: u64 = per_layer.iter().map(|c| c.len() as u64).sum();
 
     let errors = AtomicU64::new(0);
-    for stored in segment.errors() {
+    for stored in index.errors() {
         let path = match stored.root {
             Some(root) => scope.roots[root as usize].join(&stored.path),
             None => stored.path.clone(),
@@ -81,27 +88,7 @@ pub fn search(
         });
     }
 
-    // Consecutive candidates in one block are one unit of work: decompress once.
-    let mut work: Vec<(Option<u32>, &[u32])> = Vec::new();
-    let mut rest = &candidates[..];
-    while let Some(&first) = rest.first() {
-        let block = match segment.location(first) {
-            Location::Block { block, .. } => Some(block),
-            Location::Empty | Location::External => None,
-        };
-        let n = match block {
-            Some(b) => rest
-                .iter()
-                .take_while(|&&d| {
-                    matches!(segment.location(d), Location::Block { block, .. } if block == b)
-                })
-                .count(),
-            None => 1,
-        };
-        let (head, tail) = rest.split_at(n);
-        work.push((block, head));
-        rest = tail;
-    }
+    let work = group(&layers, &per_layer);
 
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -113,7 +100,7 @@ pub fn search(
         for _ in 0..threads {
             threads_scope.spawn(|| {
                 let worker = Worker {
-                    segment,
+                    layers: &layers,
                     scope,
                     on_hit,
                     on_error,
@@ -137,20 +124,60 @@ pub fn search(
     }
     Ok((
         Summary {
-            files_searched: candidates.len() as u64,
+            files_searched: candidates,
             files_matched: files_matched.into_inner(),
             errors: errors.into_inner(),
         },
         SearchStats {
             plan,
-            candidates: candidates.len() as u64,
+            candidates,
             blocks: blocks.into_inner(),
         },
     ))
 }
 
+/// Splits each layer's candidates into units of work: consecutive candidates in one store
+/// block are decompressed once; files outside the store go one by one.
+fn group<'a>(layers: &[(&Segment, &[u32])], per_layer: &'a [Vec<u32>]) -> Vec<Work<'a>> {
+    let mut work = Vec::new();
+    for (layer, (&(segment, _), docs)) in layers.iter().zip(per_layer).enumerate() {
+        let mut rest = &docs[..];
+        while let Some(&first) = rest.first() {
+            let block = match segment.location(first) {
+                Location::Block { block, .. } => Some(block),
+                Location::Empty | Location::External => None,
+            };
+            let n = match block {
+                Some(b) => rest
+                    .iter()
+                    .take_while(|&&d| {
+                        matches!(segment.location(d), Location::Block { block, .. } if block == b)
+                    })
+                    .count(),
+                None => 1,
+            };
+            let (head, tail) = rest.split_at(n);
+            work.push(Work {
+                layer,
+                block,
+                docs: head,
+            });
+            rest = tail;
+        }
+    }
+    work
+}
+
+/// Candidates of one layer that share a store block (or one file outside the store).
+#[derive(Clone, Copy)]
+struct Work<'a> {
+    layer: usize,
+    block: Option<u32>,
+    docs: &'a [u32],
+}
+
 struct Worker<'a> {
-    segment: &'a Segment,
+    layers: &'a [(&'a Segment, &'a [u32])],
     scope: &'a Scope,
     on_hit: &'a (dyn Fn(&FileHit<'_>) -> ControlFlow<()> + Sync),
     on_error: &'a (dyn Fn(&Error) + Sync),
@@ -164,27 +191,31 @@ impl Worker<'_> {
         &self,
         matcher: &mtseek_walk::RegexMatcher,
         mode: Mode,
-        work: &[(Option<u32>, &[u32])],
+        work: &[Work<'_>],
         next: &AtomicUsize,
         blocks: &AtomicU64,
     ) -> Result<(), IndexError> {
-        let mut reader = self.segment.block_reader()?;
+        let mut readers = Vec::with_capacity(self.layers.len());
+        for (segment, _) in self.layers {
+            readers.push(segment.block_reader()?);
+        }
         let mut searcher = FileSearcher::new(self.scope.filter, mode);
         while !self.stop.load(Ordering::Relaxed) {
-            let Some(&(block, docs)) = work.get(next.fetch_add(1, Ordering::Relaxed)) else {
+            let Some(&item) = work.get(next.fetch_add(1, Ordering::Relaxed)) else {
                 break;
             };
-            let raw: &[u8] = match block {
+            let segment = self.layers[item.layer].0;
+            let raw: &[u8] = match item.block {
                 Some(b) => {
                     blocks.fetch_add(1, Ordering::Relaxed);
-                    reader.read(b)?
+                    readers[item.layer].read(b)?
                 }
                 None => &[],
             };
-            for &doc in docs {
-                let (root, relative) = self.segment.path(doc);
+            for &doc in item.docs {
+                let (root, relative) = segment.path(doc);
                 let path = self.scope.roots[root].join(relative);
-                let found = match self.segment.location(doc) {
+                let found = match segment.location(doc) {
                     Location::Block { offset, len, .. } => {
                         let bytes = &raw[offset as usize..(offset + len) as usize];
                         searcher.search_bytes(matcher, bytes)
@@ -215,6 +246,24 @@ impl Worker<'_> {
         }
         Ok(())
     }
+}
+
+/// `a` without the elements of `b` (both increasing).
+fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len());
+    let mut j = 0;
+    for &x in a {
+        while j < b.len() && b[j] < x {
+            j += 1;
+        }
+        if b.get(j) != Some(&x) {
+            out.push(x);
+        }
+    }
+    out
 }
 
 /// The files satisfying `plan`, in increasing order, or `None` for all of them.
@@ -347,6 +396,7 @@ mod tests {
             let bv: Vec<u32> = b.iter().copied().collect();
             prop_assert_eq!(intersect(&av, &bv), a.intersection(&b).copied().collect::<Vec<_>>());
             prop_assert_eq!(union(&av, &bv), a.union(&b).copied().collect::<Vec<_>>());
+            prop_assert_eq!(difference(&av, &bv), a.difference(&b).copied().collect::<Vec<_>>());
         }
     }
 }

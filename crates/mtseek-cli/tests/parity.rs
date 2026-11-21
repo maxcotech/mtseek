@@ -46,7 +46,7 @@ const QUERIES: &[(&str, &[&str])] = &[
 const UNSTABLE: &[&str] = &["binary-late.bin"];
 
 /// mtseek runs every case twice: scanning, and through the content index (`--index`).
-const MTSEEK_VARIANTS: &[&[&str]] = &[&[], &["--index"]];
+const MTSEEK_VARIANTS: &[&[&str]] = &[&["--no-index"], &["--index"]];
 
 const SCOPES: &[&[&str]] = &[&[], &["-u"], &["-uu"]];
 const FILES_MODE: &[&str] = &["--files-with-matches"];

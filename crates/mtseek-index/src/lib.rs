@@ -12,6 +12,8 @@
 
 mod build;
 mod format;
+mod live;
+mod ntfs;
 mod read;
 pub mod text;
 pub mod trigram;
@@ -20,9 +22,43 @@ mod write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use build::{build, read_stored, scope_key};
+pub use build::{build, read_file, scope_key};
+pub use live::{CatchUp, Index, delta_path};
 pub use read::{BlockReader, Location, Segment};
-pub use write::{Content, Doc, StoredError, WriteStats, write_segment};
+pub use write::{Content, Doc, SegmentInfo, StoredError, WriteStats, write_segment};
+
+/// A directory or control file the index tracks by file reference number (ADR 0011).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Entry {
+    /// Its NTFS file reference number.
+    pub frn: u64,
+    /// The root it is under.
+    pub root: u32,
+    /// Its path relative to that root (empty for the root itself).
+    pub path: PathBuf,
+}
+
+/// Where a segment is up to date in one drive's change journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The drive letter.
+    pub letter: char,
+    /// The journal's identity; a recreated journal has another.
+    pub journal_id: u64,
+    /// The next change the segment hasn't seen.
+    pub usn: i64,
+}
+
+/// A segment's identity and freshness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// Unique per written segment.
+    pub build_id: u64,
+    /// For a delta: the `build_id` of the base it applies to. 0 for a base.
+    pub base_id: u64,
+    /// One per drive of the scope's roots. Empty if the journal isn't available.
+    pub checkpoints: Vec<Checkpoint>,
+}
 
 /// Files bigger than this aren't stored; every query reads them from disk instead.
 pub const MAX_STORED: u64 = 256 << 20;
@@ -114,8 +150,23 @@ mod tests {
         Doc {
             root,
             path: PathBuf::from(path),
+            frn: bytes.len() as u64 + 1,
             content: Content::Stored(bytes.to_vec()),
         }
+    }
+
+    fn write(path: &Path, roots: u32, docs: &mut [Doc], errors: &[StoredError]) -> WriteStats {
+        let meta = Meta::default();
+        let info = SegmentInfo {
+            key: "key",
+            roots,
+            errors,
+            dirs: &[],
+            controls: &[],
+            tombstones: &[],
+            meta: &meta,
+        };
+        write_segment(path, &info, docs, 4).unwrap()
     }
 
     /// Every stored file's bytes, read back through the segment.
@@ -151,6 +202,7 @@ mod tests {
             Doc {
                 root: 0,
                 path: PathBuf::from("huge"),
+                frn: 99,
                 content: Content::External,
             },
         ];
@@ -159,7 +211,7 @@ mod tests {
             path: PathBuf::from("locked"),
             message: "Access is denied. (os error 5)".into(),
         }];
-        let stats = write_segment(&path, "key", 2, &mut docs, &errors, 4).unwrap();
+        let stats = write(&path, 2, &mut docs, &errors);
         assert_eq!((stats.files, stats.external), (6, 1));
 
         let segment = Segment::open(&path).unwrap();
@@ -194,11 +246,60 @@ mod tests {
     }
 
     #[test]
+    fn directories_controls_tombstones_and_meta_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        let dirs = vec![
+            Entry {
+                frn: 1,
+                root: 0,
+                path: PathBuf::new(),
+            },
+            Entry {
+                frn: 2,
+                root: 0,
+                path: PathBuf::from("src"),
+            },
+        ];
+        let controls = vec![Entry {
+            frn: 3,
+            root: 0,
+            path: PathBuf::from(".gitignore"),
+        }];
+        let meta = Meta {
+            build_id: 10,
+            base_id: 20,
+            checkpoints: vec![Checkpoint {
+                letter: 'C',
+                journal_id: 5,
+                usn: 6,
+            }],
+        };
+        let info = SegmentInfo {
+            key: "key",
+            roots: 1,
+            errors: &[],
+            dirs: &dirs,
+            controls: &controls,
+            tombstones: &[0, 4, 9],
+            meta: &meta,
+        };
+        let mut docs = vec![doc(0, "src/a.rs", b"fn main() {}")];
+        write_segment(&path, &info, &mut docs, 1).unwrap();
+        let segment = Segment::open(&path).unwrap();
+        assert_eq!(segment.dirs().unwrap(), dirs);
+        assert_eq!(segment.controls().unwrap(), controls);
+        assert_eq!(segment.tombstones(), [0, 4, 9]);
+        assert_eq!(segment.meta(), &meta);
+        assert_eq!(segment.frn(0), 13);
+    }
+
+    #[test]
     fn damaged_segments_are_errors_not_panics() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg");
         let mut docs = vec![doc(0, "a", b"some text here"), doc(0, "b", b"more text")];
-        write_segment(&path, "key", 1, &mut docs, &[], 1).unwrap();
+        write(&path, 1, &mut docs, &[]);
         let good = std::fs::read(&path).unwrap();
         // Cut anywhere: always an error.
         for len in (0..good.len()).step_by(7) {
@@ -223,12 +324,13 @@ mod tests {
                 doc(0, "b", b"beta delta"),
                 doc(0, "c", &[b'y'; 70_000]),
             ];
-            write_segment(&path, "key", 1, &mut docs, &[], 1).unwrap();
+            write(&path, 1, &mut docs, &[]);
             let mut bytes = std::fs::read(&path).unwrap();
             let i = at.index(bytes.len());
             bytes[i] = value;
             std::fs::write(&path, &bytes).unwrap();
             if let Ok(segment) = Segment::open(&path) {
+                let _ = (segment.dirs(), segment.controls());
                 for d in 0..segment.len() {
                     let _ = segment.path(d);
                     if let Location::Block { block, .. } = segment.location(d) {

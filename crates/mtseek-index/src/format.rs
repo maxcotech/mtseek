@@ -1,9 +1,10 @@
-//! The segment file layout (ADR 0010) and the byte-level helpers shared by the writer and
-//! the reader.
+//! The segment file layout (ADR 0010, 0011) and the byte-level helpers shared by the writer
+//! and the reader.
 //!
 //! ```text
-//! header   "MTSKCIDX" version:u32 0:u32 docs:u32 blocks:u32 trigrams:u32 errors:u32
-//! sections scope, docs, paths, errors, dictionary, postings, blocks, store
+//! header   "MTSKCIDX" version:u32 roots:u32 docs:u32 blocks:u32 trigrams:u32 errors:u32
+//! sections scope, docs, paths, errors, dictionary, postings, blocks, store,
+//!          dirs, controls, tombstones, meta
 //! trailer  SECTIONS × (offset:u64, length:u64) "MTSKCEND"
 //! ```
 //!
@@ -11,11 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::{Checkpoint, Entry, Meta};
+
 pub(crate) const MAGIC: &[u8; 8] = b"MTSKCIDX";
 pub(crate) const END_MAGIC: &[u8; 8] = b"MTSKCEND";
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 pub(crate) const HEADER_LEN: usize = 32;
-pub(crate) const SECTIONS: usize = 8;
+pub(crate) const SECTIONS: usize = 12;
 pub(crate) const TRAILER_LEN: usize = SECTIONS * 16 + 8;
 
 /// Section numbers, in file order.
@@ -28,15 +31,29 @@ pub(crate) mod section {
     pub(crate) const POSTINGS: usize = 5;
     pub(crate) const BLOCKS: usize = 6;
     pub(crate) const STORE: usize = 7;
+    /// Directories the walk entered: [`super::put_entry`] records. Read only by catch-up.
+    pub(crate) const DIRS: usize = 8;
+    /// Ignore-control files (`.gitignore`, ...): [`super::put_entry`] records.
+    pub(crate) const CONTROLS: usize = 9;
+    /// In a delta: the base's files it replaces or deletes, increasing `u32` ids.
+    pub(crate) const TOMBSTONES: usize = 10;
+    /// Build id, base id and journal checkpoints ([`super::put_meta`]).
+    pub(crate) const META: usize = 11;
+
+    /// Sections that are read only on demand, so may be big.
+    pub(crate) fn is_lazy(i: usize) -> bool {
+        matches!(i, POSTINGS | STORE | DIRS | CONTROLS)
+    }
 }
 
-/// `block, offset in block, stored length, path offset, path length | UTF16_PATH, root`.
-pub(crate) const DOC_LEN: usize = 24;
+/// `block, offset in block, stored length, path offset, path length | UTF16_PATH, root,
+/// file reference number (u64)`.
+pub(crate) const DOC_LEN: usize = 32;
 /// `trigram, file count, postings offset`.
 pub(crate) const DICT_LEN: usize = 16;
 /// `store offset, compressed length, raw length`.
 pub(crate) const BLOCK_LEN: usize = 16;
-/// Set in a doc's path length when the path is stored as UTF-16 (not valid Unicode).
+/// Set in a path length when the path is stored as UTF-16 (not valid Unicode).
 pub(crate) const UTF16_PATH: u32 = 1 << 31;
 /// The block of an empty file: there is nothing to read.
 pub(crate) const NO_BLOCK: u32 = u32::MAX;
@@ -45,6 +62,82 @@ pub(crate) const NO_BLOCK: u32 = u32::MAX;
 pub(crate) const BLOCK_TARGET: usize = 64 * 1024;
 /// zstd level for the store (ADR 0010).
 pub(crate) const ZSTD_LEVEL: i32 = 3;
+
+/// Appends one dirs/controls record: `frn:u64 root:u32 path_len:u32 path`.
+pub(crate) fn put_entry(out: &mut Vec<u8>, entry: &Entry) {
+    let (path, utf16) = encode_path(&entry.path);
+    // Paths are far shorter than 2 GiB; an absurd one is cut rather than corrupting the file.
+    let len = u32::try_from(path.len()).unwrap_or(0).min(UTF16_PATH - 1);
+    out.extend_from_slice(&entry.frn.to_le_bytes());
+    out.extend_from_slice(&entry.root.to_le_bytes());
+    out.extend_from_slice(&(len | if utf16 { UTF16_PATH } else { 0 }).to_le_bytes());
+    out.extend_from_slice(&path[..len as usize]);
+}
+
+/// Parses a dirs/controls section. `None` if it is malformed or names a root `>= roots`.
+pub(crate) fn parse_entries(mut bytes: &[u8], roots: u32) -> Option<Vec<Entry>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let frn = u64_at(take(&mut bytes, 8)?, 0);
+        let root = u32_at(take(&mut bytes, 4)?, 0);
+        let len = u32_at(take(&mut bytes, 4)?, 0);
+        let path = decode_path(
+            take(&mut bytes, (len & !UTF16_PATH) as usize)?,
+            len & UTF16_PATH != 0,
+        )?;
+        if root >= roots {
+            return None;
+        }
+        out.push(Entry { frn, root, path });
+    }
+    Some(out)
+}
+
+/// Encodes the meta section: `build_id:u64 base_id:u64 n:u32` then `n` checkpoints of
+/// `letter:u32 journal_id:u64 usn:i64`.
+pub(crate) fn put_meta(meta: &Meta) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&meta.build_id.to_le_bytes());
+    out.extend_from_slice(&meta.base_id.to_le_bytes());
+    let n = u32::try_from(meta.checkpoints.len()).unwrap_or(0);
+    out.extend_from_slice(&n.to_le_bytes());
+    for c in meta.checkpoints.iter().take(n as usize) {
+        out.extend_from_slice(&u32::from(c.letter).to_le_bytes());
+        out.extend_from_slice(&c.journal_id.to_le_bytes());
+        out.extend_from_slice(&c.usn.to_le_bytes());
+    }
+    out
+}
+
+/// Parses the meta section. `None` if it is malformed.
+pub(crate) fn parse_meta(mut bytes: &[u8]) -> Option<Meta> {
+    let build_id = u64_at(take(&mut bytes, 8)?, 0);
+    let base_id = u64_at(take(&mut bytes, 8)?, 0);
+    let n = u32_at(take(&mut bytes, 4)?, 0);
+    let mut checkpoints = Vec::new();
+    for _ in 0..n {
+        let letter = char::from_u32(u32_at(take(&mut bytes, 4)?, 0))?;
+        let journal_id = u64_at(take(&mut bytes, 8)?, 0);
+        let usn = i64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
+        checkpoints.push(Checkpoint {
+            letter,
+            journal_id,
+            usn,
+        });
+    }
+    bytes.is_empty().then_some(Meta {
+        build_id,
+        base_id,
+        checkpoints,
+    })
+}
+
+/// Splits `n` bytes off the front of `bytes`.
+pub(crate) fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    let (head, rest) = bytes.split_at_checked(n)?;
+    *bytes = rest;
+    Some(head)
+}
 
 /// Encodes a relative path for the paths section. Returns the bytes and whether they are
 /// UTF-16 (only for names that aren't valid Unicode, which Windows allows).
@@ -157,6 +250,45 @@ mod tests {
             let mut pos = 0;
             while get_varint(&bytes, &mut pos).is_some() {}
         }
+    }
+
+    #[test]
+    fn entries_and_meta_round_trip() {
+        let entries = vec![
+            Entry {
+                frn: 7,
+                root: 0,
+                path: PathBuf::from("a\\b"),
+            },
+            Entry {
+                frn: u64::MAX,
+                root: 1,
+                path: PathBuf::new(),
+            },
+        ];
+        let mut bytes = Vec::new();
+        for e in &entries {
+            put_entry(&mut bytes, e);
+        }
+        assert_eq!(parse_entries(&bytes, 2).unwrap(), entries);
+        assert!(parse_entries(&bytes, 1).is_none(), "root out of range");
+        assert!(
+            parse_entries(&bytes[..bytes.len() - 1], 2).is_none(),
+            "truncated"
+        );
+
+        let meta = Meta {
+            build_id: 1,
+            base_id: 2,
+            checkpoints: vec![Checkpoint {
+                letter: 'C',
+                journal_id: 3,
+                usn: -4,
+            }],
+        };
+        let bytes = put_meta(&meta);
+        assert_eq!(parse_meta(&bytes).unwrap(), meta);
+        assert!(parse_meta(&bytes[..bytes.len() - 1]).is_none());
     }
 
     #[test]

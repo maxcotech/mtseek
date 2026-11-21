@@ -12,7 +12,7 @@ use crate::format::{
     self, BLOCK_LEN, DICT_LEN, DOC_LEN, END_MAGIC, HEADER_LEN, MAGIC, NO_BLOCK, SECTIONS,
     TRAILER_LEN, UTF16_PATH, VERSION, section, u32_at, u64_at,
 };
-use crate::{EXTERNAL_BLOCK, IndexError, MAX_STORED, StoredError};
+use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, StoredError};
 
 /// An open segment.
 #[derive(Debug)]
@@ -27,8 +27,12 @@ pub struct Segment {
     dictionary: Vec<u8>,
     blocks: Vec<u8>,
     errors: Vec<StoredError>,
+    tombstones: Vec<u32>,
+    meta: Meta,
     postings: (u64, u64),
     store: (u64, u64),
+    dirs: (u64, u64),
+    controls: (u64, u64),
     file_bytes: u64,
 }
 
@@ -92,6 +96,9 @@ impl Segment {
         let error_bytes = read_section(section::ERRORS)?;
         let dictionary = read_section(section::DICTIONARY)?;
         let blocks = read_section(section::BLOCKS)?;
+        let tombstone_bytes = read_section(section::TOMBSTONES)?;
+        let meta =
+            format::parse_meta(&read_section(section::META)?).ok_or_else(|| corrupt("bad meta"))?;
 
         if docs.len() as u64 != u64::from(doc_count) * DOC_LEN as u64
             || dictionary.len() as u64 != u64::from(trigram_count) * DICT_LEN as u64
@@ -106,6 +113,11 @@ impl Segment {
         check_dictionary(&dictionary, doc_count, postings.1).map_err(corrupt)?;
         let errors =
             parse_errors(&error_bytes, error_count, roots).ok_or_else(|| corrupt("bad errors"))?;
+        let (pairs, rest) = tombstone_bytes.as_chunks::<4>();
+        let tombstones: Vec<u32> = pairs.iter().map(|&b| u32::from_le_bytes(b)).collect();
+        if !rest.is_empty() || tombstones.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(corrupt("bad tombstones"));
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -118,8 +130,12 @@ impl Segment {
             dictionary,
             blocks,
             errors,
+            tombstones,
+            meta,
             postings,
             store,
+            dirs: ranges[section::DIRS],
+            controls: ranges[section::CONTROLS],
             file_bytes,
         })
     }
@@ -152,6 +168,35 @@ impl Segment {
     /// Files and directories that couldn't be read when the segment was built.
     pub fn errors(&self) -> &[StoredError] {
         &self.errors
+    }
+
+    /// For a delta: the base's files it replaces or deletes, in increasing order.
+    pub fn tombstones(&self) -> &[u32] {
+        &self.tombstones
+    }
+
+    /// Build id, base id and journal checkpoints.
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    /// The directories the walk entered (read from disk on each call).
+    pub fn dirs(&self) -> Result<Vec<Entry>, IndexError> {
+        self.entries(self.dirs)
+    }
+
+    /// The ignore-control files in those directories (read from disk on each call).
+    pub fn controls(&self) -> Result<Vec<Entry>, IndexError> {
+        self.entries(self.controls)
+    }
+
+    /// `doc`'s NTFS file reference number, or 0 if unknown.
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn frn(&self, doc: u32) -> u64 {
+        u64_at(self.doc(doc), 24)
     }
 
     /// The root `doc` was found under and its path relative to that root.
@@ -247,6 +292,19 @@ impl Segment {
         })
     }
 
+    fn entries(&self, (offset, len): (u64, u64)) -> Result<Vec<Entry>, IndexError> {
+        let corrupt = || IndexError::Corrupt {
+            path: self.path.clone(),
+            reason: "bad directory or control entries",
+        };
+        let mut bytes = vec![0u8; usize::try_from(len).map_err(|_| corrupt())?];
+        read_at(&self.file, &mut bytes, offset).map_err(|source| IndexError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        format::parse_entries(&bytes, self.roots).ok_or_else(corrupt)
+    }
+
     fn doc(&self, doc: u32) -> &[u8] {
         let at = doc as usize * DOC_LEN;
         &self.docs[at..at + DOC_LEN]
@@ -325,7 +383,7 @@ fn section_ranges(file: &File, file_bytes: u64) -> Result<[(u64, u64); SECTIONS]
         if offset < HEADER_LEN as u64 || offset.checked_add(len).is_none_or(|e| e > data_end) {
             return Err("section out of bounds");
         }
-        if i != section::POSTINGS && i != section::STORE && len > MAX_EAGER_SECTION {
+        if !section::is_lazy(i) && len > MAX_EAGER_SECTION {
             return Err("section too big");
         }
         *range = (offset, len);
@@ -405,11 +463,7 @@ fn check_dictionary(
 }
 
 fn parse_errors(mut bytes: &[u8], count: u32, roots: u32) -> Option<Vec<StoredError>> {
-    fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-        let (head, rest) = bytes.split_at_checked(n)?;
-        *bytes = rest;
-        Some(head)
-    }
+    use format::take;
     let mut errors = Vec::new();
     for _ in 0..count {
         let root = u32_at(take(&mut bytes, 4)?, 0);
