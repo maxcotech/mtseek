@@ -18,3 +18,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0011](0011-live-content-index.md) | Keep the content index current from the USN journal | Accepted |
 | [0012](0012-index-coverage.md) | What the daemon indexes: coverage roots, narrowed at query time | Accepted |
 | [0013](0013-daemon-and-ipc.md) | The daemon and its pipe protocol | Accepted |
+| [0014](0014-service-mode.md) | Service mode: one machine-wide daemon that shows each caller only what it could read | Proposed |
