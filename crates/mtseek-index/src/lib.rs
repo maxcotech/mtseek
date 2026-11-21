@@ -23,9 +23,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use build::{build, coverage, read_file, scope_key};
-pub use live::{CatchUp, Index, delta_path};
+pub use live::{CatchUp, Index, Persist, delta_path};
 pub use read::{BlockReader, Location, Segment};
-pub use write::{Content, Doc, SegmentInfo, StoredError, WriteStats, write_segment};
+pub use write::{
+    Content, Doc, SegmentInfo, StoredError, WriteStats, segment_bytes, write_bytes, write_segment,
+};
 
 /// A directory or control file the index tracks by file reference number (ADR 0011).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

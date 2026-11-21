@@ -1,5 +1,9 @@
 //! Keeping the content index current (ADR 0011): an immutable base segment, a delta segment
 //! with every file added or re-read since, and catch-up from the NTFS change journal.
+//!
+//! The CLI writes each new delta to disk before searching it. The daemon keeps it in memory
+//! and writes it later, once changes stop ([`Persist::Later`], ADR 0013), so writing never
+//! adds to a search's time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +31,18 @@ pub struct Index {
     base: Segment,
     delta: Option<Segment>,
     base_path: PathBuf,
+    persist: Persist,
+}
+
+/// When [`Index::catch_up`] writes the delta it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Persist {
+    /// Write it to disk before returning.
+    #[default]
+    Now,
+    /// Keep it in memory until [`Index::save`]. A crash loses only the memory: the next
+    /// open catches up from the last delta written.
+    Later,
 }
 
 /// What [`Index::catch_up`] did.
@@ -66,7 +82,33 @@ impl Index {
             base,
             delta,
             base_path: base_path.to_path_buf(),
+            persist: Persist::Now,
         })
+    }
+
+    /// Sets when catch-up writes the delta. The default is [`Persist::Now`].
+    pub fn set_persist(&mut self, persist: Persist) {
+        self.persist = persist;
+    }
+
+    /// Whether the delta holds changes not yet written to disk.
+    pub fn unsaved(&self) -> bool {
+        self.delta.as_ref().is_some_and(Segment::in_memory)
+    }
+
+    /// Writes a delta held in memory to disk, then reads it from there. Returns whether
+    /// there was one.
+    pub fn save(&mut self) -> Result<bool, IndexError> {
+        let Some(bytes) = self.delta.as_ref().and_then(Segment::bytes).cloned() else {
+            return Ok(false);
+        };
+        let path = delta_path(&self.base_path);
+        crate::write_bytes(&path, &bytes).map_err(|source| IndexError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        self.delta = Some(Segment::open(&path)?);
+        Ok(true)
     }
 
     /// Builds a fresh base for `scope` at `base_path` and removes any delta.
@@ -83,9 +125,15 @@ impl Index {
                 base,
                 delta: None,
                 base_path: base_path.to_path_buf(),
+                persist: Persist::Now,
             },
             stats,
         ))
+    }
+
+    /// Where the base segment is.
+    pub fn path(&self) -> &Path {
+        &self.base_path
     }
 
     /// The base segment.
@@ -405,6 +453,11 @@ impl Index {
             meta: &meta,
         };
         let path = delta_path(&self.base_path);
+        if self.persist == Persist::Later {
+            let (bytes, _) = crate::segment_bytes(&path, &info, &mut docs, options.thread_count())?;
+            self.delta = Some(Segment::from_bytes(&path, bytes.into())?);
+            return Ok(());
+        }
         // Close the old delta first: Windows can't replace a file that is open.
         self.delta = None;
         crate::write_segment(&path, &info, &mut docs, options.thread_count())?;

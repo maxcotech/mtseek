@@ -20,6 +20,7 @@ mtseek-ntfs = { path = "crates/mtseek-ntfs" }
 mtseek-names = { path = "crates/mtseek-names" }
 mtseek-index = { path = "crates/mtseek-index" }
 mtseek-query = { path = "crates/mtseek-query" }
+mtseek-engine = { path = "crates/mtseek-engine" }
 
 # Search primitives: the same crates ripgrep is built from, so semantics match rg exactly.
 grep-matcher = "0.1.9"

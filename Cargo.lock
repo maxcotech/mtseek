@@ -467,10 +467,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "mtseek-core",
- "mtseek-index",
- "mtseek-names",
- "mtseek-ntfs",
- "mtseek-query",
+ "mtseek-engine",
  "mtseek-testkit",
  "mtseek-walk",
  "tempfile",
@@ -481,6 +478,19 @@ name = "mtseek-core"
 version = "0.0.1"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "mtseek-engine"
+version = "0.0.1"
+dependencies = [
+ "mtseek-core",
+ "mtseek-index",
+ "mtseek-names",
+ "mtseek-ntfs",
+ "mtseek-query",
+ "mtseek-walk",
+ "tempfile",
 ]
 
 [[package]]

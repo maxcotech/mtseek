@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mtseek_core::{Filter, Scope};
-use mtseek_index::{CatchUp, Index, Location, membership};
+use mtseek_index::{CatchUp, Index, Location, Persist, membership};
 use mtseek_walk::Options;
 use proptest::prelude::*;
 
@@ -335,10 +335,17 @@ proptest! {
     ))]
 
     #[test]
+    /// `later` keeps deltas in memory as the daemon does (ADR 0013). After each batch,
+    /// `after` saves them (1), or drops the index and opens it from disk again (2): a
+    /// daemon that stopped without saving.
     fn a_caught_up_index_equals_a_fresh_build(
         setup in proptest::collection::vec(op(), 0..12),
-        batches in proptest::collection::vec(proptest::collection::vec(op(), 1..8), 1..4),
+        batches in proptest::collection::vec(
+            (proptest::collection::vec(op(), 1..8), 0u8..3),
+            1..4,
+        ),
         which in 0u8..4,
+        later in any::<bool>(),
     ) {
         let tree = tempfile::tempdir().expect("temp dir");
         let cache = tempfile::tempdir().expect("temp dir");
@@ -351,13 +358,34 @@ proptest! {
         let scope = coverage_scope(&root, which);
         let (mut index, _) =
             Index::build(&scope, Options::default(), &cache.path().join("idx")).expect("build");
-        for batch in &batches {
+        let persist = if later { Persist::Later } else { Persist::Now };
+        index.set_persist(persist);
+        for (batch, after) in &batches {
             for op in batch {
                 apply(&root, op);
             }
             let above = batch.iter().any(Op::is_above);
             check(&mut index, &scope, cache.path(), above)?;
+            index.set_persist(persist);
+            prop_assert!(later || !index.unsaved());
+            match after {
+                1 => {
+                    index.save().expect("save");
+                    prop_assert!(!index.unsaved());
+                }
+                2 => {
+                    let key = mtseek_index::scope_key(&scope).expect("key");
+                    let path = index.path().to_path_buf();
+                    drop(index);
+                    index = Index::open(&path, &key).expect("the base is still there");
+                    index.set_persist(persist);
+                }
+                _ => {}
+            }
         }
+        // A restart after the last batch catches up from what was saved.
+        let above = batches.iter().any(|(batch, _)| batch.iter().any(Op::is_above));
+        check(&mut index, &scope, cache.path(), above)?;
     }
 }
 
