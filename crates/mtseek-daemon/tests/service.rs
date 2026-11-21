@@ -88,10 +88,12 @@ fn run_as(user: &str, password: &str, command: &str, out: &Path, tag: &str) -> O
         stderr.display(),
         code.display()
     );
+    // `/s` and the outer quotes: cmd strips exactly those. Without `/s`, a line that starts
+    // with a quote (a quoted program path) loses its first and last quote and doesn't run.
     let script = format!(
         "$p = ConvertTo-SecureString '{password}' -AsPlainText -Force; \
          $c = New-Object System.Management.Automation.PSCredential('{user}', $p); \
-         Start-Process -FilePath cmd.exe -ArgumentList '/v:on', '/c', '{}' -Credential $c \
+         Start-Process -FilePath cmd.exe -ArgumentList '/v:on', '/s', '/c', '\"{}\"' -Credential $c \
          -LoadUserProfile -WorkingDirectory '{}' -Wait -WindowStyle Hidden",
         line.replace('\'', "''"),
         out.display()
