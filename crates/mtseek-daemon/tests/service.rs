@@ -124,6 +124,10 @@ fn run_as(user: &str, password: &str, command: &str, out: &Path, tag: &str) -> O
 
 /// `rg.exe` and `mtseek.exe` copied where the second account may run them (`bin`): `rg`
 /// is often installed in the administrator's own profile. Returns their paths.
+///
+/// A copy of `rg` that doesn't run is a launcher that finds the real program relative to
+/// itself (Chocolatey's, on CI); those live where every user may run them, so the original
+/// is used.
 #[allow(clippy::unwrap_used)] // test setup: a failure is the test failing
 fn programs(bin: &Path, mtseek: &Path) -> (PathBuf, PathBuf) {
     let found = Command::new("where.exe").arg("rg").output().unwrap();
@@ -135,7 +139,15 @@ fn programs(bin: &Path, mtseek: &Path) -> (PathBuf, PathBuf) {
     let copies = (bin.join("rg.exe"), bin.join("mtseek.exe"));
     fs::copy(&rg, &copies.0).unwrap();
     fs::copy(mtseek, &copies.1).unwrap();
-    copies
+    let runs = Command::new(&copies.0)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if runs {
+        copies
+    } else {
+        (rg, copies.1)
+    }
 }
 
 /// The tree (everyone may read it, but one private file), the output folder (everyone may
