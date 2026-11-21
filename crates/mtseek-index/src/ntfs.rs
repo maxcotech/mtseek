@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Component, Path, Prefix};
 
-use crate::Checkpoint;
+use crate::{Checkpoint, Sd, no_sd};
 
 /// Names whose presence or content changes which files ripgrep's walker lists below their
 /// directory. `.git` makes `.gitignore` apply (ripgrep's `require_git`).
@@ -42,6 +42,12 @@ pub(crate) fn drive_letter(path: &Path) -> Option<char> {
     }
 }
 
+/// Journal reasons that change who may read a file, but not its contents.
+pub(crate) const SECURITY_CHANGE: u32 = 0x0000_0800;
+/// Journal reasons that say nothing about contents or names: a permission change, and the
+/// close that summarises it.
+pub(crate) const NOT_CONTENT: u32 = SECURITY_CHANGE | 0x8000_0000;
+
 /// Why the journal couldn't be read from a checkpoint.
 #[derive(Debug)]
 pub(crate) enum JournalError {
@@ -53,11 +59,19 @@ pub(crate) enum JournalError {
 
 #[cfg(windows)]
 mod imp {
-    use super::{Checkpoint, File, JournalError, Listed, Listing, Path, io};
+    use super::{Checkpoint, File, JournalError, Listed, Listing, Path, Sd, io, no_sd};
     use mtseek_ntfs::{DirBuffer, Directory, Journal, VolumeError};
 
     pub(crate) fn file_frn(file: &File) -> u64 {
         mtseek_ntfs::file_ref_of(file).unwrap_or(0)
+    }
+
+    pub(crate) fn descriptor_of(file: &File) -> Sd {
+        mtseek_ntfs::security::descriptor_of(file).map_or_else(|_| no_sd(), Sd::from)
+    }
+
+    pub(crate) fn descriptor_at(path: &Path) -> Sd {
+        mtseek_ntfs::security::descriptor_at(path).map_or_else(|_| no_sd(), Sd::from)
     }
 
     pub(crate) fn list_dir(path: &Path) -> io::Result<Listing> {
@@ -86,7 +100,7 @@ mod imp {
 
     pub(crate) fn read_journal(
         from: &Checkpoint,
-        on_record: &mut dyn FnMut(u64, u64),
+        on_record: &mut dyn FnMut(u64, u64, u32),
     ) -> Result<Checkpoint, JournalError> {
         let journal = Journal::open(from.letter).map_err(|_| JournalError::Unavailable)?;
         let info = journal.info().map_err(|_| JournalError::Unavailable)?;
@@ -95,7 +109,7 @@ mod imp {
         }
         let next = journal
             .read(&info, from.usn, &mut |r| {
-                on_record(r.file_ref, r.parent_ref);
+                on_record(r.file_ref, r.parent_ref, r.reason);
             })
             .map_err(|e| match e {
                 VolumeError::JournalWrapped(_) => JournalError::Lost,
@@ -107,10 +121,18 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{Checkpoint, File, JournalError, Listing, Path, io};
+    use super::{Checkpoint, File, JournalError, Listing, Path, Sd, io, no_sd};
 
     pub(crate) fn file_frn(_: &File) -> u64 {
         0
+    }
+
+    pub(crate) fn descriptor_of(_: &File) -> Sd {
+        no_sd()
+    }
+
+    pub(crate) fn descriptor_at(_: &Path) -> Sd {
+        no_sd()
     }
 
     pub(crate) fn list_dir(path: &Path) -> io::Result<Listing> {
@@ -124,13 +146,13 @@ mod imp {
 
     pub(crate) fn read_journal(
         _: &Checkpoint,
-        _: &mut dyn FnMut(u64, u64),
+        _: &mut dyn FnMut(u64, u64, u32),
     ) -> Result<Checkpoint, JournalError> {
         Err(JournalError::Unavailable)
     }
 }
 
-pub(crate) use imp::{checkpoint, file_frn, list_dir, read_journal};
+pub(crate) use imp::{checkpoint, descriptor_at, descriptor_of, file_frn, list_dir, read_journal};
 
 #[cfg(test)]
 mod tests {

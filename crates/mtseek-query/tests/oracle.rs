@@ -67,6 +67,7 @@ fn by_index(
     collect(|on_hit, on_error| {
         let target = mtseek_query::Target {
             root: &root,
+            disk_root: &root,
             dir,
             filter,
         };
@@ -76,6 +77,7 @@ fn by_index(
             query,
             mode,
             Options::default(),
+            &mtseek_query::Everyone,
             on_hit,
             on_error,
         )

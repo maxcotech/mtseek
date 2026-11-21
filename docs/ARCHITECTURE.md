@@ -59,16 +59,16 @@ Crates land with the milestone that needs them. There are no empty placeholder c
 |---|---|---|
 | `mtseek-core` | M0 ✅ | Shared vocabulary: `Query`, `Scope`, `Filter`, `Error`. No I/O. |
 | `mtseek-walk` | M0 ✅ | The **reference scanner**: walks a scope and searches every file with ripgrep-identical semantics. Used as the test oracle, as the fallback for non-NTFS volumes and index-hostile patterns, and to search the dirty set. Its `list` (the scope's files and directories) and `FileSearcher` (one file's search) are what the content index builds from and verifies with. |
-| `mtseek-cli` | M0 ✅ | The `mtseek` binary: ripgrep's flags and output format (ADR 0005). Sends the search to the user's `mtseekd` when one answers on its pipe (ADR 0013), else runs `mtseek-engine` itself ("direct mode"); prints the same either way. |
+| `mtseek-cli` | M0 ✅ | The `mtseek` binary: ripgrep's flags and output format (ADR 0005). Sends the search to the user's `mtseekd`, else to the service (ADR 0013, 0014), else runs `mtseek-engine` itself ("direct mode"); prints the same either way. A search the service declines runs in direct mode. |
 | `mtseek-testkit` | M0 ✅ | Deterministic synthetic corpora full of edge cases. |
 | `xtask` | M0 ✅ | `cargo xtask ci / bench / corpus / fmt`. |
-| `mtseek-ntfs` | M1 ✅ | Raw MFT record reading with every hard link (ADR 0009) and MFT enumeration as its fallback, both needing admin; unprivileged USN journal reads through a directory handle, directory listings with file reference numbers, long paths. Safe parsers for every buffer format, property-tested against random and malformed input. Also the daemon's named pipe (`pipe`, ADR 0013): a DACL for the user's SID, remote clients refused, the server's identity checked by the client. **The only crate allowed `unsafe`**, confined to `src/sys.rs`. |
+| `mtseek-ntfs` | M1 ✅ | Raw MFT record reading with every hard link (ADR 0009) and MFT enumeration as its fallback, both needing admin; unprivileged USN journal reads through a directory handle, directory listings with file reference numbers, long paths. Safe parsers for every buffer format, property-tested against random and malformed input. Also the daemon's named pipe (`pipe`, ADR 0013): a DACL for the user's SID (or the service's), remote clients refused, the server's identity checked by the client. And service mode (ADR 0014): security descriptors, callers' tokens and `AccessCheck` (`security`, every descriptor checked for structure in safe code first), the SCM and the machine data folder (`service`). **The only crate allowed `unsafe`**, confined to `src/sys.rs`. |
 | `mtseek-names` | M1 ✅ | File-name index: flat name arenas + parent links, parallel SIMD substring scan (ADR 0007). Built from the MFT or by a parallel directory walk; saved as a snapshot and caught up from the USN journal by re-listing changed directories (ADR 0008). |
-| `mtseek-index` | M2 ✅ | Segment file (ADR 0010): trigram dictionary, delta-varint postings, document table, zstd content store of raw file bytes cut where ripgrep stops reading. Built from a scope's file list; opened with every section bounds-checked. Kept current (ADR 0011): file, folder and control-file reference numbers plus journal checkpoints in the segment, catch-up by re-listing dirty folders into a delta segment over the immutable base, rebuild when the delta grows past 1/8 of the base. Coverage (ADR 0012): each file, folder and error records which of the four ignore/hidden filter combinations would list it, so one index answers its subfolders and every narrower filter; files cut at a NUL are flagged for binary-mode searches. |
-| `mtseek-query` | M2 ✅ | Regex → trigram plan (`regex-syntax` HIR, Russ Cox's analysis), posting-list execution limited to the searched folder and filter, verification of candidates with `mtseek-walk`'s `FileSearcher` on stored bytes. |
-| `mtseek-engine` | M3b ✅ | What answers a search, for both hosts: coverage roots and their registry (ADR 0012), opening and catching up content indexes, scanning what no index covers, name indexes. `Engine::direct` serves one CLI run and writes every change first; `Engine::resident` (the daemon) keeps indexes open, catches them up between searches and keeps deltas in memory until they are quiet. Requests can carry the caller's working directory; results are spelled onto the roots as typed. |
+| `mtseek-index` | M2 ✅ | Segment file (ADR 0010; v4 since ADR 0014): trigram dictionary, delta-varint postings, document table, zstd content store of raw file bytes cut where ripgrep stops reading, and a table of security descriptors that files, folders and control files refer to. Secret-looking files are listed but never stored; encrypted files and cloud placeholders are never read. Built from a scope's file list; opened with every section bounds-checked. Kept current (ADR 0011): file, folder and control-file reference numbers plus journal checkpoints in the segment, catch-up by re-listing dirty folders into a delta segment over the immutable base, rebuild when the delta grows past 1/8 of the base. Coverage (ADR 0012): each file, folder and error records which of the four ignore/hidden filter combinations would list it, so one index answers its subfolders and every narrower filter; files cut at a NUL are flagged for binary-mode searches. |
+| `mtseek-query` | M2 ✅ | Regex → trigram plan (`regex-syntax` HIR, Russ Cox's analysis), posting-list execution limited to the searched folder and filter, verification of candidates with `mtseek-walk`'s `FileSearcher` on stored bytes. Before planning, the caller's visible set (ADR 0014): folders it may list and files it may read, by `Viewer`; the rest is reported as `rg` reports it and never reaches planning, verification or the summary. |
+| `mtseek-engine` | M3b ✅ | What answers a search, for both hosts: coverage roots and their registry (ADR 0012), opening and catching up content indexes, scanning what no index covers, name indexes. `Engine::direct` serves one CLI run and writes every change first; `Engine::resident` (the daemon) keeps indexes open, catches them up between searches and keeps deltas in memory until they are quiet. Requests can carry the caller's working directory; results are spelled onto the roots as typed. Every search runs for a `Caller` (this process, or a daemon's client by its token); `Engine::serve` answers only from indexes, exactly, or declines before reporting anything (the service, ADR 0014). |
 | `mtseek-ipc` | M3b ✅ | The daemon protocol (ADR 0013): newline-delimited JSON-RPC 2.0, typed messages, exact bytes (lines as UTF-8 text or base64, paths as strings or UTF-16), version negotiation, framing with a size limit, and the pipe client. No index internals. |
-| `mtseek-daemon` | M3b ✅ | `mtseekd`: one resident engine behind a local named pipe. `--console` runs it per user without admin; a thread per connection, searches one at a time, `$/hit` streaming, cancellation, a poller that catches indexes up every 250 ms and writes deltas after 2 s of quiet. Service mode, ACL filtering of results and the scheduler are M3c. |
+| `mtseek-daemon` | M3b ✅ | `mtseekd`: one resident engine behind a local named pipe. `--console` runs it per user without admin; a thread per connection, searches one at a time, `$/hit` streaming, cancellation, a poller that catches indexes up every 250 ms and writes deltas after 2 s of quiet. M3c (ADR 0014): `--install`/`--uninstall`/`--service` run it as the LocalSystem service for every interactive user, from `%ProgramData%\mtseek`, each client's token deciding what it sees; it declines what it can't answer exactly, logs no paths or queries, and stops only for an elevated administrator. The scheduler is later. |
 | `mtseek-mcp` | M4 | MCP server for AI agents. |
 | `mtseek-app` | M5 | GPUI desktop app (ADR 0003). |
 
@@ -111,7 +111,10 @@ These are properties the code must keep. Each one has a test that enforces it.
    and the ignore files above an indexed folder are tracked too (an edit above the folder
    rebuilds). Known gaps: git's global excludes file, a `.git/info` folder created after
    the index was built, and repositories whose `.git` is a file (worktrees, submodules)
-   need `--reindex`. The daemon (M3b, ADR 0013) catches its open indexes up every 250 ms
+   need `--reindex`. Permission changes count (ADR 0014): catch-up records the new security
+   descriptor of every file and folder the journal says changed, and the next search honours
+   it; `live.rs` changes DACLs and their inheritance and checks the descriptors against a
+   fresh build. The daemon (M3b, ADR 0013) catches its open indexes up every 250 ms
    and again before each search, and keeps the new delta in memory until changes have been
    quiet for 2 s. `live.rs` also keeps deltas in memory, saves them, and drops unsaved ones
    (a daemon that stopped), checking against a fresh build after each step.
@@ -119,8 +122,13 @@ These are properties the code must keep. Each one has a test that enforces it.
    Segments are written to a temporary file, flushed, then renamed over the old one. A delta
    the daemon holds in memory is only memory: after a crash the last written delta and its
    checkpoint are caught up again.
-5. **No privilege leak.** (M3) A user never sees a path or a line from a file their own
-   account cannot open (ADR 0004).
+5. **No privilege leak.** (M3c, ADR 0014) A caller sees exactly what `rg` run by that caller
+   would show: names in folders it may list (from the search root down), lines from files it
+   may read, and `Access is denied` for the rest. Decided by `AccessCheck` of the descriptors
+   the index recorded against the caller's token, before planning, so no count or line of an
+   invisible file reaches the output. Enforced by `crates/mtseek-cli/tests/access.rs` (direct
+   and daemon, after taking access away from the test's own account), the service tests in
+   `mtseek-daemon`, and the two-account test (`tests/service.rs`, elevated CI).
 6. **Only `mtseek-ntfs` contains `unsafe`**, and only in `src/sys.rs` (NTFS, and the pipe and token calls of the daemon's transport). Enforced by `unsafe_code = "forbid"` in workspace lints and `deny` + one scoped `allow` in that crate.
 7. **Name search is complete.** `mtseek --names ""` lists every file `rg --files -uu` lists (plus directories). Enforced by `crates/mtseek-cli/tests/names.rs`. Whole-drive indexes read raw MFT records so that every hard link is listed (ADR 0009); the admin-only tests in CI enforce it.
 8. **A snapshot is only a cache.** A caught-up snapshot gives the same answers as a fresh walk, and a missing or corrupt one costs time, never correctness. Enforced by `catch_up_matches_a_fresh_walk` (`mtseek-names`), the snapshot corruption property test, and `later_runs_reuse_the_saved_index_and_see_changes` (CLI).
@@ -131,16 +139,19 @@ These are properties the code must keep. Each one has a test that enforces it.
 - **Errors.** Library crates return `mtseek_core::Error`, and binaries add context with `anyhow`.
   Unreadable files are reported and skipped, never fatal (ripgrep's behaviour, exit code 2).
 - **Logging.** The CLI prints nothing but results to stdout. `mtseekd --console` logs one
-  line per request to stderr; structured logging (`tracing`, the event log) comes with
-  service mode (M3c).
+  line per request to stderr. The service logs one line per request (method, caller SID,
+  outcome, duration) to `%ProgramData%\mtseek\logs`, two files of at most 8 MiB, and never a
+  path or a query; the SCM's own events record starts, stops and crashes.
 - **Performance work** starts with a benchmark number and ends with one: `cargo xtask bench`.
   A speed claim without a run in `bench/results/` doesn't count.
 - **Windows specifics.** Long paths (`\\?\`), reparse points (not followed by default),
   hard links (the name index lists each link, like `rg --files`), UTF-16 files (BOM sniffing),
   USN journal wrap or recreation (full rebuild).
 - **Security.** The index holds file contents, so it is as sensitive as the disk.
-  The index directory is ACL'd to SYSTEM + Administrators, and secret-looking files are excluded
-  by default (ADR 0004).
+  The service's index directory is ACL'd to SYSTEM + Administrators (and recreated if someone
+  else created it first), and secret-looking files are never stored in any index
+  (ADR 0004, 0012 §4, 0014). Requests from other users are untrusted input: the protocol
+  parser and the descriptor checker are property-tested on damaged input.
 
 ## Milestones
 
@@ -149,7 +160,7 @@ These are properties the code must keep. Each one has a test that enforces it.
 | **M0** | Foundation | Workspace, CI, xtask, ADRs, benchmark harness with ripgrep baseline, parity test passing. |
 | **M1** | Name engine | `mtseek --names` from MFT or parallel walk; index persisted between runs and caught up from the USN journal without admin (ADR 0008). Whole-drive indexes list every hard link from raw MFT records (M1c, ADR 0009). |
 | M2 | Content engine | Trigram index + content store; `dev` scope queries under 100 ms with parity. M2a (ADR 0010): index built with `--index`, parity in every benchmark cell. M2b (ADR 0011): caught up from the USN journal on every search, used automatically once a scope has one. 12 of 16 `dev` cells under 100 ms; the rest are output volume, the no-literal regex and noise (`bench/TARGETS.md`). |
-| M3 | Daemon | Service, IPC, ACL filtering, dirty set, admin-free fallback mode. M3a: coverage roots (ADR 0012) in the CLI's direct mode. M3b (ADR 0013): `mtseekd --console`, the pipe protocol, one engine for both modes, deltas in memory until quiet. Next, M3c: service mode, ACL filtering, global excludes per caller. |
+| M3 | Daemon | Service, IPC, ACL filtering, dirty set, admin-free fallback mode. M3a: coverage roots (ADR 0012) in the CLI's direct mode. M3b (ADR 0013): `mtseekd --console`, the pipe protocol, one engine for both modes, deltas in memory until quiet. M3c (ADR 0014): the LocalSystem service, each caller's access checked against recorded descriptors, declines for what isn't exact. Left: names through the service, the global excludes file applied per caller, serving the walker path. |
 | M4 | Agents | MCP server, `--json`, docs/mcp.md; Claude Code uses it end to end. |
 | M5 | Desktop app | GPUI palette, preview, settings, onboarding, tray. Preceded by a GPUI spike. |
 | M6 | Ship | Signed MSI, winget, auto-update, docs site. |

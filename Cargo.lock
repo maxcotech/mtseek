@@ -498,6 +498,7 @@ dependencies = [
  "mtseek-engine",
  "mtseek-ipc",
  "mtseek-ntfs",
+ "mtseek-query",
  "mtseek-walk",
  "serde",
  "serde_json",

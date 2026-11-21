@@ -25,11 +25,15 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | Run the CLI | `cargo run -p mtseek-cli -- -F needle C:\some\dir` |
 | Run the daemon | `cargo run -p mtseek-daemon -- --console` (then `mtseek` answers through it) |
 | Daemon = direct mode | `cargo test -p mtseek-cli --test daemon` (Windows) |
+| What a caller may see (ADR 0014) | `cargo test -p mtseek-cli --test access` (Windows) |
+| Service end to end, two accounts | `cargo test -p mtseek-daemon --test service` (elevated; skips otherwise) |
 
 The toolchain is pinned in `rust-toolchain.toml`. Nothing needs admin rights except the MFT
-enumeration test in `mtseek-ntfs`, which skips when not elevated (CI is elevated and sets
-`MTSEEK_REQUIRE_ADMIN=1`). To run it locally, run `cargo test -p mtseek-ntfs` from an elevated
-terminal. The USN journal tests run as any user.
+enumeration test in `mtseek-ntfs` and the service test in `mtseek-daemon` (it installs a test
+service and creates a local account), which skip when not elevated (CI is elevated and sets
+`MTSEEK_REQUIRE_ADMIN=1`). To run them locally, run `cargo test -p mtseek-ntfs` and
+`cargo test -p mtseek-daemon --test service` from an elevated terminal. The USN journal and
+access-check tests run as any user.
 
 ## Rules
 
@@ -63,7 +67,7 @@ crates/mtseek-engine   what answers a search, shared by direct mode and the daem
 crates/mtseek-ipc      daemon protocol: JSON-RPC messages, framing, client
 crates/mtseek-daemon   `mtseekd`: resident engine behind a named pipe
 crates/mtseek-testkit  deterministic edge-case corpus generator
-crates/mtseek-ntfs     MFT + USN journal + the daemon's pipe (Win32 FFI; all unsafe in src/sys.rs)
+crates/mtseek-ntfs     MFT + USN journal + pipe, tokens, ACLs, SCM (Win32 FFI; all unsafe in src/sys.rs)
 crates/mtseek-names    file-name index (arenas + parent links), MFT or walk source
 crates/mtseek-index    content index: segments (postings + zstd store), live catch-up; tests/live.rs
 crates/mtseek-query    regex -> trigram plan, candidate lookup, verification; tests/oracle.rs
@@ -86,7 +90,12 @@ docs/                  ARCHITECTURE.md, adr/
 - When `mtseekd` runs, `mtseek` answers through it, from the daemon's cache. CLI tests go
   through `tests/common/mod.rs` (`How`), which sets `MTSEEK_PIPE` either to a pipe nobody
   serves (direct mode) or to a daemon started for the test, so a daemon you are running
-  never answers a test.
+  never answers a test. With `MTSEEK_PIPE` set, the CLI tries no service pipe unless
+  `MTSEEK_SERVICE_PIPE` names one, so an installed service never answers a test either.
+- Every search checks what its caller may see against the security descriptors in the index
+  (ADR 0014), in direct mode too. A permission change only updates the descriptor; the bytes
+  stay. So a test that takes access away from itself (`security::set_dacl`, see
+  `tests/access.rs`) must give it back before the temp dir is deleted.
 - The content index must never change *what* matches, only how fast. If the oracle test
   fails, the index is wrong. Fix the planner or the stored bytes, never the test.
 - Paths print exactly as the walker joins them onto the root you pass. Don't canonicalise

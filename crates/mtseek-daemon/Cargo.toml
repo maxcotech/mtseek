@@ -15,6 +15,7 @@ path = "src/main.rs"
 mtseek-core.workspace = true
 mtseek-walk.workspace = true
 mtseek-engine.workspace = true
+mtseek-query.workspace = true
 mtseek-ipc.workspace = true
 clap.workspace = true
 serde.workspace = true

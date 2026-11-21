@@ -373,6 +373,15 @@ pub fn file_ref(path: &Path) -> io::Result<u64> {
     sys::file_index(handle.as_handle())
 }
 
+/// The volume serial number and file reference number of the file or folder at `path`:
+/// which file it is, whoever spells the path (ADR 0014).
+pub fn identity(path: &Path) -> io::Result<(u32, u64)> {
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000; // needed to open folders
+    let handle = sys::open(path.as_os_str(), FILE_READ_ATTRIBUTES, BACKUP_SEMANTICS)?;
+    sys::file_identity(handle.as_handle())
+}
+
 /// The NTFS file reference number of an already open file or directory.
 pub fn file_ref_of(file: &impl AsHandle) -> io::Result<u64> {
     sys::file_index(file.as_handle())

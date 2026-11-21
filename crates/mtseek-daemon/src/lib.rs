@@ -7,6 +7,14 @@
 //!   [`Config::poll`], so a search usually finds them current, and writes deltas to disk
 //!   once they have been quiet for [`Config::quiet`]. Writing never adds to a search.
 //! * A search stops when its client sends `$/cancel` or goes away.
+//! * Every search runs for its client's account (ADR 0014): the client's token, taken from
+//!   the pipe, decides what it may see.
+//!
+//! Two modes ([`Mode`]). A console daemon serves its own user. The service serves every
+//! interactive user of the machine from indexes SYSTEM built: it answers only what an index
+//! answers exactly for the caller and declines the rest (`DECLINED`), keeps paths and queries
+//! out of its log, shows each caller only the coverage it may list, and stops only for an
+//! elevated administrator.
 //!
 //! The binary is `mtseekd`. Tests run the daemon in-process with [`Daemon::spawn`].
 
@@ -16,21 +24,23 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query};
-use mtseek_engine::{Engine, IndexUse, NamesRequest, Report, SearchRequest};
+use mtseek_engine::{Caller, Engine, IndexUse, NamesRequest, Outcome, Report, SearchRequest};
 use mtseek_ipc::{
     CancelParams, Case, Hit, Incoming, IndexMode, IndexStatus, InitializeParams, InitializeResult,
     Line, MIN_PROTOCOL, Message, NamesParams, NamesResult, NamesStatus, PROTOCOL, Paths, Reader,
     RpcError, SearchMode, SearchParams, SearchResult, StatusResult, Summary, WirePath, code,
 };
 use mtseek_ntfs::pipe::{self, Listener};
-use mtseek_walk::{FileHit, Mode};
+use mtseek_ntfs::security::{self, Token};
+use mtseek_query::Viewer;
+use mtseek_walk::{FileHit, Mode as WalkMode};
 use serde_json::Value;
 
 /// How the daemon runs.
@@ -46,7 +56,24 @@ pub struct Config {
     pub quiet: Duration,
     /// Log requests and writes to stderr.
     pub log: bool,
+    /// Also log to this file, rotated at [`LOG_LIMIT`] (the service).
+    pub log_file: Option<PathBuf>,
+    /// Console (one user) or service (every user of the machine).
+    pub mode: Mode,
 }
+
+/// Who a daemon serves (ADR 0013, 0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// The user it runs as, on that user's pipe.
+    #[default]
+    Console,
+    /// Every interactive user, on [`pipe::SERVICE_PIPE`], running as `LocalSystem`.
+    Service,
+}
+
+/// A log file grows to this size, then is renamed to `.1` and started again.
+pub const LOG_LIMIT: u64 = 8 << 20;
 
 impl Config {
     /// The defaults of ADR 0013: poll every 250 ms, write after 2 s without changes.
@@ -57,6 +84,8 @@ impl Config {
             poll: Duration::from_millis(250),
             quiet: Duration::from_secs(2),
             log: false,
+            log_file: None,
+            mode: Mode::Console,
         }
     }
 }
@@ -74,6 +103,7 @@ struct Shared {
     config: Config,
     engine: Mutex<Engine>,
     stop: AtomicBool,
+    log_file: Mutex<Option<File>>,
 }
 
 impl Shared {
@@ -81,9 +111,56 @@ impl Shared {
         self.engine.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn service(&self) -> bool {
+        self.config.mode == Mode::Service
+    }
+
+    /// Logs a line that names no path and no query.
     fn log(&self, line: &str) {
         if self.config.log {
             let _ = writeln!(io::stderr(), "mtseekd: {line}");
+        }
+        let Some(path) = &self.config.log_file else {
+            return;
+        };
+        let mut file = lock(&self.log_file);
+        if file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .is_some_and(|m| m.len() > LOG_LIMIT)
+        {
+            *file = None;
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        }
+        if file.is_none() {
+            *file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok();
+        }
+        if let Some(f) = file.as_mut() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let _ = writeln!(f, "{secs} {line}");
+        }
+    }
+
+    /// Logs what saving wrote: each line in console mode, only how many in the service,
+    /// whose lines would name the folders users index.
+    fn log_saved(&self, lines: &[String]) {
+        if self.service() {
+            if !lines.is_empty() {
+                self.log(&format!(
+                    "{} write(s) of changes kept in memory",
+                    lines.len()
+                ));
+            }
+        } else {
+            for line in lines {
+                self.log(line);
+            }
         }
     }
 }
@@ -94,9 +171,10 @@ pub struct Daemon {
     shared: Arc<Shared>,
 }
 
-/// A daemon serving on a thread of this process (tests).
+/// A daemon serving on a thread of this process (tests, and the service host).
 pub struct Running {
     pipe: String,
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -106,7 +184,7 @@ impl Running {
         &self.pipe
     }
 
-    /// Asks it to stop, and waits until it has.
+    /// Writes what it holds in memory, stops it, and waits until it has.
     pub fn stop(mut self) -> io::Result<()> {
         self.shutdown()
     }
@@ -115,12 +193,15 @@ impl Running {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        let sid = pipe::user_sid()?;
-        if let Ok(Some(mut client)) =
-            mtseek_ipc::client::Client::connect(&self.pipe, Duration::from_secs(5), &sid)
         {
-            let _ = client.shutdown();
+            let mut engine = self.shared.engine();
+            let saved = engine.save(Duration::ZERO);
+            self.shared.log_saved(&saved);
+            self.shared.stop.store(true, Ordering::SeqCst);
         }
+        self.shared.log("stopping");
+        // Wake the accept loop, which then sees the flag.
+        let _ = pipe::connect(&self.pipe, Duration::from_secs(1), &pipe::user_sid()?);
         thread
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("the daemon thread panicked")))
@@ -136,7 +217,10 @@ impl Drop for Running {
 impl Daemon {
     /// Creates the pipe. Fails if another daemon holds it.
     pub fn bind(config: Config) -> io::Result<Self> {
-        let listener = Listener::bind(&config.pipe)?;
+        let listener = match config.mode {
+            Mode::Console => Listener::bind(&config.pipe)?,
+            Mode::Service => Listener::bind_with(&config.pipe, pipe::SERVICE_PIPE_SDDL)?,
+        };
         let engine = Engine::resident(config.cache.clone());
         Ok(Self {
             listener,
@@ -144,6 +228,7 @@ impl Daemon {
                 config,
                 engine: Mutex::new(engine),
                 stop: AtomicBool::new(false),
+                log_file: Mutex::new(None),
             }),
         })
     }
@@ -152,11 +237,13 @@ impl Daemon {
     pub fn spawn(config: Config) -> io::Result<Running> {
         let pipe = config.pipe.clone();
         let daemon = Self::bind(config)?;
+        let shared = Arc::clone(&daemon.shared);
         let thread = std::thread::Builder::new()
             .name("mtseekd".into())
             .spawn(move || daemon.run())?;
         Ok(Running {
             pipe,
+            shared,
             thread: Some(thread),
         })
     }
@@ -214,9 +301,8 @@ fn poll(shared: &Shared) {
         if changed > 0 {
             shared.log(&format!("{changed} index(es) caught up"));
         }
-        for line in engine.save(shared.config.quiet) {
-            shared.log(&line);
-        }
+        let saved = engine.save(shared.config.quiet);
+        shared.log_saved(&saved);
     }
 }
 
@@ -233,6 +319,7 @@ fn serve(conn: File, shared: &Shared) {
             pending: Mutex::new(VecDeque::new()),
         },
         initialized: false,
+        caller: None,
     };
     loop {
         let line = match session.inbox.next() {
@@ -310,6 +397,8 @@ struct Session<'a> {
     out: Mutex<BufWriter<File>>,
     inbox: Inbox,
     initialized: bool,
+    /// Who the client is, from its token (set by `initialize`).
+    caller: Option<Caller>,
 }
 
 impl Session<'_> {
@@ -351,26 +440,53 @@ impl Session<'_> {
             return Ok(Flow::Next);
         }
         let started = Instant::now();
+        let mut declined = None;
         let result = match method {
             "initialize" => self.initialize(&message),
             "search" => match message.params::<SearchParams>() {
                 Ok(params) => self.search(&id, &params),
                 Err(e) => Err(rpc(code::INVALID_PARAMS, e.to_string())),
             },
+            "names" if self.shared.service() => Err(rpc(
+                code::DECLINED,
+                "the service doesn't answer name searches yet".into(),
+            )),
             "names" => match message.params::<NamesParams>() {
                 Ok(params) => self.names(&id, &params),
                 Err(e) => Err(rpc(code::INVALID_PARAMS, e.to_string())),
             },
             "status" => Ok(self.status()),
+            "shutdown" if self.shared.service() && !self.caller().is_admin() => Err(rpc(
+                code::FAILED,
+                "only an elevated administrator can stop the service (or `sc stop mtseek`)".into(),
+            )),
             "shutdown" => {
                 self.shutdown(&id)?;
                 return Ok(Flow::Stop);
             }
             _ => Err(rpc(code::METHOD_NOT_FOUND, format!("no method {method:?}"))),
         };
+        if let Err(err) = &result
+            && err.code == code::DECLINED
+        {
+            declined = Some(err.message.clone());
+        }
+        let who = if self.shared.service() {
+            self.caller
+                .as_ref()
+                .and_then(Caller::user_sid)
+                .map(|sid| format!(" for {sid}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let what = match (&declined, result.is_ok()) {
+            (Some(why), _) => format!("declined ({why})"),
+            (None, true) => "answered".into(),
+            (None, false) => "failed".into(),
+        };
         self.shared.log(&format!(
-            "{method} {} in {:.1} ms",
-            if result.is_ok() { "answered" } else { "failed" },
+            "{method}{who} {what} in {:.1} ms",
             started.elapsed().as_secs_f64() * 1000.0
         ));
         self.reply(&id, result)?;
@@ -391,6 +507,16 @@ impl Session<'_> {
                 ),
             ));
         };
+        // Who the client is: Windows identifies it once it has written, which it has.
+        let token = Token::of_client(lock(&self.out).get_ref());
+        self.caller = match (token, self.shared.config.mode) {
+            (Ok(token), Mode::Service) => Some(Caller::client(token, true)),
+            (Ok(token), Mode::Console) => Some(Caller::client(token, false)),
+            (Err(_), Mode::Console) => Some(Caller::process()),
+            (Err(e), Mode::Service) => {
+                return Err(rpc(code::FAILED, format!("can't identify the client: {e}")));
+            }
+        };
         self.initialized = true;
         self.shared.log(&format!("{} connected", params.client));
         to_value(&InitializeResult {
@@ -401,12 +527,28 @@ impl Session<'_> {
         })
     }
 
+    /// The client, as identified by `initialize`.
+    fn caller(&self) -> &Caller {
+        self.caller
+            .as_ref()
+            .expect("requests come after initialize, which sets the caller")
+    }
+
     fn search(&self, id: &Value, params: &SearchParams) -> Result<Value, RpcError> {
         let request = search_request(params);
         let report = PipeReport::new(id, self);
-        let outcome = self.shared.engine().search(&request, &report);
+        let outcome = if self.shared.service() {
+            self.serve(params, &request, &report)
+        } else {
+            self.shared
+                .engine()
+                .search_as(&request, self.caller(), &report)
+        };
         report.finish()?;
-        let outcome = outcome.map_err(|e| rpc(code::FAILED, e.to_string()))?;
+        let outcome = outcome.map_err(|e| match e {
+            Error::Declined(why) => rpc(code::DECLINED, why),
+            e => rpc(code::FAILED, e.to_string()),
+        })?;
         to_value(&SearchResult {
             summary: Summary {
                 searched: outcome.summary.files_searched,
@@ -415,6 +557,49 @@ impl Session<'_> {
             },
             stats: outcome.stats,
         })
+    }
+
+    /// A search in the service (ADR 0014 §5, §6): only what an index answers exactly for
+    /// this caller. Everything is checked before the engine runs, which itself declines
+    /// before reporting anything.
+    fn serve(
+        &self,
+        params: &SearchParams,
+        request: &SearchRequest,
+        report: &PipeReport<'_>,
+    ) -> mtseek_core::Result<Outcome> {
+        let decline = |why: &str| Err(Error::Declined(why.to_owned()));
+        let caller = self.caller();
+        let Some(ids) = &params.root_ids else {
+            return decline("the client didn't say which folders its roots are");
+        };
+        let Some(excludes) = &params.global_excludes else {
+            return decline("the client didn't send its global excludes file");
+        };
+        let excludes = mtseek_ipc::base64::decode(&excludes.b64).unwrap_or_default();
+        if request.filter.respect_ignore_files && mtseek_walk::has_ignore_rules(&excludes) {
+            return decline("the caller has a global git excludes file");
+        }
+        if ids.len() != request.roots.len() {
+            return decline("the root identities don't match the roots");
+        }
+        let cwd = params.cwd.to_path_buf();
+        let mut disk = Vec::with_capacity(request.roots.len());
+        for (typed, id) in request.roots.iter().zip(ids) {
+            let absolute = mtseek_engine::absolute_from(&cwd, typed);
+            let Some(id) = id else {
+                return decline("a root the caller can't open");
+            };
+            match mtseek_ntfs::identity(&absolute) {
+                Ok((volume, frn)) if volume == id.volume && frn == id.frn => {}
+                _ => return decline("a root names another folder here than for the caller"),
+            }
+            if request.index.explicit() {
+                register_check(caller, typed, &absolute)?;
+            }
+            disk.push(absolute);
+        }
+        self.shared.engine().serve(request, &disk, caller, report)
     }
 
     fn names(&self, id: &Value, params: &NamesParams) -> Result<Value, RpcError> {
@@ -448,6 +633,12 @@ impl Session<'_> {
 
     fn status(&self) -> Value {
         let engine = self.shared.engine();
+        // The service shows each caller the coverage roots it may list; administrators all.
+        let shown = |root: &Path| {
+            !self.shared.service()
+                || self.caller().is_admin()
+                || security::descriptor_at(root).is_ok_and(|sd| self.caller().may_list(&sd))
+        };
         let status = StatusResult {
             server: server_name(),
             pid: std::process::id(),
@@ -455,6 +646,7 @@ impl Session<'_> {
             indexes: engine
                 .status()
                 .into_iter()
+                .filter(|s| shown(&s.root))
                 .map(|s| IndexStatus {
                     root: WirePath::new(&s.root),
                     ignore_files: s.ignore_files,
@@ -481,9 +673,8 @@ impl Session<'_> {
     fn shutdown(&self, id: &Value) -> io::Result<()> {
         {
             let mut engine = self.shared.engine();
-            for line in engine.save(Duration::ZERO) {
-                self.shared.log(&line);
-            }
+            let saved = engine.save(Duration::ZERO);
+            self.shared.log_saved(&saved);
             self.shared.stop.store(true, Ordering::SeqCst);
         }
         self.shared.log("stopping");
@@ -601,6 +792,28 @@ impl Report for PipeReport<'_> {
     }
 }
 
+/// Whether `caller` may make `absolute` (typed as `typed`) a coverage root of the service
+/// (ADR 0014 §7): only a folder it may list, and a whole drive only as an elevated
+/// administrator.
+fn register_check(caller: &Caller, typed: &Path, absolute: &Path) -> mtseek_core::Result<()> {
+    let refuse = |why: &str| {
+        Err(Error::Io {
+            path: typed.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, why.to_owned()),
+        })
+    };
+    let listable = security::descriptor_at(absolute).is_ok_and(|sd| caller.may_list(&sd));
+    if !listable {
+        return Err(Error::Declined(
+            "the caller may not list a folder it asks to index".into(),
+        ));
+    }
+    if absolute.parent().is_none() && !caller.is_admin() {
+        return refuse("indexing a whole drive in the service needs an elevated administrator");
+    }
+    Ok(())
+}
+
 /// The engine request for `search` parameters.
 pub fn search_request(params: &SearchParams) -> SearchRequest {
     let mut roots: Vec<PathBuf> = params.roots.iter().map(WirePath::to_path_buf).collect();
@@ -625,8 +838,8 @@ pub fn search_request(params: &SearchParams) -> SearchRequest {
             follow_links: params.follow,
         },
         mode: match params.mode {
-            SearchMode::Files => Mode::Files,
-            SearchMode::Lines => Mode::Lines,
+            SearchMode::Files => WalkMode::Files,
+            SearchMode::Lines => WalkMode::Lines,
         },
         threads: params.threads,
         index: match params.index {
@@ -707,6 +920,8 @@ mod tests {
             mode: SearchMode::Lines,
             threads: 2,
             index,
+            root_ids: None,
+            global_excludes: None,
         }
     }
 
@@ -776,6 +991,178 @@ mod tests {
             code::UNSUPPORTED_VERSION
         );
         drop(conn);
+        daemon.stop().unwrap();
+    }
+
+    fn service(test: &str, cache: &std::path::Path) -> Running {
+        let mut config = Config::new(pipe_name(test), Some(cache.into()));
+        config.mode = Mode::Service;
+        Daemon::spawn(config).unwrap()
+    }
+
+    /// What a client sends the service: which folder each root is, and its global excludes.
+    fn for_service(root: &std::path::Path, index: IndexMode, excludes: &str) -> SearchParams {
+        let (volume, frn) = mtseek_ntfs::identity(root).unwrap();
+        SearchParams {
+            root_ids: Some(vec![Some(mtseek_ipc::RootId { volume, frn })]),
+            global_excludes: Some(mtseek_ipc::GlobalExcludes {
+                path: None,
+                b64: mtseek_ipc::base64::encode(excludes.as_bytes()),
+            }),
+            ..params(root, index)
+        }
+    }
+
+    fn declined(result: Result<Option<SearchResult>, mtseek_ipc::client::ClientError>) -> String {
+        match result {
+            Err(mtseek_ipc::client::ClientError::Server(err)) if err.code == code::DECLINED => {
+                err.message
+            }
+            other => panic!("expected a decline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_service_answers_only_what_an_index_answers_exactly() {
+        let tree = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join("a.txt"),
+            "a needle
+",
+        )
+        .unwrap();
+        std::fs::write(
+            elsewhere.path().join("b.txt"),
+            "a needle
+",
+        )
+        .unwrap();
+        let daemon = service("service", cache.path());
+        let sid = pipe::user_sid().unwrap();
+        let mut client = Client::connect(daemon.pipe(), Duration::from_secs(5), &sid)
+            .unwrap()
+            .unwrap();
+
+        // A client that doesn't say which folders its roots are is declined, before anything
+        // is built or sent.
+        let mut found = Collect::default();
+        let why = declined(client.search(&params(tree.path(), IndexMode::Build), &mut found));
+        assert!(why.contains("folders"), "{why}");
+        assert!(found.hits.is_empty() && found.notes.is_empty());
+
+        // Registered and answered from the index.
+        let mut found = Collect::default();
+        let done = client
+            .search(&for_service(tree.path(), IndexMode::Build, ""), &mut found)
+            .unwrap()
+            .unwrap();
+        assert_eq!((done.summary.matched, found.hits.len()), (1, 1));
+        let mut found = Collect::default();
+        client
+            .search(
+                &for_service(
+                    tree.path(),
+                    IndexMode::Auto,
+                    "# comments only
+",
+                ),
+                &mut found,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.hits.len(), 1);
+
+        // Everything an index can't answer exactly is left to the client.
+        let mut found = Collect::default();
+        let outside = for_service(elsewhere.path(), IndexMode::Auto, "");
+        declined(client.search(&outside, &mut found));
+        declined(client.search(&for_service(tree.path(), IndexMode::Off, ""), &mut found));
+        let excludes = for_service(
+            tree.path(),
+            IndexMode::Auto,
+            "*.log
+",
+        );
+        let why = declined(client.search(&excludes, &mut found));
+        assert!(why.contains("global"), "{why}");
+        let mut no_ignore = excludes.clone();
+        no_ignore.ignore_files = false;
+        let why = declined(client.search(&no_ignore, &mut found));
+        assert!(!why.contains("global"), "-u ignores the global file: {why}");
+        let mut wrong = for_service(tree.path(), IndexMode::Auto, "");
+        wrong.root_ids = Some(vec![Some(mtseek_ipc::RootId { volume: 1, frn: 2 })]);
+        let why = declined(client.search(&wrong, &mut found));
+        assert!(why.contains("another folder"), "{why}");
+        assert!(found.hits.is_empty(), "declines send nothing");
+        let names = NamesParams {
+            pattern: "a".into(),
+            case: Case::Smart,
+            roots: vec![WirePath::Text(".".into())],
+            cwd: WirePath::new(tree.path()),
+            threads: 1,
+        };
+        match client.names(&names, &mut found) {
+            Err(mtseek_ipc::client::ClientError::Server(err)) => {
+                assert_eq!(err.code, code::DECLINED);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // The coverage this caller may list, and a shutdown only for an elevated admin.
+        assert_eq!(client.status().unwrap().indexes.len(), 1);
+        if !Token::current().unwrap().is_admin() {
+            match client.shutdown() {
+                Err(mtseek_ipc::client::ClientError::Server(err)) => {
+                    assert_eq!(err.code, code::FAILED);
+                }
+                other => panic!("a non-admin stopped the service: {other:?}"),
+            }
+            assert!(client.status().is_ok(), "still serving");
+        }
+        daemon.stop().unwrap();
+    }
+
+    #[test]
+    fn the_service_hides_what_the_caller_may_not_read() {
+        let tree = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join("open.txt"),
+            "a needle
+",
+        )
+        .unwrap();
+        let locked = tree.path().join("locked.txt");
+        std::fs::write(
+            &locked,
+            "a needle
+",
+        )
+        .unwrap();
+        let daemon = service("hides", cache.path());
+        let sid = pipe::user_sid().unwrap();
+        let mut client = Client::connect(daemon.pipe(), Duration::from_secs(5), &sid)
+            .unwrap()
+            .unwrap();
+        let mut found = Collect::default();
+        client
+            .search(&for_service(tree.path(), IndexMode::Build, ""), &mut found)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.hits.len(), 2);
+
+        security::set_dacl(&locked, &format!("D:P(D;;0x1;;;{sid})(A;;FA;;;{sid})")).unwrap();
+        let mut found = Collect::default();
+        let done = client
+            .search(&for_service(tree.path(), IndexMode::Auto, ""), &mut found)
+            .unwrap()
+            .unwrap();
+        security::set_dacl(&locked, &format!("D:P(A;;FA;;;{sid})")).unwrap();
+        let paths: Vec<PathBuf> = found.hits.iter().map(|h| h.path.to_path_buf()).collect();
+        assert_eq!(paths, [PathBuf::from(".").join("open.txt")]);
+        assert_eq!((done.summary.matched, done.summary.errors), (1, 1));
         daemon.stop().unwrap();
     }
 

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use mtseek_core::{Error, Filter, Result, Scope};
 use mtseek_index::{CatchUp, Index, Persist, membership};
+use mtseek_query::Viewer;
 use mtseek_walk::{FileHit, Options, Summary};
 
 use crate::{Engine, IndexUse, Open, Outcome, Report, SearchRequest, io_error, ms};
@@ -24,6 +25,18 @@ use crate::{Engine, IndexUse, Open, Outcome, Report, SearchRequest, io_error, ms
 /// `1`/`0` for each flag.
 pub const REGISTRY: &str = "content-coverage.txt";
 
+/// Who a search runs for and what it may do.
+pub(crate) struct View<'a> {
+    /// What the caller may see.
+    pub(crate) viewer: &'a dyn Viewer,
+    /// Where each root is on this machine, when the caller spelled them in a namespace this
+    /// process doesn't share (the service).
+    pub(crate) disk_roots: Option<&'a [PathBuf]>,
+    /// Answer only from indexes, exactly, or decline before reporting anything (the
+    /// service, ADR 0014 §6).
+    pub(crate) only_indexed: bool,
+}
+
 /// Searches each root through the index that covers it, where one can answer exactly, and
 /// scans the rest: no covering index (and `--index` not given), a filter the index doesn't
 /// cover, `--no-index`, a search that follows links, a file, or a path through a junction.
@@ -31,14 +44,18 @@ pub(crate) fn search(
     engine: &mut Engine,
     request: &SearchRequest,
     report: &dyn Report,
+    view: &View<'_>,
 ) -> Result<Outcome> {
     let options = Options {
         threads: request.threads,
     };
     let filter = request.filter;
     let mut outcome = Outcome::default();
-    let rest = indexed(engine, request, options, report, &mut outcome)?;
+    let rest = indexed(engine, request, options, report, view, &mut outcome)?;
     if !rest.is_empty() {
+        if view.only_indexed {
+            return Err(Error::Declined("a root no index answers".into()));
+        }
         let scope = Scope {
             roots: rest,
             filter,
@@ -68,9 +85,14 @@ fn indexed(
     request: &SearchRequest,
     options: Options,
     report: &dyn Report,
+    view: &View<'_>,
     outcome: &mut Outcome,
 ) -> Result<Vec<PathBuf>> {
     let explicit = request.index.explicit();
+    let decline = |why: &str| Err(Error::Declined(why.to_owned()));
+    if view.only_indexed && (request.index == IndexUse::Off || request.filter.follow_links) {
+        return decline("the search doesn't use the content index");
+    }
     if request.index == IndexUse::Off {
         return Ok(request.roots.clone());
     }
@@ -105,8 +127,11 @@ fn indexed(
         stats: &mut outcome.stats,
     };
     let mut rest = Vec::new();
-    for typed in &request.roots {
-        let Some((root, dir)) = run.resolve(typed, request.filter) else {
+    // First every root's index, opened and caught up, so that a search the service must
+    // decline is declined before anything is reported.
+    let routes = run.routes(request, view)?;
+    for Route { typed, disk, found } in routes {
+        let Some((root, dir)) = found else {
             rest.push(typed.clone());
             continue;
         };
@@ -114,19 +139,9 @@ fn indexed(
             rest.push(typed.clone());
             continue;
         };
-        let bit = membership::bit(&request.filter);
-        let entered = match index.entered(&dir) {
-            Ok(flags) => flags,
-            Err(err) => return Err(run.discard(&root, err.into())),
-        };
-        if entered.is_none_or(|flags| flags & bit == 0) {
-            // A folder the index's walk skips (an ignored or hidden folder, searched by
-            // name): the walker decides what is in it.
-            rest.push(typed.clone());
-            continue;
-        }
         let target = mtseek_query::Target {
             root: typed,
+            disk_root: disk,
             dir: &dir,
             filter: request.filter,
         };
@@ -139,6 +154,7 @@ fn indexed(
             &request.query,
             request.mode,
             options,
+            view.viewer,
             &on_hit,
             &on_error,
         );
@@ -223,6 +239,16 @@ pub(crate) fn save(engine: &mut Engine, quiet: Duration) -> Vec<String> {
         }
     }
     lines
+}
+
+/// How one root of a search is answered.
+struct Route<'a> {
+    /// The root as typed.
+    typed: &'a PathBuf,
+    /// Where it is on this machine.
+    disk: &'a PathBuf,
+    /// The coverage root whose index answers it, and its folder there; `None` to scan.
+    found: Option<(PathBuf, PathBuf)>,
 }
 
 /// One search's view of the indexes: the coverage list, which indexes it caught up or
@@ -312,6 +338,59 @@ impl Run<'_> {
             .map(Path::to_path_buf)
             .unwrap_or_default();
         Some((root, dir))
+    }
+
+    /// How each root of `request` is answered, with every index it needs opened and caught
+    /// up. For the service (`view.only_indexed`), [`Error::Declined`] unless every root is
+    /// answered by an index exactly.
+    fn routes<'r>(
+        &mut self,
+        request: &'r SearchRequest,
+        view: &View<'r>,
+    ) -> Result<Vec<Route<'r>>> {
+        let decline = |why: &str| Err(Error::Declined(why.to_owned()));
+        let mut routes = Vec::with_capacity(request.roots.len());
+        for (i, typed) in request.roots.iter().enumerate() {
+            let disk = view.disk_roots.map_or(typed, |d| &d[i]);
+            let found = match self.resolve(disk, request.filter) {
+                Some((root, dir)) => self
+                    .route(&root, &dir, request.filter)?
+                    .then_some((root, dir)),
+                None => None,
+            };
+            if view.only_indexed {
+                let Some((root, dir)) = &found else {
+                    return decline("a root isn't inside a folder the service indexes");
+                };
+                let target = mtseek_query::Target {
+                    root: typed,
+                    disk_root: disk,
+                    dir,
+                    filter: request.filter,
+                };
+                if let Some(index) = self.index(root)?
+                    && let Some(why) = mtseek_query::decline_reason(index, target, view.viewer)?
+                {
+                    return decline(why);
+                }
+            }
+            routes.push(Route { typed, disk, found });
+        }
+        Ok(routes)
+    }
+
+    /// Whether the index of coverage root `root` answers a search of its folder `dir` with
+    /// `filter`: it can be opened, and its walk enters `dir` with that filter. Otherwise the
+    /// walker decides what is in `dir` (an ignored or hidden folder, searched by name).
+    fn route(&mut self, root: &Path, dir: &Path, filter: Filter) -> Result<bool> {
+        let Some(index) = self.index(root)? else {
+            return Ok(false);
+        };
+        let bit = membership::bit(&filter);
+        match index.entered(dir) {
+            Ok(flags) => Ok(flags.is_some_and(|flags| flags & bit != 0)),
+            Err(err) => Err(self.discard(root, err.into())),
+        }
     }
 
     /// The index of coverage root `root`, caught up (once per search), or built. `None` if

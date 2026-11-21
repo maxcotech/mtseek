@@ -4,7 +4,7 @@
 //! ```text
 //! header   "MTSKCIDX" version:u32 roots:u32 docs:u32 blocks:u32 trigrams:u32 errors:u32
 //! sections scope, docs, paths, errors, dictionary, postings, blocks, store,
-//!          dirs, controls, tombstones, meta
+//!          dirs, controls, tombstones, meta, descriptors
 //! trailer  SECTIONS × (offset:u64, length:u64) "MTSKCEND"
 //! ```
 //!
@@ -12,13 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{Checkpoint, Entry, Meta};
+use crate::{Checkpoint, Entry, Meta, Sd};
 
 pub(crate) const MAGIC: &[u8; 8] = b"MTSKCIDX";
 pub(crate) const END_MAGIC: &[u8; 8] = b"MTSKCEND";
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 pub(crate) const HEADER_LEN: usize = 32;
-pub(crate) const SECTIONS: usize = 12;
+pub(crate) const SECTIONS: usize = 13;
 pub(crate) const TRAILER_LEN: usize = SECTIONS * 16 + 8;
 
 /// Section numbers, in file order.
@@ -39,6 +39,9 @@ pub(crate) mod section {
     pub(crate) const TOMBSTONES: usize = 10;
     /// Build id, base id and journal checkpoints ([`super::put_meta`]).
     pub(crate) const META: usize = 11;
+    /// The distinct security descriptors that files, directories and control files refer to
+    /// by number ([`super::put_descriptors`], ADR 0014).
+    pub(crate) const DESCRIPTORS: usize = 12;
 
     /// Sections that are read only on demand, so may be big.
     pub(crate) fn is_lazy(i: usize) -> bool {
@@ -47,8 +50,8 @@ pub(crate) mod section {
 }
 
 /// `block, offset in block, stored length, path offset, path length | UTF16_PATH, root,
-/// file reference number (u64), flags` ([`crate::membership`]).
-pub(crate) const DOC_LEN: usize = 36;
+/// file reference number (u64), flags` ([`crate::membership`]), descriptor number.
+pub(crate) const DOC_LEN: usize = 40;
 /// `trigram, file count, postings offset`.
 pub(crate) const DICT_LEN: usize = 16;
 /// `store offset, compressed length, raw length`.
@@ -63,25 +66,35 @@ pub(crate) const BLOCK_TARGET: usize = 64 * 1024;
 /// zstd level for the store (ADR 0010).
 pub(crate) const ZSTD_LEVEL: i32 = 3;
 
-/// Appends one dirs/controls record: `frn:u64 root:u32 flags:u32 path_len:u32 path`.
-pub(crate) fn put_entry(out: &mut Vec<u8>, entry: &Entry) {
+/// Appends one dirs/controls record:
+/// `frn:u64 root:u32 flags:u32 descriptor:u32 path_len:u32 path`.
+pub(crate) fn put_entry(out: &mut Vec<u8>, entry: &Entry, descriptor: u32) {
     let (path, utf16) = encode_path(&entry.path);
     // Paths are far shorter than 2 GiB; an absurd one is cut rather than corrupting the file.
     let len = u32::try_from(path.len()).unwrap_or(0).min(UTF16_PATH - 1);
     out.extend_from_slice(&entry.frn.to_le_bytes());
     out.extend_from_slice(&entry.root.to_le_bytes());
     out.extend_from_slice(&u32::from(entry.flags).to_le_bytes());
+    out.extend_from_slice(&descriptor.to_le_bytes());
     out.extend_from_slice(&(len | if utf16 { UTF16_PATH } else { 0 }).to_le_bytes());
     out.extend_from_slice(&path[..len as usize]);
 }
 
-/// Parses a dirs/controls section. `None` if it is malformed or names a root `>= roots`.
-pub(crate) fn parse_entries(mut bytes: &[u8], roots: u32) -> Option<Vec<Entry>> {
+/// Parses a dirs/controls section. `None` if it is malformed, names a root `>= roots` or a
+/// descriptor not in `descriptors`.
+pub(crate) fn parse_entries(
+    mut bytes: &[u8],
+    roots: u32,
+    descriptors: &[Sd],
+) -> Option<Vec<Entry>> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
         let frn = u64_at(take(&mut bytes, 8)?, 0);
         let root = u32_at(take(&mut bytes, 4)?, 0);
         let flags = u8::try_from(u32_at(take(&mut bytes, 4)?, 0)).ok()?;
+        let sd = descriptors
+            .get(u32_at(take(&mut bytes, 4)?, 0) as usize)?
+            .clone();
         let len = u32_at(take(&mut bytes, 4)?, 0);
         let path = decode_path(
             take(&mut bytes, (len & !UTF16_PATH) as usize)?,
@@ -95,9 +108,36 @@ pub(crate) fn parse_entries(mut bytes: &[u8], roots: u32) -> Option<Vec<Entry>> 
             root,
             path,
             flags,
+            sd,
         });
     }
     Some(out)
+}
+
+/// Encodes the descriptors section: `n:u32`, then `n` times `len:u32 bytes`.
+pub(crate) fn put_descriptors(table: &[Sd]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&u32::try_from(table.len()).unwrap_or(0).to_le_bytes());
+    for sd in table {
+        out.extend_from_slice(&u32::try_from(sd.len()).unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(sd);
+    }
+    out
+}
+
+/// Parses the descriptors section. `None` if it is malformed. A descriptor longer than
+/// 64 KiB is malformed: Windows limits them to that.
+pub(crate) fn parse_descriptors(mut bytes: &[u8]) -> Option<Vec<Sd>> {
+    let n = u32_at(take(&mut bytes, 4)?, 0);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let len = u32_at(take(&mut bytes, 4)?, 0) as usize;
+        if len > 1 << 16 {
+            return None;
+        }
+        out.push(Sd::from(take(&mut bytes, len)?));
+    }
+    bytes.is_empty().then_some(out)
 }
 
 /// Encodes the meta section: `build_id:u64 base_id:u64 n:u32` then `n` checkpoints of
@@ -267,24 +307,37 @@ mod tests {
                 root: 0,
                 path: PathBuf::from("a\\b"),
                 flags: 5,
+                sd: Sd::from(&b"one"[..]),
             },
             Entry {
                 frn: u64::MAX,
                 root: 1,
                 path: PathBuf::new(),
                 flags: 0,
+                sd: Sd::from(&b"two"[..]),
             },
         ];
+        let table = vec![Sd::from(&b"one"[..]), Sd::from(&b"two"[..])];
         let mut bytes = Vec::new();
-        for e in &entries {
-            put_entry(&mut bytes, e);
+        for (i, e) in (0u32..).zip(&entries) {
+            put_entry(&mut bytes, e, i);
         }
-        assert_eq!(parse_entries(&bytes, 2).unwrap(), entries);
-        assert!(parse_entries(&bytes, 1).is_none(), "root out of range");
+        assert_eq!(parse_entries(&bytes, 2, &table).unwrap(), entries);
         assert!(
-            parse_entries(&bytes[..bytes.len() - 1], 2).is_none(),
+            parse_entries(&bytes, 1, &table).is_none(),
+            "root out of range"
+        );
+        assert!(
+            parse_entries(&bytes, 2, &table[..1]).is_none(),
+            "descriptor out of range"
+        );
+        assert!(
+            parse_entries(&bytes[..bytes.len() - 1], 2, &table).is_none(),
             "truncated"
         );
+        let encoded = put_descriptors(&table);
+        assert_eq!(parse_descriptors(&encoded).unwrap(), table);
+        assert!(parse_descriptors(&encoded[..encoded.len() - 1]).is_none());
 
         let meta = Meta {
             build_id: 1,

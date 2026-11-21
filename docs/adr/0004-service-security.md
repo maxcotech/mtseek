@@ -1,6 +1,8 @@
 # 0004: SYSTEM service that filters results by the caller's ACLs
 
-**Status:** Accepted, 2026-11-19
+**Status:** Accepted, 2026-11-19. Made concrete by [0014](0014-service-mode.md): access is
+decided per recorded security descriptor rather than cached per (user, folder), and secret
+files follow [0012](0012-index-coverage.md) §4.
 
 ## Context
 

@@ -1,7 +1,8 @@
 //! Invariant 3 for the content index (ADR 0011): after any sequence of changes, an index
 //! caught up from the change journal holds exactly what a fresh build holds. Same files,
 //! same stored bytes, same directories, control files and errors, with the same membership
-//! bits for every coverage filter (ADR 0012).
+//! bits for every coverage filter (ADR 0012), and the same security descriptors, including
+//! after permission changes and their inheritance (ADR 0014).
 //!
 //! Windows only: the journal is NTFS's. Needs no admin rights.
 
@@ -17,15 +18,19 @@ use mtseek_index::{CatchUp, Index, Location, Persist, membership};
 use mtseek_walk::Options;
 use proptest::prelude::*;
 
-/// A file as the index holds it: its stored bytes (`None` if read from disk) and flags.
-type Held = (Option<Vec<u8>>, u8);
+/// A file as the index holds it: its stored bytes (`None` if read from disk), flags and
+/// security descriptor.
+type Held = (Option<Vec<u8>>, u8, Vec<u8>);
+
+/// A directory or control file: root, path, flags, security descriptor.
+type Tracked = (u32, PathBuf, u8, Vec<u8>);
 
 /// Everything an index answers with, keyed by (root, relative path).
 #[derive(Debug, PartialEq, Eq)]
 struct View {
     files: BTreeMap<(usize, PathBuf), Held>,
-    dirs: Vec<(u32, PathBuf, u8)>,
-    controls: Vec<(u32, PathBuf, u8)>,
+    dirs: Vec<Tracked>,
+    controls: Vec<Tracked>,
     errors: Vec<String>,
 }
 
@@ -45,7 +50,8 @@ fn view(index: &Index) -> View {
                     Some(raw[offset as usize..(offset + len) as usize].to_vec())
                 }
             };
-            let previous = files.insert(segment.path(id), (bytes, segment.flags(id)));
+            let held = (bytes, segment.flags(id), segment.descriptor(id).to_vec());
+            let previous = files.insert(segment.path(id), held);
             assert!(
                 previous.is_none(),
                 "{:?} is in two layers",
@@ -55,9 +61,9 @@ fn view(index: &Index) -> View {
     }
     let newest = index.delta().unwrap_or_else(|| index.base());
     let paths = |entries: Vec<mtseek_index::Entry>| {
-        let mut out: Vec<(u32, PathBuf, u8)> = entries
+        let mut out: Vec<Tracked> = entries
             .into_iter()
-            .map(|e| (e.root, e.path, e.flags))
+            .map(|e| (e.root, e.path, e.flags, e.sd.to_vec()))
             .collect();
         out.sort();
         out
@@ -144,7 +150,18 @@ enum Op {
     Above {
         what: usize,
     },
+    /// Gives a file or folder (`file: None`) one of two DACLs that both let this account
+    /// read everything, so a fresh build reads the same. A folder's change is inherited by
+    /// what is inside it.
+    Permit {
+        dir: usize,
+        file: Option<usize>,
+        dacl: usize,
+    },
 }
+
+/// DACLs for [`Op::Permit`]; `{}` is this account's SID.
+const DACLS: &[&str] = &["D:P(A;OICI;FA;;;{})", "D:P(A;OICI;FA;;;{})(A;OICI;FR;;;WD)"];
 
 impl Op {
     /// Whether the change is above the indexed folder, where catch-up rebuilds.
@@ -185,6 +202,8 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (d.clone(), any::<bool>()).prop_map(|(dir, hidden)| Op::HideDir { dir, hidden }),
         1 => (d, 0..PATTERNS.len()).prop_map(|(dir, pattern)| Op::Exclude { dir, pattern }),
         1 => (0..ABOVE.len()).prop_map(|what| Op::Above { what }),
+        2 => (0..DIRS.len(), proptest::option::of(0..FILES.len()), 0..DACLS.len())
+            .prop_map(|(dir, file, dacl)| Op::Permit { dir, file, dacl }),
     ]
 }
 
@@ -259,6 +278,17 @@ fn apply(root: &Path, op: &Op) {
             }
         }
         Op::Above { what } => change_above(root, what),
+        Op::Permit {
+            dir: d,
+            file: f,
+            dacl,
+        } => {
+            let path = f.map_or_else(|| dir(d), |f| file(d, f));
+            if path.exists() {
+                let sid = mtseek_ntfs::pipe::user_sid().expect("own SID");
+                let _ = mtseek_ntfs::security::set_dacl(&path, &DACLS[dacl].replace("{}", &sid));
+            }
+        }
         Op::Hide {
             dir: d,
             file: f,
@@ -486,4 +516,36 @@ fn an_ignore_file_above_the_root_asks_for_a_rebuild() {
     fs::write(tree.path().join(".ignore"), "x.txt\n").unwrap();
     let done = index.catch_up(&scope, Options::default()).unwrap();
     assert!(matches!(done, CatchUp::NeedsRebuild(_)), "{done:?}");
+}
+
+/// A permission change alone doesn't make catch-up read a file again: it records the new
+/// descriptor and keeps the bytes, which searches then hide from whoever may no longer read
+/// them (ADR 0014).
+#[test]
+fn a_permission_change_records_the_descriptor_and_keeps_the_bytes() {
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path();
+    let path = root.join("a.txt");
+    fs::write(&path, "kept").unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let scope = scope(root, 0);
+    let (mut index, _) =
+        Index::build(&scope, Options::default(), &cache.path().join("idx")).unwrap();
+    let before = view(&index).files[&(0, PathBuf::from("a.txt"))].clone();
+
+    let sid = mtseek_ntfs::pipe::user_sid().unwrap();
+    mtseek_ntfs::security::set_dacl(&path, &format!("D:P(D;;0x1;;;{sid})(A;;FA;;;{sid})")).unwrap();
+    let done = index.catch_up(&scope, Options::default()).unwrap();
+    let after = view(&index).files[&(0, PathBuf::from("a.txt"))].clone();
+    mtseek_ntfs::security::set_dacl(&path, &format!("D:P(A;;FA;;;{sid})")).unwrap();
+
+    let CatchUp::Updated { read, .. } = done else {
+        panic!("{done:?}");
+    };
+    assert_eq!(read, 0, "nothing read again");
+    assert_eq!(after.0.as_deref(), Some(&b"kept"[..]));
+    assert_ne!(after.2, before.2, "the new descriptor");
+    let token = mtseek_ntfs::security::Token::current().unwrap();
+    assert!(token.allows(&before.2, mtseek_ntfs::security::READ));
+    assert!(!token.allows(&after.2, mtseek_ntfs::security::READ));
 }

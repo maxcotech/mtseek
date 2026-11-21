@@ -19,10 +19,14 @@ use std::time::{Duration, Instant};
 
 use mtseek_core::{CaseMode, Error, Filter, Query, Result};
 use mtseek_index::Index;
+use mtseek_query::Viewer;
 use mtseek_walk::{FileHit, Mode, Summary};
 
+pub mod access;
 pub mod content;
 pub mod names;
+
+pub use access::Caller;
 
 /// Whether a content search uses, builds or skips the index (`--index`, `--reindex`,
 /// `--no-index`).
@@ -182,11 +186,26 @@ impl Engine {
         self.cache.as_deref()
     }
 
-    /// Runs a content search, reporting hits and unreadable files to `report` as they are
-    /// found.
+    /// Runs a content search for this process, reporting hits and unreadable files to
+    /// `report` as they are found.
     pub fn search(&mut self, request: &SearchRequest, report: &dyn Report) -> Result<Outcome> {
+        self.search_as(request, &Caller::process(), report)
+    }
+
+    /// Runs a content search for `caller`: it sees what its own `rg` would (ADR 0014).
+    pub fn search_as(
+        &mut self,
+        request: &SearchRequest,
+        caller: &dyn Viewer,
+        report: &dyn Report,
+    ) -> Result<Outcome> {
+        let anywhere = content::View {
+            viewer: caller,
+            disk_roots: None,
+            only_indexed: false,
+        };
         let Some(cwd) = &request.cwd else {
-            return content::search(self, request, report);
+            return content::search(self, request, report, &anywhere);
         };
         // Another process's working directory: search each root by its absolute path and
         // spell results as joined onto the root as typed. One root at a time, so that every
@@ -204,13 +223,35 @@ impl Engine {
                 actual: &actual,
                 typed,
             };
-            let done = content::search(self, &one, &respelled)?;
+            let done = content::search(self, &one, &respelled, &anywhere)?;
             outcome.summary.files_searched += done.summary.files_searched;
             outcome.summary.files_matched += done.summary.files_matched;
             outcome.summary.errors += done.summary.errors;
             outcome.stats.extend(done.stats);
         }
         Ok(outcome)
+    }
+
+    /// Answers a content search for the service (ADR 0014 §6): `request.roots` as the caller
+    /// typed them, `disk_roots` where they are (resolved by the caller, plain drive paths).
+    /// Every root must be answered by an index the service holds, exactly, or the search is
+    /// [`Error::Declined`] before anything is reported.
+    pub fn serve(
+        &mut self,
+        request: &SearchRequest,
+        disk_roots: &[PathBuf],
+        caller: &dyn Viewer,
+        report: &dyn Report,
+    ) -> Result<Outcome> {
+        if disk_roots.len() != request.roots.len() {
+            return Err(Error::Declined("roots and resolved roots differ".into()));
+        }
+        let view = content::View {
+            viewer: caller,
+            disk_roots: Some(disk_roots),
+            only_indexed: true,
+        };
+        content::search(self, request, report, &view)
     }
 
     /// Runs a name search.
@@ -271,7 +312,7 @@ impl Engine {
 
 /// `typed` found from `cwd`, without `.` components (`C:\work` and `.` give `C:\work`).
 /// `..` stays, as the walker would follow it.
-fn absolute_from(cwd: &Path, typed: &Path) -> PathBuf {
+pub fn absolute_from(cwd: &Path, typed: &Path) -> PathBuf {
     cwd.join(typed)
         .components()
         .filter(|c| !matches!(c, Component::CurDir))

@@ -4,11 +4,13 @@
 in file names *and* file contents, in under 100 ms. Results are always up to date, and nothing
 rescans in the background.
 
-> **Status: pre-alpha (milestone M3, daemon working in console mode).** The `mtseek` CLI gives
-> ripgrep-identical results. File-name search (`--names`) is indexed and kept current. Content
-> search answers from a content index once you create one with `--index`: 5–16× faster than
-> ripgrep on the benchmark, and kept current from the NTFS change journal. `mtseekd --console`
-> keeps the indexes open between searches. See the [roadmap](#roadmap).
+> **Status: pre-alpha (milestone M3, daemon in console and service mode).** The `mtseek` CLI
+> gives ripgrep-identical results. File-name search (`--names`) is indexed and kept current.
+> Content search answers from a content index once you create one with `--index`: 5–16× faster
+> than ripgrep on the benchmark, and kept current from the NTFS change journal. `mtseekd`
+> keeps the indexes open between searches, for one user (`--console`) or as a service for
+> every user of the machine, each seeing only what their account may read. See the
+> [roadmap](#roadmap).
 
 ## Why
 
@@ -56,6 +58,16 @@ of the 15,000-file benchmark tree then take 44–57 ms including process start. 
 shows what it holds, `mtseekd --stop` writes what is in memory and stops it, and
 `mtseek --no-daemon` searches without it.
 
+`mtseekd --install`, from an elevated terminal, registers the `mtseek` service instead: one
+daemon for the whole machine, running as LocalSystem, with its indexes in
+`%ProgramData%\mtseek` (readable by SYSTEM and Administrators only). Every user's `mtseek`
+answers through it and sees exactly what their own `rg` would: lines from files their account
+may read, "Access is denied" for the rest. The service answers only what an index answers
+exactly for the caller; anything else (a folder it doesn't index, `-L`, a user with a git
+global excludes file) is searched in the user's own process. `mtseekd --uninstall` removes it.
+Secret-looking files (`.env*`, `id_rsa*`, `*.pem`, `*.key`, `*.pfx`, ...) are never stored in
+any index; searches read them from disk.
+
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
 output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`
 work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md)).
@@ -67,7 +79,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
 | M1 | Name engine: MFT + USN journal, instant file-name search | ✅ |
 | M2 | Content engine: trigram index + content store, kept current, under 100 ms | index ✅, live ✅; 12 of 16 benchmark queries under 100 ms |
-| M3 | Background service, live updates, per-user access control | coverage roots ✅, console daemon ✅; service mode next |
+| M3 | Background service, live updates, per-user access control | coverage roots ✅, console daemon ✅, service mode ✅ |
 | M4 | MCP server for AI agents, `--json` | |
 | M5 | Desktop app (GPUI): global-hotkey palette with preview | |
 | M6 | Signed installer, winget, auto-update | |

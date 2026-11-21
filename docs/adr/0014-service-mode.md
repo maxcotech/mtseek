@@ -1,9 +1,10 @@
 # 0014: Service mode: one machine-wide daemon that shows each caller only what it could read
 
-**Status:** Proposed, 2026-11-21. First decision of M3c. Makes [0004](0004-service-security.md)
-concrete for the daemon of [0013](0013-daemon-and-ipc.md). Sharpens 0004's access cache and
-supersedes two details of [0012](0012-index-coverage.md) (§3's impersonation, §5's default
-coverage); see [Consequences](#consequences).
+**Status:** Accepted, 2026-11-21. Built in M3c; [As built](#as-built-m3c) lists where the
+build differs from the proposal. First decision of M3c. Makes
+[0004](0004-service-security.md) concrete for the daemon of [0013](0013-daemon-and-ipc.md).
+Sharpens 0004's access cache and supersedes two details of [0012](0012-index-coverage.md)
+(§3's impersonation, §5's default coverage); see [Consequences](#consequences).
 
 ## Context
 
@@ -303,3 +304,54 @@ same check that guards every other result, and the index on disk never holds the
   - Locally, those tests skip unless the terminal is elevated, like the MFT test.
 - **Searches the service declines** cost one round trip before direct mode. The
   benchmark measures that, and the log counts declines by reason.
+
+## As built (M3c)
+
+Where the build differs from the proposal above, and why:
+
+- **Every host checks access, not only the service.** A permission change only updates the
+  recorded descriptor; catch-up doesn't read the file again, so the index may keep bytes its
+  builder can no longer read. Direct mode therefore checks with the process's own token,
+  and a console daemon with its client's. In both, an unknown descriptor grants access,
+  because the same account built the index. Only the service is strict. One code path
+  serves every host, so the parity suite exercises it.
+- **Roots: no volume GUID.** The service finds each root from the client's working directory,
+  as a console daemon does. The client sends each root's volume serial number and file
+  reference number, and the service declines if the same path names another folder for it.
+  A root reached through a link, a junction or a `subst` drive is declined: walking from that
+  spelling reads other ignore files above it than the index's walk did, so only direct mode
+  is exact there. A drive mapped in the user's session doesn't exist for SYSTEM, so it is
+  declined too.
+- **Global excludes: sent, not yet applied.** The client sends the path and contents of its
+  global excludes file. A search that honours ignore files is declined if that file holds any
+  rule, so a caller with one gets direct mode. Applying the file to matching files (0012 §3)
+  comes later. The service builds as SYSTEM, whose profile has no global excludes file.
+- **Names through the service are declined.** That leaves direct mode, as before. Security
+  ids from the MFT pass come with the names work.
+- **`SeBackupPrivilege` isn't used yet.** The service reads files as SYSTEM, which every
+  default DACL allows. A file SYSTEM may not read is a stored error, and callers see that
+  error.
+- **The pipe's DACL** gives interactive users read, write and attribute access (`0x12019b`)
+  rather than generic read and write. Generic write includes `FILE_CREATE_PIPE_INSTANCE`,
+  which would let any user serve on the name. Clients ask for exactly what they use. The
+  pipe's owner (the process that created it) has full access, so a test daemon running as a
+  user can create instances.
+- **The cache folder:** if its owner isn't SYSTEM or Administrators, it is deleted and
+  created again with the right security. If the owner is right, the DACL is set again (not
+  recursively: inside a folder only those two can write to, everything inherits).
+- **Coverage registrants aren't recorded.** Registering checks that the caller may list the
+  folder, and that a whole drive comes from an elevated administrator.
+- **Logging:** plain timestamped lines, no `tracing`.
+- **The two-account test** (`mtseek-daemon/tests/service.rs`) installs a test service,
+  creates a local account and compares its `mtseek` with its `rg`. It runs only elevated, so
+  in CI. It also checks that a cache folder someone else created first is made safe. Without
+  admin, the same checks run against a service-mode daemon started in the test process
+  (`mtseek-daemon` unit tests) and through `tests/access.rs`.
+- **Two fixes found on the way:**
+  - Files the index doesn't store (over 256 MiB, and now secret files) had no trigrams, so
+    the planner never picked them as candidates, and searches through the index missed
+    them. They are now candidates for every search.
+  - Re-walking a `.git` or `.git\info` folder during catch-up dropped the control entries
+    that the folder above owns. The catch-up property test found it once permission changes
+    reached those folders.
+- **Measured:** see `bench/TARGETS.md`, M3c.

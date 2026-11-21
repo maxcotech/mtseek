@@ -13,8 +13,8 @@ use mtseek_walk::{Listed, Options};
 
 use crate::format::VERSION;
 use crate::{
-    Checkpoint, Content, Doc, Entry, IndexError, MAX_STORED, Meta, SegmentInfo, StoredError,
-    WriteStats, membership, ntfs, text, write_segment,
+    Checkpoint, Content, Doc, Entry, IndexError, MAX_STORED, Meta, Sd, SegmentInfo, StoredError,
+    WriteStats, membership, no_sd, ntfs, text, write_segment,
 };
 
 /// The filter an index is built with for a search with `filter` (ADR 0012): the same
@@ -314,6 +314,7 @@ pub(crate) fn walk_tree(
                         root: root_u32,
                         path: rel.join(&e.name),
                         flags: 0,
+                        sd: ntfs::descriptor_at(&entry.path.join(&e.name)),
                     })
                     .collect();
                 if listing
@@ -323,12 +324,14 @@ pub(crate) fn walk_tree(
                 {
                     controls.extend(git_info(entry.path, &rel, root_u32));
                 }
+                let sd = ntfs::descriptor_at(entry.path);
                 let mut found = lock(&found);
                 found.dirs.push(Entry {
                     frn: listing.frn,
                     root: root_u32,
                     path: rel,
                     flags: main,
+                    sd,
                 });
                 found.controls.extend(controls);
                 return;
@@ -336,12 +339,13 @@ pub(crate) fn walk_tree(
             let read = read_file(entry.path, include_binary);
             let mut found = lock(&found);
             match read {
-                Ok((content, frn)) => found.docs.push(Doc {
+                Ok((content, frn, sd)) => found.docs.push(Doc {
                     root: root_u32,
                     path: rel,
                     frn,
                     flags: main,
                     content,
+                    sd,
                 }),
                 Err(e) => found.errors.push(StoredError {
                     root: Some(root_u32),
@@ -379,11 +383,13 @@ pub(crate) fn git_info(dir: &Path, rel: &Path, root: u32) -> Vec<Entry> {
     let Ok(listing) = ntfs::list_dir(&dir.join(".git").join("info")) else {
         return Vec::new();
     };
+    let info_dir = dir.join(".git").join("info");
     let mut out = vec![Entry {
         frn: listing.frn,
         root,
         path: info.clone(),
         flags: 0,
+        sd: no_sd(),
     }];
     out.extend(
         listing
@@ -395,6 +401,7 @@ pub(crate) fn git_info(dir: &Path, rel: &Path, root: u32) -> Vec<Entry> {
                 root,
                 path: info.join(&e.name),
                 flags: 0,
+                sd: ntfs::descriptor_at(&info_dir.join(&e.name)),
             }),
     );
     out
@@ -416,6 +423,7 @@ fn above(root_path: &Path, root: u32) -> Vec<Entry> {
             root,
             path: rel.clone(),
             flags: 0,
+            sd: no_sd(),
         });
         for e in listing.entries.iter().filter(|e| ntfs::is_control(&e.name)) {
             out.push(Entry {
@@ -423,6 +431,7 @@ fn above(root_path: &Path, root: u32) -> Vec<Entry> {
                 root,
                 path: rel.join(&e.name),
                 flags: 0,
+                sd: ntfs::descriptor_at(&dir.join(&e.name)),
             });
             if e.name.eq_ignore_ascii_case(".git") {
                 out.extend(git_info(dir, &rel, root));
@@ -501,6 +510,7 @@ pub(crate) fn list_level(scope: &Scope, root: usize, dir: &Path, within: u8) -> 
                     root: root_u32,
                     path: rel,
                     flags: main,
+                    sd: no_sd(),
                 });
             } else {
                 found.docs.push(Doc {
@@ -509,6 +519,7 @@ pub(crate) fn list_level(scope: &Scope, root: usize, dir: &Path, within: u8) -> 
                     frn: 0,
                     flags: main,
                     content: Content::External,
+                    sd: no_sd(),
                 });
             }
         },
@@ -535,16 +546,68 @@ pub(crate) fn list_level(scope: &Scope, root: usize, dir: &Path, within: u8) -> 
     }
 }
 
-/// Reads what the index stores for the file at `path` (see [`text::stored_len`]), and its
-/// file reference number. When binary files are skipped, reading stops at the first NUL, so
-/// big binaries cost little.
-pub fn read_file(path: &Path, include_binary: bool) -> io::Result<(Content, u64)> {
+/// Whether the contents of a file named `name` never go into the index (ADR 0004 and 0012
+/// §4): environment files, private keys, certificates with keys, password vaults. Searches
+/// read such files from disk, so results don't change.
+pub fn is_secret(name: &str) -> bool {
+    const PREFIXES: [&str; 5] = [".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+    const SUFFIXES: [&str; 7] = [".pem", ".key", ".pfx", ".p12", ".kdbx", ".jks", ".keystore"];
+    let name = name.to_ascii_lowercase();
+    PREFIXES.iter().any(|p| name.starts_with(p)) || SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Whether a file with these attributes must not be read in the background: EFS-encrypted
+/// (a service can't decrypt it), or a cloud placeholder whose data isn't on disk (reading
+/// would download it).
+fn not_to_read(attributes: u32) -> bool {
+    const OFFLINE: u32 = 0x1000;
+    const ENCRYPTED: u32 = 0x4000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    attributes & (OFFLINE | ENCRYPTED | RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(windows)]
+fn attributes(meta: &std::fs::Metadata) -> u32 {
+    std::os::windows::fs::MetadataExt::file_attributes(meta)
+}
+
+#[cfg(not(windows))]
+fn attributes(_: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// Reads what the index stores for the file at `path` (see [`text::stored_len`]), its file
+/// reference number and its security descriptor. When binary files are skipped, reading
+/// stops at the first NUL, so big binaries cost little. Secret files ([`is_secret`]) aren't
+/// read, nor are files that mustn't be read in the background (encrypted ones, cloud
+/// placeholders): their contents stay on disk.
+pub fn read_file(path: &Path, include_binary: bool) -> io::Result<(Content, u64, Sd)> {
     const CHUNK: u64 = 64 * 1024;
-    let mut file = File::open(path)?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            // An encrypted file another account owns can't be opened for reading at all.
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && std::fs::symlink_metadata(path).is_ok_and(|m| not_to_read(attributes(&m)))
+            {
+                return Ok((Content::Unstored, 0, ntfs::descriptor_at(path)));
+            }
+            return Err(e);
+        }
+    };
     let frn = ntfs::file_frn(&file);
-    let len = file.metadata()?.len();
-    if len > MAX_STORED {
-        return Ok((Content::External, frn));
+    let sd = ntfs::descriptor_of(&file);
+    let meta = file.metadata()?;
+    if not_to_read(attributes(&meta)) {
+        return Ok((Content::Unstored, frn, sd));
+    }
+    let len = meta.len();
+    let secret = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_secret);
+    if len > MAX_STORED || secret {
+        return Ok((Content::External, frn, sd));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     if include_binary {
@@ -567,9 +630,9 @@ pub fn read_file(path: &Path, include_binary: bool) -> io::Result<(Content, u64)
         }
     }
     if bytes.len() as u64 > MAX_STORED {
-        return Ok((Content::External, frn));
+        return Ok((Content::External, frn, sd));
     }
-    Ok((Content::Stored(bytes), frn))
+    Ok((Content::Stored(bytes), frn, sd))
 }
 
 /// A walk error as stored: relative to the root when it is under it.
