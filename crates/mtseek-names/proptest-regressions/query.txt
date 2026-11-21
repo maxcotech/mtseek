@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 149eda2f1c088033cb8cf35aef75c36082f1f8a3dca87bb9de967c3d7491b687 # shrinks to names = ["A", "A", "A", "a", "A"], removed = [], pattern = "", threads = 1
+cc 388f5459299e752e9f5a593ffdf291909d0fd6a47b36677ba904b9b0a3f8b21e # shrinks to paths = [["."], ["-"]]
+cc be6c89b4038f9232bf75128e9153baa038353dd99d104e9784e1d6ad66f8ee77 # shrinks to entries = [(Index(0), "a", false), (Index(0), "a", false), (Index(0), "a", false), (Index(0), "a", false), (Index(0), "a", false), (Index(0), "c", true), (Index(9223372036854775808), "a", false), (Index(0), "c", false)], moved = Index(0), pick = Index(0)
+cc 64211f9ac735b91654d574cd8ab936f6ac91cb093b5d8454c2dd0e7694aa9929 # shrinks to names = [".", ".", "A", "a", ".", "A", "a", ".", "a", "a", "a", "a", ".", ".", "A", ".", "A", "a", "a", "A", ".", "A", "A", "a", "A", "A", ".", ".", "a", "A", ".", "a", "a", "A", "a"], removed = [], pattern = "", threads = 1

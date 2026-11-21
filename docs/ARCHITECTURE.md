@@ -62,8 +62,8 @@ Crates land with the milestone that needs them. There are no empty placeholder c
 | `mtseek-cli` | M0 ✅ | The `mtseek` binary. ripgrep's flags and output format (ADR 0005). Talks to `mtseekd` from M3 on; for now it scans. |
 | `mtseek-testkit` | M0 ✅ | Deterministic synthetic corpora full of edge cases. |
 | `xtask` | M0 ✅ | `cargo xtask ci / bench / corpus / fmt`. |
-| `mtseek-ntfs` | M1 | MFT enumeration (`FSCTL_ENUM_USN_DATA`) and USN journal tailing. **The only crate allowed `unsafe`** (Win32 FFI). |
-| `mtseek-names` | M1 | File-name index: name arena + parent links, parallel SIMD substring scan. |
+| `mtseek-ntfs` | M1 ✅ | Raw MFT record reading with every hard link (ADR 0009) and MFT enumeration as its fallback, both needing admin; unprivileged USN journal reads through a directory handle, directory listings with file reference numbers, long paths. Safe parsers for every buffer format, property-tested against random and malformed input. **The only crate allowed `unsafe`**, confined to `src/sys.rs`. |
+| `mtseek-names` | M1 ✅ | File-name index: flat name arenas + parent links, parallel SIMD substring scan (ADR 0007). Built from the MFT or by a parallel directory walk; saved as a snapshot and caught up from the USN journal by re-listing changed directories (ADR 0008). |
 | `mtseek-index` | M2 | Segment format: trigram dictionary, delta-encoded postings, document table, zstd content store, manifest, merges. |
 | `mtseek-query` | M2 | Regex → trigram plan (`regex-syntax` HIR), execution, verification, ranking. |
 | `mtseek-ipc` | M3 | JSON-RPC protocol types + versioning, shared by every client. |
@@ -77,6 +77,8 @@ Crates land with the milestone that needs them. There are no empty placeholder c
 - Clients (`cli`, `mcp`, `app`) depend on `mtseek-ipc`, **never** on index internals.
   The engine can then change its storage without touching a client.
 - `mtseek-walk` must stay ripgrep-identical. It is what every index result is checked against.
+- `mtseek-names` uses `mtseek-ntfs` (Windows only) for listings, the journal and the MFT. Nothing
+  else talks to NTFS directly.
 
 ## Invariants
 
@@ -92,7 +94,9 @@ These are properties the code must keep. Each one has a test that enforces it.
    Commits are write-new-then-rename of a versioned manifest, with fsync.
 5. **No privilege leak.** (M3) A user never sees a path or a line from a file their own
    account cannot open (ADR 0004).
-6. **Only `mtseek-ntfs` contains `unsafe`.** Enforced by `unsafe_code = "forbid"` in workspace lints.
+6. **Only `mtseek-ntfs` contains `unsafe`**, and only in `src/sys.rs`. Enforced by `unsafe_code = "forbid"` in workspace lints and `deny` + one scoped `allow` in that crate.
+7. **Name search is complete.** `mtseek --names ""` lists every file `rg --files -uu` lists (plus directories). Enforced by `crates/mtseek-cli/tests/names.rs`. Whole-drive indexes read raw MFT records so that every hard link is listed (ADR 0009); the admin-only tests in CI enforce it.
+8. **A snapshot is only a cache.** A caught-up snapshot gives the same answers as a fresh walk, and a missing or corrupt one costs time, never correctness. Enforced by `catch_up_matches_a_fresh_walk` (`mtseek-names`), the snapshot corruption property test, and `later_runs_reuse_the_saved_index_and_see_changes` (CLI).
 
 ## Cross-cutting concerns
 
@@ -102,7 +106,8 @@ These are properties the code must keep. Each one has a test that enforces it.
 - **Performance work** starts with a benchmark number and ends with one: `cargo xtask bench`.
   A speed claim without a run in `bench/results/` doesn't count.
 - **Windows specifics.** Long paths (`\\?\`), reparse points (not followed by default),
-  hard links (deduplicated by file ID), UTF-16 files (BOM sniffing), USN journal wrap (full rescan).
+  hard links (the name index lists each link, like `rg --files`), UTF-16 files (BOM sniffing),
+  USN journal wrap or recreation (full rebuild).
 - **Security.** The index holds file contents, so it is as sensitive as the disk.
   The index directory is ACL'd to SYSTEM + Administrators, and secret-looking files are excluded
   by default (ADR 0004).
@@ -112,7 +117,7 @@ These are properties the code must keep. Each one has a test that enforces it.
 | | Milestone | Done when |
 |---|---|---|
 | **M0** | Foundation | Workspace, CI, xtask, ADRs, benchmark harness with ripgrep baseline, parity test passing. |
-| M1 | Name engine | `mtseek --files` style name search from MFT + USN, live, beating Everything/fd. |
+| **M1** | Name engine | `mtseek --names` from MFT or parallel walk; index persisted between runs and caught up from the USN journal without admin (ADR 0008). Whole-drive indexes list every hard link from raw MFT records (M1c, ADR 0009). |
 | M2 | Content engine | Trigram index + content store; `dev` scope queries under 100 ms with parity. |
 | M3 | Daemon | Service, IPC, ACL filtering, dirty set, admin-free fallback mode. |
 | M4 | Agents | MCP server, `--json`, docs/mcp.md; Claude Code uses it end to end. |

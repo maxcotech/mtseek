@@ -14,6 +14,8 @@ use clap::{ArgAction, Parser};
 use mtseek_core::{CaseMode, Filter, PatternKind, Query, Scope};
 use mtseek_walk::{FileHit, Mode, Options};
 
+mod names;
+
 /// Instant full-disk search. Takes ripgrep's flags and prints ripgrep's output format.
 #[derive(Debug, Parser)]
 #[command(name = "mtseek", version, max_term_width = 100)]
@@ -88,6 +90,20 @@ struct Args {
     /// Accepted for ripgrep compatibility. mtseek has no config file.
     #[arg(long, hide = true)]
     no_config: bool,
+
+    /// Search file and folder names instead of contents (like Everything). Space-separated
+    /// terms must all appear in the name. Smart case by default. Covers every file under the
+    /// paths, ignored and hidden ones included, and prints absolute paths. Reads the NTFS
+    /// master file table when run as administrator; otherwise walks directories.
+    #[arg(
+        long,
+        conflicts_with_all = ["fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden", "no_ignore", "follow"]
+    )]
+    names: bool,
+
+    /// With --names: print timings and index size to stderr.
+    #[arg(long, requires = "names")]
+    stats: bool,
 }
 
 impl Args {
@@ -141,7 +157,12 @@ struct Format {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    match run(&args) {
+    let result = if args.names {
+        names::run(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(code) => code,
         Err(err) => {
             let _ = writeln!(io::stderr(), "mtseek: {err}");
@@ -189,7 +210,7 @@ fn run(args: &Args) -> mtseek_core::Result<ExitCode> {
     let write_error = write_error
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(err) = write_error.or(flushed.err()) {
+    if let Some(err) = write_error.or_else(|| flushed.err()) {
         // A closed pipe (`mtseek foo | head`) is a normal way to stop, not a failure.
         if err.kind() == io::ErrorKind::BrokenPipe {
             return Ok(ExitCode::SUCCESS);

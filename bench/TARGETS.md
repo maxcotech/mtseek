@@ -56,6 +56,72 @@ mtseek must search exactly this file set per scope.
 - `common` on `all` matches 400,769 files, so output volume dominates. An
   index gains little on raw speed there.
 
+## Progress
+
+### 2026-11-20, after M1b (`cargo xtask bench --modes names` and `--modes files,lines`, 5 timed runs)
+
+**File names** (`mtseek --names` vs `rg --files -uu --iglob *pattern*`, everything under
+`C:\Dev`, 1.06M files). Parity ✓ in every cell (mtseek also lists matching directories).
+
+| query | matching files | rg median | mtseek median | speedup | first run (mtseek builds its index) |
+|---|---:|---:|---:|---:|---|
+| name-absent `zq7xkvq9plmw` | 0 | 4.31 s | 126 ms | 34× | rg 4.14 s · mtseek 4.29 s |
+| name-rare `paystack` | 7 | 4.77 s | 170 ms | 28× | rg 4.21 s · mtseek 4.12 s |
+| name-medium `controller` | 1,825 | 4.95 s | 194 ms | 26× | rg 4.82 s · mtseek 4.69 s |
+| name-common `.json` | 38,309 | 5.34 s | 381 ms | 14× | rg 5.05 s · mtseek 5.16 s |
+
+The first run costs the same as rg (both walk the tree). After that, mtseek loads its saved
+index (~100 ms) and catches up from the change journal. Still above the 100 ms target:
+loading the index from disk on every run is the floor until the daemon (M3) keeps it in memory.
+
+**Content** (`dev` scope). Parity ✓ in all 16 cells. rg geomean 750 ms this run (573 ms
+in the baseline above; the tree grew to 15,134 files, and the machine was less idle).
+
+| mode | rg medians | mtseek medians | speedup |
+|---|---|---|---|
+| files | 562–807 ms | 319–446 ms | 1.6–1.8× |
+| lines | 739–908 ms | 425–570 ms | 1.5–1.9× |
+
+Don't count this as progress toward the target yet. mtseek's content search is still the
+reference scanner, built on ripgrep's own crates and opening every file like rg does. The
+gap is real and repeatable (M0 measured it too), but nobody has explained it yet. Candidates:
+thread count, rg's per-file work that mtseek skips, and build flags (mtseek is built with
+thin LTO and one codegen unit). The content target needs the trigram index (M2).
+
+### 2026-11-20, listing everything (`--names ""`)
+
+Listing every name used to build each full path and then sort them with `Path`'s
+component-by-component comparison. That took 9.1 s of search time for the 1.2M entries
+under `C:\Dev` (from `--stats`), slower than `rg --files`. Now entries are grouped by
+folder, each folder's names are sorted when the walk enters it, and a depth-first walk
+emits paths already in order:
+
+| `mtseek --names "" C:\Dev` | search time (`--stats`) |
+|---|---:|
+| before | 9,118 ms |
+| after | 696–905 ms |
+
+`cargo xtask bench --modes names` after the change, with a busier machine than the run
+above (rg medians 7.0–7.6 s instead of 4.3–5.3 s). Parity ✓ in every cell.
+
+| query | matching files | rg median | mtseek median | speedup |
+|---|---:|---:|---:|---:|
+| name-absent | 0 | 7.63 s | 227 ms | 34× |
+| name-rare | 7 | 7.39 s | 294 ms | 25× |
+| name-medium | 1,825 | 7.45 s | 316 ms | 24× |
+| name-common | 38,317 | 7.01 s | 329 ms | 21× |
+| name-all (new) | 1,060,855 | 7.49 s | 1.45 s | 5.2× |
+
+### 2026-11-20, M1c: whole-drive index from raw MFT records (admin)
+
+Measured with `mtseek --names --stats` in an elevated terminal, since the benchmark harness
+doesn't run elevated.
+
+| whole-drive build of `C:` | entries | build time | `C:\Dev` files missing vs `rg --files -uu` |
+|---|---:|---:|---:|
+| `FSCTL_ENUM_USN_DATA` (M1) | 2,433,531 | 5.6 s | 3,877 (extra hard links) |
+| raw MFT records (M1c) | 2,509,479 | **2.56 s** | **0** of 1,060,747 |
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

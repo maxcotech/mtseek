@@ -11,6 +11,7 @@ files** before comparing speed. A fast wrong answer counts as a failure.
 python bench.py                      # default scope (dev), all queries, all installed contenders
 python bench.py --scopes dev,all     # add the whole-tree scope (minutes per query)
 python bench.py --queries rare,absent --modes files --runs 3
+python bench.py --modes names        # file-name search: rg --files vs mtseek --names
 python bench.py --list               # show scopes, queries, contenders
 ```
 
@@ -46,6 +47,23 @@ Python 3.10+ standard library only. ripgrep must be on `PATH`.
 
 The corpus is defined as what `rg --files` lists with the scope's flags. To
 pass parity, mtseek has to index the same file set for a scope.
+
+## Modes
+
+| mode | what is timed | parity |
+|---|---|---|
+| `files` | content search, list matching files (`rg -l`) | exact set of paths |
+| `lines` | content search, print matching lines | matching-line count |
+| `names` | file-name search over everything under the root | every file rg lists must appear; extras must be directories |
+
+`names` runs only the `kind: "name"` queries, and the content modes run only the others:
+`python bench.py --modes names`. ripgrep has no name search, so its side is
+`rg --files -uu --iglob *pattern*`: list everything, keep the matching names. A contender
+takes part in `names` only if it has a `names_argv`. Its `names_reset` directories are
+emptied before each cell, so the cell's `first` run includes building any index, and the
+timed runs show what a user sees from then on. mtseek's index cache lives in
+`%TEMP%\mtseek-bench\mtseek-names`: not in the user's own cache, and not under any scope's
+root, where it would become part of the corpus being searched.
 
 ## Queries
 
