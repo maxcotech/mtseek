@@ -135,7 +135,7 @@ fn respell(paths: &mut [PathBuf], stored: &Path, root: &Path) {
 }
 
 /// The cache directory: `MTSEEK_CACHE_DIR`, else `%LOCALAPPDATA%\mtseek\cache`.
-fn cache_dir() -> Option<PathBuf> {
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MTSEEK_CACHE_DIR") {
         return Some(dir.into());
     }
@@ -320,13 +320,13 @@ fn fnv1a(path: &Path) -> u64 {
 }
 
 /// A one-line note on stderr, only when a person is watching (never pollutes pipes or agents).
-fn hint(message: &str) {
+pub(crate) fn hint(message: &str) {
     if io::stderr().is_terminal() {
         let _ = writeln!(io::stderr(), "mtseek: {message}");
     }
 }
 
-fn ms(d: Duration) -> f64 {
+pub(crate) fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 

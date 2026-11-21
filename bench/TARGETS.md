@@ -122,6 +122,53 @@ doesn't run elevated.
 | `FSCTL_ENUM_USN_DATA` (M1) | 2,433,531 | 5.6 s | 3,877 (extra hard links) |
 | raw MFT records (M1c) | 2,509,479 | **2.56 s** | **0** of 1,060,747 |
 
+### 2026-11-21, M2a: content index (`cargo xtask bench --modes files,lines`, 5 timed runs)
+
+New contender `mtseek-index`, which is `mtseek --index` (ADR 0010). Its index is emptied
+before each cell, so `first` includes building it. Parity ✓ in all 16 cells. The machine was
+busy: rg's geomean was ~0.95 s, against 573 ms in the baseline.
+
+| query | mode | matches | rg | mtseek (scan) | mtseek-index | speedup vs rg | first (index build + search) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| absent | files | 6 | 625 ms | 401 ms | **35 ms** | 17.7× | 1.89 s |
+| rare | files | 27 | 911 ms | 626 ms | **72 ms** | 12.6× | 1.95 s |
+| uncommon | files | 87 | 1.08 s | 617 ms | **59 ms** | 18.2× | 2.91 s |
+| medium | files | 788 | 1.18 s | 707 ms | 124 ms | 9.5× | 2.55 s |
+| common | files | 9,474 | 1.01 s | 521 ms | 101 ms | 10.0× | 3.53 s |
+| icase | files | 30 | 982 ms | 629 ms | **71 ms** | 13.8× | 3.07 s |
+| regex-lit | files | 42 | 928 ms | 575 ms | **73 ms** | 12.8× | 2.17 s |
+| regex-nolit | files | 4 | 1.01 s | 616 ms | 166 ms | 6.0× | 2.00 s |
+| absent | lines | 11 | 892 ms | 536 ms | **52 ms** | 17.1× | 2.15 s |
+| rare | lines | 47 | 862 ms | 627 ms | **79 ms** | 11.0× | 2.15 s |
+| uncommon | lines | 201 | 915 ms | 748 ms | **66 ms** | 13.8× | 2.48 s |
+| medium | lines | 1,754 | 958 ms | 617 ms | **78 ms** | 12.2× | 2.37 s |
+| common | lines | 53,342 | 998 ms | 581 ms | 178 ms | 5.6× | 2.42 s |
+| icase | lines | 67 | 819 ms | 608 ms | **83 ms** | 9.9× | 2.40 s |
+| regex-lit | lines | 89 | 1.08 s | 709 ms | 100 ms | 10.7× | 2.64 s |
+| regex-nolit | lines | 8 | 949 ms | 643 ms | 194 ms | 4.9× | 2.83 s |
+
+Bold cells are under the 100 ms target: 10 of 16. (`absent` isn't absent any more: the token
+now appears in this repo's own docs and tests.)
+
+The index, measured with `--stats`:
+
+- **Build:** 1.75 s for 15,399 files. 102.7 MB of stored text compresses to 20.1 MB. There are
+  121,611 trigrams and 14.3 M postings, and the file is **37.3 MiB** on disk. Binary files
+  are cut after their first NUL, which is what keeps 693 MB of files down to 103 MB of text.
+- **Opening the index:** about 3 ms.
+- **Engine time per query** (plan, postings, decompress and verify):
+  - `Paystack`: 16 ms (168 candidates)
+  - `useEffect`: 21 ms (840 candidates)
+  - `import`: 36–50 ms (9,645 candidates)
+  - `regex-nolit`: 70 ms. It has no trigram to narrow by, so it decompresses and searches
+    all 1,119 blocks.
+
+  The rest of the wall time is process start (11 ms floor), thread start-up and writing the
+  output. So the over-100 ms cells are output volume (`common`), the honest worst case
+  (`regex-nolit`), and noise (`medium` files varied from 90 to 154 ms on this run).
+- **Not yet covered:** the index is built once and not updated (M2b). Update latency, pass
+  criterion 3, has no number until then.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's
