@@ -10,6 +10,8 @@
 //!   through a directory handle. Unprivileged records carry no names, only the file's and
 //!   its parent directory's reference numbers.
 //! * [`Directory`] (Windows only): lists a directory with each entry's reference number.
+//! * [`pipe`] (Windows only): the daemon's local named pipe, with its access checks
+//!   (ADR 0013). It lives here because it needs `unsafe` Win32 calls too.
 //!
 //! All `unsafe` in the project lives in this crate's private `sys` module.
 
@@ -17,6 +19,8 @@ pub mod dir;
 #[cfg(windows)]
 mod journal;
 pub mod mft;
+#[cfg(windows)]
+pub mod pipe;
 pub mod record;
 #[cfg(windows)]
 mod sys;

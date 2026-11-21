@@ -5,24 +5,25 @@
 
 #![allow(clippy::print_stderr)] // tells the developer why the rg test was skipped
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::{How, NO_DAEMON};
 use mtseek_testkit::CorpusSpec;
 
 /// Runs `mtseek --names` with a throwaway cache, so every run builds from scratch.
 fn mtseek(args: &[&str], root: &Path) -> (Option<i32>, Vec<String>) {
-    let cache = tempfile::tempdir().expect("temp dir");
-    let (code, lines, _) = mtseek_cached(cache.path(), args, root);
+    let (code, lines, _) = mtseek_how(&How::direct(), args, root);
     (code, lines)
 }
 
-/// Runs `mtseek --names --stats` with the given cache. Returns exit code, stdout lines and
-/// stderr.
-fn mtseek_cached(cache: &Path, args: &[&str], root: &Path) -> (Option<i32>, Vec<String>, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mtseek"))
-        .env("MTSEEK_CACHE_DIR", cache)
+/// Runs `mtseek --names --stats`. Returns exit code, stdout lines and stderr.
+fn mtseek_how(how: &How, args: &[&str], root: &Path) -> (Option<i32>, Vec<String>, String) {
+    let out = how
+        .command(env!("CARGO_BIN_EXE_mtseek"))
         .arg("--names")
         .arg("--stats")
         .args(args)
@@ -152,6 +153,7 @@ fn terms_case_and_exit_codes() {
 #[test]
 fn content_only_flags_are_rejected_with_names() {
     let out = Command::new(env!("CARGO_BIN_EXE_mtseek"))
+        .env("MTSEEK_PIPE", NO_DAEMON)
         .args(["--names", "-l", "x", "."])
         .output()
         .unwrap();
@@ -164,13 +166,13 @@ fn content_only_flags_are_rejected_with_names() {
 #[cfg(windows)]
 #[test]
 fn later_runs_reuse_the_saved_index_and_see_changes() {
-    let cache = tempfile::tempdir().unwrap();
+    let how = How::direct();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/old.rs"), "").unwrap();
 
-    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    let (code, out, stats) = mtseek_how(&how, &[".rs"], root);
     assert_eq!((code, names(&out)), (Some(0), vec!["old.rs".to_owned()]));
     // Elevated (CI), the first run reads the MFT; otherwise it walks. Either way it saves.
     assert!(!stats.contains("snapshot"), "{stats}");
@@ -178,15 +180,53 @@ fn later_runs_reuse_the_saved_index_and_see_changes() {
 
     std::fs::write(root.join("src/new.rs"), "").unwrap();
     std::fs::remove_file(root.join("src/old.rs")).unwrap();
-    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    let (code, out, stats) = mtseek_how(&how, &[".rs"], root);
     assert_eq!((code, names(&out)), (Some(0), vec!["new.rs".to_owned()]));
     assert!(stats.contains("snapshot"), "{stats}");
 
     // A corrupt cache is rebuilt, not trusted.
-    for entry in std::fs::read_dir(cache.path()).unwrap() {
+    for entry in std::fs::read_dir(how.cache()).unwrap() {
         std::fs::write(entry.unwrap().path(), b"garbage").unwrap();
     }
-    let (code, out, stats) = mtseek_cached(cache.path(), &[".rs"], root);
+    let (code, out, stats) = mtseek_how(&how, &[".rs"], root);
     assert_eq!((code, names(&out)), (Some(0), vec!["new.rs".to_owned()]));
     assert!(!stats.contains("snapshot"), "{stats}");
+}
+
+/// The daemon answers name searches like direct mode, from an index it keeps in memory and
+/// catches up between searches.
+#[cfg(windows)]
+#[test]
+fn the_daemon_answers_names_like_direct_mode_and_sees_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src").join("Payments")).unwrap();
+    std::fs::write(
+        root.join("src").join("Payments").join("PaystackClient.cs"),
+        "",
+    )
+    .unwrap();
+    std::fs::write(root.join("src").join("paystack.json"), "").unwrap();
+    let daemon = How::daemon("names");
+    for args in [
+        &["paystack"][..],
+        &["Paystack"],
+        &["-i", "PAYSTACK"],
+        &["pay .json"],
+        &[""],
+    ] {
+        let (code, direct, _) = mtseek_how(&How::direct(), args, root);
+        let (daemon_code, through, stats) = mtseek_how(&daemon, args, root);
+        assert_eq!((daemon_code, &through), (code, &direct), "{args:?}");
+        assert!(stats.contains("answered by mtseekd"), "{stats}");
+    }
+    // A file created after the daemon loaded the index is found by the next search.
+    std::fs::write(root.join("src").join("paystack.lock"), "").unwrap();
+    let (_, out, stats) = mtseek_how(&daemon, &["paystack"], root);
+    assert_eq!(
+        names(&out),
+        ["PaystackClient.cs", "paystack.json", "paystack.lock"],
+        "{stats}"
+    );
+    assert!(stats.contains("memory +"), "caught up in memory: {stats}");
 }

@@ -8,11 +8,14 @@
 
 #![allow(clippy::print_stderr)] // tells the developer why the test was skipped
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
+use common::How;
 use mtseek_testkit::{CorpusSpec, tokens};
 
 const QUERIES: &[(&str, &[&str])] = &[
@@ -45,7 +48,8 @@ const QUERIES: &[(&str, &[&str])] = &[
 /// `binary_after_match_reports_lines_and_offset` unit tests.
 const UNSTABLE: &[&str] = &["binary-late.bin"];
 
-/// mtseek runs every case twice: scanning, and through the content index (`--index`).
+/// mtseek runs every case scanning and through the content index (`--index`), each in its
+/// own process and through a daemon (ADR 0013).
 const MTSEEK_VARIANTS: &[&[&str]] = &[&["--no-index"], &["--index"]];
 
 const SCOPES: &[&[&str]] = &[&[], &["-u"], &["-uu"]];
@@ -59,7 +63,8 @@ fn output_matches_ripgrep() {
     }
     let dir = tempfile::tempdir().unwrap();
     mtseek_testkit::generate(dir.path(), &CorpusSpec::default()).unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let ways = How::both("parity");
+    let rg = How::direct();
 
     let mut failures = Vec::new();
     let mut cases = 0;
@@ -72,19 +77,26 @@ fn output_matches_ripgrep() {
                     .chain(mode)
                     .copied()
                     .collect();
-                let expected = run("rg", &["--no-config"], &flags, pattern, dir.path(), None);
-                for variant in MTSEEK_VARIANTS {
+                let expected = run(&rg, "rg", &["--no-config"], &flags, pattern, dir.path());
+                for (how, variant) in ways
+                    .iter()
+                    .flat_map(|how| MTSEEK_VARIANTS.iter().map(move |v| (how, v)))
+                {
                     let actual = run(
+                        how,
                         env!("CARGO_BIN_EXE_mtseek"),
                         variant,
                         &flags,
                         pattern,
                         dir.path(),
-                        Some(cache.path()),
                     );
                     cases += 1;
                     if expected != actual {
-                        let all_flags: Vec<&str> = variant.iter().chain(&flags).copied().collect();
+                        let all_flags: Vec<&str> = [how.label()]
+                            .into_iter()
+                            .chain(variant.iter().copied())
+                            .chain(flags.iter().copied())
+                            .collect();
                         failures.push(describe(pattern, &all_flags, &expected, &actual));
                     }
                 }
@@ -108,16 +120,19 @@ fn subfolder_searches_through_a_parent_index_match_ripgrep() {
     }
     let dir = tempfile::tempdir().unwrap();
     mtseek_testkit::generate(dir.path(), &CorpusSpec::default()).unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let ways = How::both("subfolders");
+    let rg = How::direct();
     // Index the whole corpus with the widest filters, so that every search below can use it.
-    run(
-        env!("CARGO_BIN_EXE_mtseek"),
-        &["--index", "-uu", "-l"],
-        &[],
-        tokens::ABSENT,
-        dir.path(),
-        Some(cache.path()),
-    );
+    for how in &ways {
+        run(
+            how,
+            env!("CARGO_BIN_EXE_mtseek"),
+            &["--index", "-uu", "-l"],
+            &[],
+            tokens::ABSENT,
+            dir.path(),
+        );
+    }
     let mut roots: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -141,21 +156,24 @@ fn subfolder_searches_through_a_parent_index_match_ripgrep() {
                         .chain(mode)
                         .copied()
                         .collect();
-                    let expected = run("rg", &["--no-config"], &flags, pattern, root, None);
-                    let actual = run(
-                        env!("CARGO_BIN_EXE_mtseek"),
-                        &[],
-                        &flags,
-                        pattern,
-                        root,
-                        Some(cache.path()),
-                    );
-                    cases += 1;
-                    if expected != actual {
-                        let mut all = flags.clone();
-                        let shown = root.to_string_lossy();
-                        all.push(&shown);
-                        failures.push(describe(pattern, &all, &expected, &actual));
+                    let expected = run(&rg, "rg", &["--no-config"], &flags, pattern, root);
+                    for how in &ways {
+                        let actual = run(
+                            how,
+                            env!("CARGO_BIN_EXE_mtseek"),
+                            &[],
+                            &flags,
+                            pattern,
+                            root,
+                        );
+                        cases += 1;
+                        if expected != actual {
+                            let mut all = vec![how.label()];
+                            all.extend(&flags);
+                            let shown = root.to_string_lossy();
+                            all.push(&shown);
+                            failures.push(describe(pattern, &all, &expected, &actual));
+                        }
                     }
                 }
             }
@@ -181,18 +199,12 @@ struct Outcome {
     lines: BTreeMap<Vec<u8>, usize>,
 }
 
-fn run(
-    exe: &str,
-    pre: &[&str],
-    flags: &[&str],
-    pattern: &str,
-    root: &Path,
-    cache: Option<&Path>,
-) -> Outcome {
-    let mut command = Command::new(exe);
-    if let Some(cache) = cache {
-        command.env("MTSEEK_CACHE_DIR", cache);
-    }
+fn run(how: &How, exe: &str, pre: &[&str], flags: &[&str], pattern: &str, root: &Path) -> Outcome {
+    let mut command = if exe == "rg" {
+        Command::new(exe)
+    } else {
+        how.command(exe)
+    };
     let output = command
         .args(pre)
         .args(flags)

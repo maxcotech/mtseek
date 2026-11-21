@@ -151,7 +151,14 @@ class Contender:
         self.content_env: dict[str, str] = {
             k: str(SCRATCH / v) for k, v in spec.get("env", {}).items()
         }
+        # Variables passed as they are (not scratch paths), e.g. a daemon's pipe name.
+        self.content_env.update(spec.get("env_literal", {}))
         self.content_reset: list[Path] = [SCRATCH / p for p in spec.get("reset", [])]
+        # A server the contender talks to (the mtseek daemon): started after the caches are
+        # emptied, before the cell's first run, and stopped with `stop` after its last run.
+        self.serve: list[str] | None = spec.get("serve")
+        self.stop: list[str] | None = spec.get("stop")
+        self.server: subprocess.Popen | None = None
 
     def supports(self, mode: str) -> bool:
         return mode != "names" or self.names_argv is not None
@@ -167,6 +174,28 @@ class Contender:
         for d in self.names_reset if mode == "names" else self.content_reset:
             if d.resolve().is_relative_to(SCRATCH):  # never delete outside the scratch dir
                 shutil.rmtree(d, ignore_errors=True)
+
+    def start_server(self, mode: str) -> None:
+        if not self.serve or mode == "names":
+            return
+        argv = [resolve_exe(self.serve[0]) or self.serve[0], *self.serve[1:]]
+        self.server = subprocess.Popen(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env(mode)
+        )
+        time.sleep(0.5)  # let it create its pipe; the client would search directly otherwise
+
+    def stop_server(self, mode: str) -> None:
+        if self.server is None:
+            return
+        if self.stop:
+            argv = [resolve_exe(self.stop[0]) or self.stop[0], *self.stop[1:]]
+            subprocess.run(argv, capture_output=True, timeout=60, env=self.env(mode))
+        try:
+            self.server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.server.kill()
+            self.server.wait()
+        self.server = None
 
     @property
     def exe(self) -> str | None:
@@ -364,6 +393,7 @@ def bench_cell(contenders, query, scope, mode, runs, warmup, timeout, reference)
     # for an indexing tool the first run includes building its index.
     for c in contenders:
         c.reset(mode)
+        c.start_server(mode)
         for w in range(max(warmup, 1)):
             r = run_once(argvs[c.name], timeout, envs[c.name])
             if w == 0:
@@ -376,15 +406,19 @@ def bench_cell(contenders, query, scope, mode, runs, warmup, timeout, reference)
             digests[c.name] = digest(r["stdout"], mode)
 
     # Timed runs, round-robin across contenders so background noise is shared.
-    for _ in range(runs):
+    try:
+        for _ in range(runs):
+            for c in contenders:
+                if status[c.name] == "timeout":
+                    continue
+                r = run_once(argvs[c.name], timeout, envs[c.name])
+                if r["timeout"]:
+                    status[c.name] = "timeout"
+                    continue
+                samples[c.name].append(r["seconds"])
+    finally:
         for c in contenders:
-            if status[c.name] == "timeout":
-                continue
-            r = run_once(argvs[c.name], timeout, envs[c.name])
-            if r["timeout"]:
-                status[c.name] = "timeout"
-                continue
-            samples[c.name].append(r["seconds"])
+            c.stop_server(mode)
 
     cell = {
         "query": query["id"],

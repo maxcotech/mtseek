@@ -1,67 +1,86 @@
-//! Content search through the content index (ADR 0010, 0011, 0012).
+//! Content search through coverage roots (ADR 0010, 0011, 0012).
 //!
 //! The cache directory holds a list of **coverage roots**, each a folder indexed with one
 //! filter, and one index per root. `--index` adds the folders of a search to the list. From
 //! then on every content search inside a covered folder uses its index, as long as the
 //! search's filter lists no more than the index's filter does: a search of a subfolder, of
 //! the same folder spelled differently (case, 8.3 short names), or with narrower filters.
-//! Each run first applies what the NTFS change journal recorded since the last run, so
-//! results are never stale. Roots the index can't answer exactly are scanned. `--no-index`
-//! scans everything; `--reindex` rebuilds.
+//! Each search first applies what the NTFS change journal recorded since the index was last
+//! current, so results are never stale. Roots the index can't answer exactly are scanned.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::io::{self, Write};
-use std::ops::ControlFlow;
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use mtseek_core::{Error, Filter, Query, Result, Scope};
-use mtseek_index::{CatchUp, Index, membership};
-use mtseek_walk::{FileHit, Mode, Options, Summary};
+use mtseek_core::{Error, Filter, Result, Scope};
+use mtseek_index::{CatchUp, Index, Persist, membership};
+use mtseek_walk::{FileHit, Options, Summary};
 
-use crate::Args;
-use crate::names::{cache_dir, hint, ms};
+use crate::{Engine, IndexUse, Open, Outcome, Report, SearchRequest, io_error, ms};
 
 /// The coverage list, one root per line: `<ignore files><hidden>\t<canonical path>`, with
 /// `1`/`0` for each flag.
-const REGISTRY: &str = "content-coverage.txt";
+pub const REGISTRY: &str = "content-coverage.txt";
 
-/// What [`search`] did: the totals for the roots it answered from an index, and the roots
-/// left for the caller to scan.
-pub(crate) struct Outcome {
-    pub(crate) summary: Summary,
-    pub(crate) rest: Vec<PathBuf>,
+/// Searches each root through the index that covers it, where one can answer exactly, and
+/// scans the rest: no covering index (and `--index` not given), a filter the index doesn't
+/// cover, `--no-index`, a search that follows links, a file, or a path through a junction.
+pub(crate) fn search(
+    engine: &mut Engine,
+    request: &SearchRequest,
+    report: &dyn Report,
+) -> Result<Outcome> {
+    let options = Options {
+        threads: request.threads,
+    };
+    let filter = request.filter;
+    let mut outcome = Outcome::default();
+    let rest = indexed(engine, request, options, report, &mut outcome)?;
+    if !rest.is_empty() {
+        let scope = Scope {
+            roots: rest,
+            filter,
+        };
+        let on_hit = |hit: &FileHit<'_>| report.hit(hit);
+        let on_error = |err: &Error| report.error(err);
+        let scanned = mtseek_walk::scan(
+            &scope,
+            &request.query,
+            request.mode,
+            options,
+            &on_hit,
+            &on_error,
+        )?;
+        add(&mut outcome.summary, scanned);
+    }
+    if !engine.resident {
+        // The CLI wrote every change before searching; this only closes the indexes.
+        engine.indexes.clear();
+    }
+    Ok(outcome)
 }
 
-/// Searches each root of `scope` through the index that covers it, where one can answer
-/// exactly (ADR 0012). The other roots are returned for scanning: no covering index (and
-/// `--index` not given), a filter the index doesn't cover, `--no-index`, a search that follows
-/// links, a file, or a path through a junction.
-pub(crate) fn search(
-    args: &Args,
-    scope: &Scope,
-    query: &Query,
-    mode: Mode,
+/// The indexed part of [`search`]. Returns the roots left to scan.
+fn indexed(
+    engine: &mut Engine,
+    request: &SearchRequest,
     options: Options,
-    on_hit: &(dyn Fn(&FileHit<'_>) -> ControlFlow<()> + Sync),
-    on_error: &(dyn Fn(&Error) + Sync),
-) -> Result<Outcome> {
-    let explicit = args.index || args.reindex;
-    let everything = || Outcome {
-        summary: Summary::default(),
-        rest: scope.roots.clone(),
-    };
-    if args.no_index {
-        return Ok(everything());
+    report: &dyn Report,
+    outcome: &mut Outcome,
+) -> Result<Vec<PathBuf>> {
+    let explicit = request.index.explicit();
+    if request.index == IndexUse::Off {
+        return Ok(request.roots.clone());
     }
-    if scope.filter.follow_links {
+    if request.filter.follow_links {
         if explicit {
-            hint("searches that follow links (-L) don't use the content index; scanning");
+            report.note("searches that follow links (-L) don't use the content index; scanning");
         }
-        return Ok(everything());
+        return Ok(request.roots.clone());
     }
-    let Some(cache) = cache_dir() else {
+    let Some(cache) = engine.cache.clone() else {
         if explicit {
             return Err(io_error(
                 Path::new("<cache>"),
@@ -71,22 +90,23 @@ pub(crate) fn search(
                 ),
             ));
         }
-        return Ok(everything());
+        return Ok(request.roots.clone());
     };
 
     let mut run = Run {
-        args,
+        engine,
+        index_use: request.index,
         options,
         cache: &cache,
         registry: Registry::load(&cache),
-        open: HashMap::new(),
+        current: HashSet::new(),
         rebuilt: HashSet::new(),
-        stats: Vec::new(),
+        report,
+        stats: &mut outcome.stats,
     };
-    let mut summary = Summary::default();
     let mut rest = Vec::new();
-    for typed in &scope.roots {
-        let Some((root, dir)) = run.resolve(typed, scope.filter) else {
+    for typed in &request.roots {
+        let Some((root, dir)) = run.resolve(typed, request.filter) else {
             rest.push(typed.clone());
             continue;
         };
@@ -94,7 +114,7 @@ pub(crate) fn search(
             rest.push(typed.clone());
             continue;
         };
-        let bit = membership::bit(&scope.filter);
+        let bit = membership::bit(&request.filter);
         let entered = match index.entered(&dir) {
             Ok(flags) => flags,
             Err(err) => return Err(run.discard(&root, err.into())),
@@ -108,10 +128,20 @@ pub(crate) fn search(
         let target = mtseek_query::Target {
             root: typed,
             dir: &dir,
-            filter: scope.filter,
+            filter: request.filter,
         };
+        let on_hit = |hit: &FileHit<'_>| report.hit(hit);
+        let on_error = |err: &Error| report.error(err);
         let searched = Instant::now();
-        let result = mtseek_query::search(index, target, query, mode, options, on_hit, on_error);
+        let result = mtseek_query::search(
+            index,
+            target,
+            &request.query,
+            request.mode,
+            options,
+            &on_hit,
+            &on_error,
+        );
         let (found, search_stats) = match result {
             Ok(done) => done,
             Err(err @ Error::InvalidPattern(_)) => return Err(err),
@@ -131,33 +161,83 @@ pub(crate) fn search(
             found.files_matched,
             ms(searched.elapsed()),
         ));
-        summary.files_searched += found.files_searched;
-        summary.files_matched += found.files_matched;
-        summary.errors += found.errors;
+        add(&mut outcome.summary, found);
     }
-    run.registry.save(&cache);
-    if args.stats {
-        let mut err = io::stderr().lock();
-        for line in &run.stats {
-            let _ = writeln!(err, "{line}");
-        }
-        if !rest.is_empty() && !run.stats.is_empty() {
-            let _ = writeln!(err, "{} root(s) scanned instead", rest.len());
-        }
+    run.registry.save(&cache, report);
+    if !rest.is_empty() && !run.stats.is_empty() {
+        run.stats
+            .push(format!("{} root(s) scanned instead", rest.len()));
     }
-    Ok(Outcome { summary, rest })
+    Ok(rest)
 }
 
-/// One run's indexes: the coverage list, the indexes opened (and caught up) so far, and the
-/// `--stats` lines.
+fn add(total: &mut Summary, part: Summary) {
+    total.files_searched += part.files_searched;
+    total.files_matched += part.files_matched;
+    total.errors += part.errors;
+}
+
+/// Catches up every open index (see [`Engine::refresh`]).
+pub(crate) fn refresh(engine: &mut Engine) -> usize {
+    let mut changed = 0;
+    let mut closed = Vec::new();
+    for (root, open) in &mut engine.indexes {
+        let scope = Scope {
+            roots: vec![root.clone()],
+            filter: open.index.coverage(),
+        };
+        match open.index.catch_up(&scope, Options::default()) {
+            Ok(CatchUp::Current { .. }) => {}
+            Ok(CatchUp::Updated { .. }) => {
+                open.changed = Some(Instant::now());
+                changed += 1;
+            }
+            Ok(CatchUp::NeedsRebuild(_)) | Err(_) => closed.push(root.clone()),
+        }
+    }
+    for root in closed {
+        // Unsaved changes are lost with it; the rebuild re-reads everything.
+        engine.indexes.remove(&root);
+    }
+    changed
+}
+
+/// Writes unsaved deltas older than `quiet` (see [`Engine::save`]).
+pub(crate) fn save(engine: &mut Engine, quiet: Duration) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (root, open) in &mut engine.indexes {
+        if !open.index.unsaved() || open.changed.is_some_and(|t| t.elapsed() < quiet) {
+            continue;
+        }
+        let started = Instant::now();
+        match open.index.save() {
+            Ok(_) => lines.push(format!(
+                "wrote the delta of {} in {:.1} ms",
+                root.display(),
+                ms(started.elapsed())
+            )),
+            Err(err) => lines.push(format!(
+                "could not write the delta of {}: {err}",
+                root.display()
+            )),
+        }
+    }
+    lines
+}
+
+/// One search's view of the indexes: the coverage list, which indexes it caught up or
+/// rebuilt, and its `--stats` lines.
 struct Run<'a> {
-    args: &'a Args,
+    engine: &'a mut Engine,
+    index_use: IndexUse,
     options: Options,
     cache: &'a Path,
     registry: Registry,
-    open: HashMap<PathBuf, Index>,
+    /// Coverage roots whose index this search caught up (or built).
+    current: HashSet<PathBuf>,
     rebuilt: HashSet<PathBuf>,
-    stats: Vec<String>,
+    report: &'a dyn Report,
+    stats: &'a mut Vec<String>,
 }
 
 impl Run<'_> {
@@ -165,7 +245,7 @@ impl Run<'_> {
     /// it that `typed` names. Registers `typed` first if `--index` asks for it. `None` if
     /// `typed` is to be scanned.
     fn resolve(&mut self, typed: &Path, filter: Filter) -> Option<(PathBuf, PathBuf)> {
-        let explicit = self.args.index || self.args.reindex;
+        let explicit = self.index_use.explicit();
         // A missing root or a file: the scanner reports it the way rg does.
         let canonical = canonical(typed).filter(|c| c.is_dir())?;
         // The index's walk read the ignore files above its root along the real path. Through
@@ -175,7 +255,7 @@ impl Run<'_> {
         };
         if !same_path(&absolute, &canonical) {
             if explicit {
-                hint(&format!(
+                self.report.note(&format!(
                     "{}: the path goes through a link or junction; scanning",
                     typed.display()
                 ));
@@ -195,7 +275,7 @@ impl Run<'_> {
             }
             Some(entry) => {
                 if explicit {
-                    hint(&format!(
+                    self.report.note(&format!(
                         "{} is inside {}, whose index lists fewer files than these filters \
                          do; scanning. Run --index on {} with these filters to widen it.",
                         typed.display(),
@@ -208,7 +288,7 @@ impl Run<'_> {
             None if explicit => {
                 let inside = self.registry.inside(&canonical);
                 if let Some(wider) = inside.iter().find(|e| !covers(wanted, e.filter)) {
-                    hint(&format!(
+                    self.report.note(&format!(
                         "{} holds {}, indexed with filters that list more; scanning. \
                          Use the same filters to index {} instead.",
                         typed.display(),
@@ -234,73 +314,108 @@ impl Run<'_> {
         Some((root, dir))
     }
 
-    /// The index of coverage root `root`, opened and caught up (once per run), or built.
-    /// `None` if it can't be used: missing, or not kept current, without `--index`.
+    /// The index of coverage root `root`, caught up (once per search), or built. `None` if
+    /// it can't be used: missing, or not kept current, without `--index`.
     fn index(&mut self, root: &Path) -> Result<Option<&Index>> {
-        if self.open.contains_key(root) {
-            return Ok(self.open.get(root));
-        }
-        let explicit = self.args.index || self.args.reindex;
+        let explicit = self.index_use.explicit();
         let Some(entry) = self.registry.get(root).cloned() else {
+            self.forget(root);
             return Ok(None);
         };
         let scope = Scope {
             roots: vec![root.to_path_buf()],
             filter: entry.filter,
         };
+        // An index kept open from an earlier search (the daemon) is used if another process
+        // hasn't changed its coverage since.
+        if let Some(open) = self.engine.indexes.get(root)
+            && open.index.coverage() != mtseek_index::coverage(entry.filter)
+        {
+            self.forget(root);
+        }
+        let reindex =
+            self.index_use == IndexUse::Rebuild && self.rebuilt.insert(root.to_path_buf());
+        if reindex {
+            self.forget(root);
+        }
+        if self.current.contains(root) {
+            return Ok(self.engine.indexes.get(root).map(|o| &o.index));
+        }
         let path = index_path(self.cache, root);
-        let key = mtseek_index::scope_key(&scope).map_err(|source| io_error(root, source))?;
         let started = Instant::now();
-        let reindex = self.args.reindex && self.rebuilt.insert(root.to_path_buf());
-        let existing = if reindex {
-            None
-        } else {
-            Index::open(&path, &key)
+        let opened = match self.engine.indexes.remove(root) {
+            Some(open) => Some(open),
+            None if reindex => None,
+            None => {
+                let key =
+                    mtseek_index::scope_key(&scope).map_err(|source| io_error(root, source))?;
+                Index::open(&path, &key).map(|index| Open {
+                    index,
+                    changed: None,
+                })
+            }
         };
-        let index = match existing {
+        let open = match opened {
             // New, or registered earlier but gone or unreadable: build it.
             None => self.build(&scope, &path, started)?,
-            Some(index) if index.meta().checkpoints.is_empty() && !explicit => return Ok(None),
-            Some(mut index) => {
+            Some(open) if open.index.meta().checkpoints.is_empty() && !explicit => {
+                return Ok(None);
+            }
+            Some(mut open) => {
                 let opened = started.elapsed();
-                match index.catch_up(&scope, self.options)? {
+                open.index.set_persist(self.persist());
+                match open.index.catch_up(&scope, self.options)? {
                     CatchUp::NeedsRebuild(reason) => {
-                        hint(&format!("rebuilding the content index: {reason}"));
-                        drop(index);
+                        self.report
+                            .note(&format!("rebuilding the content index: {reason}"));
+                        drop(open);
                         self.build(&scope, &path, started)?
                     }
                     done => {
+                        if matches!(done, CatchUp::Updated { .. }) {
+                            open.changed = Some(Instant::now());
+                        }
                         self.stats.push(format!(
                             "index of {} files ({:.1} MiB) for {} opened in {:.1} ms, \
                              caught up in {:.1} ms: {}",
-                            index.len(),
-                            mib(index.file_bytes()),
+                            open.index.len(),
+                            mib(open.index.file_bytes()),
                             root.display(),
                             ms(opened),
                             ms(started.elapsed().saturating_sub(opened)),
                             describe(&done),
                         ));
-                        index
+                        open
                     }
                 }
             }
         };
         self.stats.push(format!("index file {}", path.display()));
-        self.open.insert(root.to_path_buf(), index);
-        Ok(self.open.get(root))
+        self.current.insert(root.to_path_buf());
+        self.engine.indexes.insert(root.to_path_buf(), open);
+        Ok(self.engine.indexes.get(root).map(|o| &o.index))
     }
 
-    fn build(&mut self, scope: &Scope, path: &Path, started: Instant) -> Result<Index> {
+    fn persist(&self) -> Persist {
+        if self.engine.resident {
+            Persist::Later
+        } else {
+            Persist::Now
+        }
+    }
+
+    fn build(&mut self, scope: &Scope, path: &Path, started: Instant) -> Result<Open> {
         std::fs::create_dir_all(self.cache).map_err(|source| io_error(self.cache, source))?;
         let root = scope
             .roots
             .first()
             .map_or_else(|| Path::new(""), PathBuf::as_path);
-        hint(&format!(
+        self.report.note(&format!(
             "building the content index for {} (only the first time)",
             root.display()
         ));
-        let (index, built) = Index::build(scope, self.options, path)?;
+        let (mut index, built) = Index::build(scope, self.options, path)?;
+        index.set_persist(self.persist());
         self.stats.push(format!(
             "index of {} files built in {:.0} ms: {:.1} MB of text stored as {:.1} MB, \
              {} trigrams, {} postings, {:.1} MiB on disk, {} unreadable, {}",
@@ -318,15 +433,19 @@ impl Run<'_> {
                 "kept current from the change journal"
             },
         ));
-        Ok(index)
+        Ok(Open {
+            index,
+            changed: None,
+        })
     }
 
     /// Closes the index of `root`, if open.
     fn forget(&mut self, root: &Path) {
-        self.open.remove(root);
+        self.engine.indexes.remove(root);
+        self.current.remove(root);
     }
 
-    /// Drops a broken index, so the next run builds a fresh one, and passes on `err`.
+    /// Drops a broken index, so the next search builds a fresh one, and passes on `err`.
     fn discard(&mut self, root: &Path, err: Error) -> Error {
         self.forget(root);
         remove_index(&index_path(self.cache, root));
@@ -375,8 +494,8 @@ impl Registry {
         }
     }
 
-    /// Writes the list if it changed. Failing only costs the next run its index.
-    fn save(&self, cache: &Path) {
+    /// Writes the list if it changed. Failing only costs the next search its index.
+    fn save(&self, cache: &Path, report: &dyn Report) {
         if !self.changed {
             return;
         }
@@ -397,7 +516,7 @@ impl Registry {
             .and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
-            hint(&format!(
+            report.note(&format!(
                 "could not save the content index list {}: {e}",
                 path.display()
             ));
@@ -520,13 +639,6 @@ fn megabytes(bytes: u64) -> f64 {
     bytes as f64 / 1e6
 }
 
-fn io_error(path: &Path, source: io::Error) -> Error {
-    Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,11 +680,19 @@ mod tests {
 
     #[test]
     fn the_registry_round_trips() {
+        struct Quiet;
+        impl Report for Quiet {
+            fn hit(&self, _: &FileHit<'_>) -> std::ops::ControlFlow<()> {
+                std::ops::ControlFlow::Continue(())
+            }
+            fn error(&self, _: &Error) {}
+            fn note(&self, _: &str) {}
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut registry = Registry::load(dir.path());
         registry.set(Path::new(r"C:\Dev"), Filter::unrestricted(1));
         registry.set(Path::new(r"D:\Notes"), Filter::unrestricted(0));
-        registry.save(dir.path());
+        registry.save(dir.path(), &Quiet);
         let loaded = Registry::load(dir.path());
         assert_eq!(loaded.entries, registry.entries);
         assert_eq!(
