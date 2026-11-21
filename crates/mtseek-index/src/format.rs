@@ -16,7 +16,7 @@ use crate::{Checkpoint, Entry, Meta};
 
 pub(crate) const MAGIC: &[u8; 8] = b"MTSKCIDX";
 pub(crate) const END_MAGIC: &[u8; 8] = b"MTSKCEND";
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 pub(crate) const HEADER_LEN: usize = 32;
 pub(crate) const SECTIONS: usize = 12;
 pub(crate) const TRAILER_LEN: usize = SECTIONS * 16 + 8;
@@ -47,8 +47,8 @@ pub(crate) mod section {
 }
 
 /// `block, offset in block, stored length, path offset, path length | UTF16_PATH, root,
-/// file reference number (u64)`.
-pub(crate) const DOC_LEN: usize = 32;
+/// file reference number (u64), flags` ([`crate::membership`]).
+pub(crate) const DOC_LEN: usize = 36;
 /// `trigram, file count, postings offset`.
 pub(crate) const DICT_LEN: usize = 16;
 /// `store offset, compressed length, raw length`.
@@ -63,13 +63,14 @@ pub(crate) const BLOCK_TARGET: usize = 64 * 1024;
 /// zstd level for the store (ADR 0010).
 pub(crate) const ZSTD_LEVEL: i32 = 3;
 
-/// Appends one dirs/controls record: `frn:u64 root:u32 path_len:u32 path`.
+/// Appends one dirs/controls record: `frn:u64 root:u32 flags:u32 path_len:u32 path`.
 pub(crate) fn put_entry(out: &mut Vec<u8>, entry: &Entry) {
     let (path, utf16) = encode_path(&entry.path);
     // Paths are far shorter than 2 GiB; an absurd one is cut rather than corrupting the file.
     let len = u32::try_from(path.len()).unwrap_or(0).min(UTF16_PATH - 1);
     out.extend_from_slice(&entry.frn.to_le_bytes());
     out.extend_from_slice(&entry.root.to_le_bytes());
+    out.extend_from_slice(&u32::from(entry.flags).to_le_bytes());
     out.extend_from_slice(&(len | if utf16 { UTF16_PATH } else { 0 }).to_le_bytes());
     out.extend_from_slice(&path[..len as usize]);
 }
@@ -80,6 +81,7 @@ pub(crate) fn parse_entries(mut bytes: &[u8], roots: u32) -> Option<Vec<Entry>> 
     while !bytes.is_empty() {
         let frn = u64_at(take(&mut bytes, 8)?, 0);
         let root = u32_at(take(&mut bytes, 4)?, 0);
+        let flags = u8::try_from(u32_at(take(&mut bytes, 4)?, 0)).ok()?;
         let len = u32_at(take(&mut bytes, 4)?, 0);
         let path = decode_path(
             take(&mut bytes, (len & !UTF16_PATH) as usize)?,
@@ -88,7 +90,12 @@ pub(crate) fn parse_entries(mut bytes: &[u8], roots: u32) -> Option<Vec<Entry>> 
         if root >= roots {
             return None;
         }
-        out.push(Entry { frn, root, path });
+        out.push(Entry {
+            frn,
+            root,
+            path,
+            flags,
+        });
     }
     Some(out)
 }
@@ -259,11 +266,13 @@ mod tests {
                 frn: 7,
                 root: 0,
                 path: PathBuf::from("a\\b"),
+                flags: 5,
             },
             Entry {
                 frn: u64::MAX,
                 root: 1,
                 path: PathBuf::new(),
+                flags: 0,
             },
         ];
         let mut bytes = Vec::new();

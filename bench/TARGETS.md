@@ -221,6 +221,52 @@ A new file is found by the very next search, and a deleted one is gone from it.
   reference numbers, with no measurable cost. Warm rebuilds take 1.34–1.38 s (M2a: 1.75 s,
   measured once, colder). The first build after the cache had gone cold took 3.35 s.
 
+### 2026-11-21, M3a: coverage roots (`cargo xtask bench --modes files,lines`, 5 timed runs)
+
+Segment format v3 (ADR 0012) adds membership bits to every file, folder and error. At the
+default coverage filter the build walks no more than before. Parity ✓ in all 16 cells; rg
+ran at 637–742 ms, so the machine was quieter than for M2b.
+
+| query | mode | rg | mtseek (scan) | mtseek-index | speedup vs rg |
+|---|---|---:|---:|---:|---:|
+| absent | files | 637 ms | 417 ms | **49 ms** | 12.9× |
+| rare | files | 695 ms | 499 ms | **70 ms** | 9.9× |
+| uncommon | files | 675 ms | 413 ms | **60 ms** | 11.3× |
+| medium | files | 654 ms | 404 ms | **71 ms** | 9.2× |
+| common | files | 742 ms | 395 ms | **88 ms** | 8.5× |
+| icase | files | 643 ms | 397 ms | **63 ms** | 10.2× |
+| regex-lit | files | 689 ms | 400 ms | **70 ms** | 9.8× |
+| regex-nolit | files | 654 ms | 462 ms | 136 ms | 4.8× |
+| absent | lines | 641 ms | 394 ms | **50 ms** | 12.9× |
+| rare | lines | 674 ms | 467 ms | **73 ms** | 9.3× |
+| uncommon | lines | 641 ms | 399 ms | **58 ms** | 11.0× |
+| medium | lines | 664 ms | 420 ms | **70 ms** | 9.4× |
+| common | lines | 730 ms | 490 ms | 155 ms | 4.7× |
+| icase | lines | 638 ms | 405 ms | **69 ms** | 9.3× |
+| regex-lit | lines | 699 ms | 417 ms | **74 ms** | 9.4× |
+| regex-nolit | lines | 654 ms | 441 ms | 131 ms | 5.0× |
+
+13 of 16 cells are under 100 ms. The other three are output volume (`common` lines) and
+the no-literal regex, which verifies the whole store.
+
+**Subfolder searches** were scanned before, because M2 used an index only for the exact
+scope it was built for. Now they are answered from the covering index. The test searched
+`C:\Dev\Signsig` (3,976 files) for `Paystack` with an index of `C:\Dev`, using the release
+build, 5 runs after a warmup:
+
+| | median |
+|---|---:|
+| rg | 177 ms |
+| mtseek `--no-index` | 111 ms |
+| mtseek through the `C:\Dev` index | **25 ms** |
+
+The 25 ms includes opening the index (3.6 ms), catch-up (1.5 ms) and looking up the folder.
+
+**Ignore sources outside the walk** (`.git/info/exclude`, ignore files above the root) are
+tracked since the second M3a step. Catch-up with nothing relevant changed went from
+1.2–1.3 ms to **1.5–1.9 ms** on `C:\Dev` (7 runs, release build). The extra time decodes the
+control-file table to check the folders above the root.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

@@ -16,3 +16,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0009](0009-raw-mft-records.md) | Read raw MFT records for whole-drive indexes | Accepted |
 | [0010](0010-content-index-format.md) | Content index: stored bytes, query planning, segment file | Accepted |
 | [0011](0011-live-content-index.md) | Keep the content index current from the USN journal | Accepted |
+| [0012](0012-index-coverage.md) | What the daemon indexes: coverage roots, narrowed at query time | Accepted |

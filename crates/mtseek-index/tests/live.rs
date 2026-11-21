@@ -1,6 +1,7 @@
 //! Invariant 3 for the content index (ADR 0011): after any sequence of changes, an index
 //! caught up from the change journal holds exactly what a fresh build holds. Same files,
-//! same stored bytes, same directories, control files and errors.
+//! same stored bytes, same directories, control files and errors, with the same membership
+//! bits for every coverage filter (ADR 0012).
 //!
 //! Windows only: the journal is NTFS's. Needs no admin rights.
 
@@ -12,16 +13,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mtseek_core::{Filter, Scope};
-use mtseek_index::{CatchUp, Index, Location};
+use mtseek_index::{CatchUp, Index, Location, membership};
 use mtseek_walk::Options;
 use proptest::prelude::*;
+
+/// A file as the index holds it: its stored bytes (`None` if read from disk) and flags.
+type Held = (Option<Vec<u8>>, u8);
 
 /// Everything an index answers with, keyed by (root, relative path).
 #[derive(Debug, PartialEq, Eq)]
 struct View {
-    files: BTreeMap<(usize, PathBuf), Option<Vec<u8>>>,
-    dirs: Vec<(u32, PathBuf)>,
-    controls: Vec<(u32, PathBuf)>,
+    files: BTreeMap<(usize, PathBuf), Held>,
+    dirs: Vec<(u32, PathBuf, u8)>,
+    controls: Vec<(u32, PathBuf, u8)>,
     errors: Vec<String>,
 }
 
@@ -41,7 +45,7 @@ fn view(index: &Index) -> View {
                     Some(raw[offset as usize..(offset + len) as usize].to_vec())
                 }
             };
-            let previous = files.insert(segment.path(id), bytes);
+            let previous = files.insert(segment.path(id), (bytes, segment.flags(id)));
             assert!(
                 previous.is_none(),
                 "{:?} is in two layers",
@@ -51,14 +55,25 @@ fn view(index: &Index) -> View {
     }
     let newest = index.delta().unwrap_or_else(|| index.base());
     let paths = |entries: Vec<mtseek_index::Entry>| {
-        let mut out: Vec<(u32, PathBuf)> = entries.into_iter().map(|e| (e.root, e.path)).collect();
+        let mut out: Vec<(u32, PathBuf, u8)> = entries
+            .into_iter()
+            .map(|e| (e.root, e.path, e.flags))
+            .collect();
         out.sort();
         out
     };
     let mut errors: Vec<String> = index
         .errors()
         .iter()
-        .map(|e| format!("{:?} {}: {}", e.root, e.path.display(), e.message))
+        .map(|e| {
+            format!(
+                "{:?} {} [{}]: {}",
+                e.root,
+                e.path.display(),
+                e.flags,
+                e.message
+            )
+        })
         .collect();
     errors.sort();
     View {
@@ -115,6 +130,27 @@ enum Op {
         file: usize,
         hidden: bool,
     },
+    HideDir {
+        dir: usize,
+        hidden: bool,
+    },
+    /// Writes `.git\info\exclude` in a repository.
+    Exclude {
+        dir: usize,
+        pattern: usize,
+    },
+    /// Writes or removes an ignore file in the folder above the root, or makes it a
+    /// repository.
+    Above {
+        what: usize,
+    },
+}
+
+impl Op {
+    /// Whether the change is above the indexed folder, where catch-up rebuilds.
+    fn is_above(&self) -> bool {
+        matches!(self, Op::Above { .. })
+    }
 }
 
 const DIRS: &[&str] = &["", "a", "a/b", "c", "c/d", ".h"];
@@ -127,6 +163,8 @@ const TEXTS: &[&[u8]] = &[
     b"\xFF\xFEu\0t\0f\0",
 ];
 const PATTERNS: &[&str] = &["x.txt\n", "*.rs\n", "b/\n", "d\n", "!y.rs\n*\n"];
+/// Changes above the root: an ignore file there with each pattern, removing it, `.git`.
+const ABOVE: &[&str] = &["*.md\n", "a/\n", "!z.md\n", "", "git"];
 
 fn op() -> impl Strategy<Value = Op> {
     let d = 0..DIRS.len();
@@ -143,7 +181,10 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (d.clone(), 0..PATTERNS.len()).prop_map(|(dir, pattern)| Op::Ignore { dir, pattern }),
         1 => d.clone().prop_map(|dir| Op::RemoveIgnore { dir }),
         1 => d.clone().prop_map(|dir| Op::MakeGit { dir }),
-        1 => (d, f, any::<bool>()).prop_map(|(dir, file, hidden)| Op::Hide { dir, file, hidden }),
+        1 => (d.clone(), f, any::<bool>()).prop_map(|(dir, file, hidden)| Op::Hide { dir, file, hidden }),
+        1 => (d.clone(), any::<bool>()).prop_map(|(dir, hidden)| Op::HideDir { dir, hidden }),
+        1 => (d, 0..PATTERNS.len()).prop_map(|(dir, pattern)| Op::Exclude { dir, pattern }),
+        1 => (0..ABOVE.len()).prop_map(|what| Op::Above { what }),
     ]
 }
 
@@ -206,10 +247,18 @@ fn apply(root: &Path, op: &Op) {
             let _ = fs::remove_file(dir(d).join(".gitignore"));
         }
         Op::MakeGit { dir: d } => {
+            // Like `git init`: `.git` with an `info` folder (a later `info` isn't noticed).
             if dir(d).is_dir() {
-                let _ = fs::create_dir(dir(d).join(".git"));
+                let _ = fs::create_dir_all(dir(d).join(".git").join("info"));
             }
         }
+        Op::Exclude { dir: d, pattern } => {
+            let info = dir(d).join(".git").join("info");
+            if info.is_dir() {
+                let _ = fs::write(info.join("exclude"), PATTERNS[pattern]);
+            }
+        }
+        Op::Above { what } => change_above(root, what),
         Op::Hide {
             dir: d,
             file: f,
@@ -222,6 +271,30 @@ fn apply(root: &Path, op: &Op) {
                     .output();
             }
         }
+        Op::HideDir { dir: d, hidden } => {
+            if d != 0 && dir(d).is_dir() {
+                let _ = Command::new("attrib")
+                    .arg(if hidden { "+h" } else { "-h" })
+                    .arg(dir(d))
+                    .output();
+            }
+        }
+    }
+}
+
+/// Applies change `ABOVE[what]` in the folder above `root`.
+fn change_above(root: &Path, what: usize) {
+    let above = root.parent().expect("the root has a parent");
+    match ABOVE[what] {
+        "" => {
+            let _ = fs::remove_file(above.join(".gitignore"));
+        }
+        "git" => {
+            let _ = fs::create_dir_all(above.join(".git").join("info"));
+        }
+        pattern => {
+            let _ = fs::write(above.join(".gitignore"), pattern);
+        }
     }
 }
 
@@ -229,12 +302,26 @@ fn scope(root: &Path, level: u8) -> Scope {
     Scope::new([root]).with_filter(Filter::unrestricted(level))
 }
 
-/// Catches `index` up and checks it against a fresh build of the same scope.
-fn check(index: &mut Index, scope: &Scope, cache: &Path) -> Result<(), TestCaseError> {
+/// A scope with one of the four coverage filters (`which` in 0..4).
+fn coverage_scope(root: &Path, which: u8) -> Scope {
+    Scope::new([root]).with_filter(membership::filter(1 << which))
+}
+
+/// Catches `index` up and checks it against a fresh build of the same scope. A rebuild is
+/// only allowed after a change above the root (`above`); then the index is rebuilt.
+fn check(index: &mut Index, scope: &Scope, cache: &Path, above: bool) -> Result<(), TestCaseError> {
     let done = index
         .catch_up(scope, Options::default())
         .expect("catch-up works");
-    prop_assert!(!matches!(done, CatchUp::NeedsRebuild(_)), "{done:?}");
+    if let CatchUp::NeedsRebuild(reason) = done {
+        prop_assert!(above && reason.contains("above"), "{done:?}");
+        // A new path: Windows can't replace the old index's files while they are open.
+        let path = cache.join(format!("rebuilt-{}", index.meta().build_id));
+        *index = Index::build(scope, Options::default(), &path)
+            .expect("rebuild")
+            .0;
+        return Ok(());
+    }
     let (fresh, _) =
         Index::build(scope, Options::default(), &cache.join("fresh")).expect("fresh build");
     let (caught_up, expected) = (view(index), view(&fresh));
@@ -243,27 +330,33 @@ fn check(index: &mut Index, scope: &Scope, cache: &Path) -> Result<(), TestCaseE
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
+    ))]
 
     #[test]
     fn a_caught_up_index_equals_a_fresh_build(
         setup in proptest::collection::vec(op(), 0..12),
         batches in proptest::collection::vec(proptest::collection::vec(op(), 1..8), 1..4),
-        level in 0u8..=3,
+        which in 0u8..4,
     ) {
         let tree = tempfile::tempdir().expect("temp dir");
         let cache = tempfile::tempdir().expect("temp dir");
+        // The root is one level down, so that changes above it stay inside the test.
+        let root = tree.path().join("root");
+        fs::create_dir(&root).expect("mkdir");
         for op in &setup {
-            apply(tree.path(), op);
+            apply(&root, op);
         }
-        let scope = scope(tree.path(), level);
+        let scope = coverage_scope(&root, which);
         let (mut index, _) =
             Index::build(&scope, Options::default(), &cache.path().join("idx")).expect("build");
         for batch in &batches {
             for op in batch {
-                apply(tree.path(), op);
+                apply(&root, op);
             }
-            check(&mut index, &scope, cache.path())?;
+            let above = batch.iter().any(Op::is_above);
+            check(&mut index, &scope, cache.path(), above)?;
         }
     }
 }
@@ -303,7 +396,7 @@ fn an_edit_a_new_folder_and_a_save_by_rename_are_picked_up() {
     let done = index.catch_up(&scope, Options::default()).unwrap();
     assert!(matches!(done, CatchUp::Updated { .. }), "{done:?}");
     let files = view(&index).files;
-    let get = |p: &str| files.get(&(0, PathBuf::from(p))).cloned().flatten();
+    let get = |p: &str| files.get(&(0, PathBuf::from(p))).and_then(|f| f.0.clone());
     assert_eq!(get("a.txt").as_deref(), Some(&b"new"[..]));
     assert_eq!(get("b.txt").as_deref(), Some(&b"second"[..]));
     assert_eq!(
@@ -316,4 +409,53 @@ fn an_edit_a_new_folder_and_a_save_by_rename_are_picked_up() {
     let key = mtseek_index::scope_key(&scope).unwrap();
     let reopened = Index::open(&cache.path().join("idx"), &key).unwrap();
     assert_eq!(view(&reopened), view(&index));
+}
+
+/// `.git\info\exclude` is honoured like a `.gitignore`: creating, editing and deleting it is
+/// picked up by catch-up without a rebuild (ADR 0012).
+#[test]
+fn git_exclude_changes_are_picked_up() {
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path().join("root");
+    fs::create_dir_all(root.join(".git").join("info")).unwrap();
+    fs::write(root.join("x.txt"), "x").unwrap();
+    fs::write(root.join("y.rs"), "y").unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let scope = scope(&root, 0);
+    let (mut index, _) =
+        Index::build(&scope, Options::default(), &cache.path().join("idx")).unwrap();
+    let names =
+        |index: &Index| -> Vec<PathBuf> { view(index).files.into_keys().map(|(_, p)| p).collect() };
+    let exclude = root.join(".git").join("info").join("exclude");
+    for (text, expected) in [
+        (Some("x.txt\n"), vec!["y.rs"]),
+        (Some("y.rs\n"), vec!["x.txt"]),
+        (None, vec!["x.txt", "y.rs"]),
+    ] {
+        match text {
+            Some(text) => fs::write(&exclude, text).unwrap(),
+            None => fs::remove_file(&exclude).unwrap(),
+        }
+        let done = index.catch_up(&scope, Options::default()).unwrap();
+        assert!(matches!(done, CatchUp::Updated { .. }), "{done:?}");
+        let expected: Vec<PathBuf> = expected.into_iter().map(PathBuf::from).collect();
+        assert_eq!(names(&index), expected, "after {text:?}");
+    }
+}
+
+/// An ignore file appearing above the indexed folder changes what the walk lists, so
+/// catch-up asks for a rebuild (ADR 0012).
+#[test]
+fn an_ignore_file_above_the_root_asks_for_a_rebuild() {
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("x.txt"), "x").unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let scope = scope(&root, 0);
+    let (mut index, _) =
+        Index::build(&scope, Options::default(), &cache.path().join("idx")).unwrap();
+    fs::write(tree.path().join(".ignore"), "x.txt\n").unwrap();
+    let done = index.catch_up(&scope, Options::default()).unwrap();
+    assert!(matches!(done, CatchUp::NeedsRebuild(_)), "{done:?}");
 }

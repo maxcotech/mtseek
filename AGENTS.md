@@ -18,6 +18,7 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | ripgrep parity test | `cargo test -p mtseek-cli --test parity` (needs `rg` on PATH) |
 | Index = scanner test | `cargo test -p mtseek-query --test oracle` |
 | Caught-up index = fresh build | `cargo test -p mtseek-index --test live` (Windows) |
+| Subtree rule (ADR 0012) | `cargo test -p mtseek-walk --test subtree` |
 | Format | `cargo xtask fmt` |
 | Benchmark vs ripgrep | `cargo xtask bench --queries rare,absent --modes files` |
 | Generate a test corpus | `cargo xtask corpus <empty-dir>` |
@@ -73,7 +74,8 @@ docs/                  ARCHITECTURE.md, adr/
   `tests/parity.rs`. Don't "fix" parity by special-casing more files without an explanation there.
 - `.gitignore` only applies inside a git repo (ripgrep's `require_git`). Tests that need it
   create a `.git` directory.
-- `mtseek --names` and `mtseek --index` cache their indexes in `%LOCALAPPDATA%\mtseek\cache`.
+- `mtseek --names` and `mtseek --index` cache their indexes in `%LOCALAPPDATA%\mtseek\cache`
+  (`content-coverage.txt` lists the folders with a content index).
   Tests must set `MTSEEK_CACHE_DIR` to a temp dir (see `tests/names.rs`, `tests/parity.rs`)
   so they never touch the real cache.
 - The content index must never change *what* matches, only how fast. If the oracle test
