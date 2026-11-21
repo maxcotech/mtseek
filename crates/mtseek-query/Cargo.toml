@@ -1,0 +1,22 @@
+[package]
+name = "mtseek-query"
+description = "Content search over the index: regex to trigram plan, candidate lookup, verification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mtseek-core.workspace = true
+mtseek-index.workspace = true
+mtseek-walk.workspace = true
+regex-syntax.workspace = true
+
+[dev-dependencies]
+mtseek-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

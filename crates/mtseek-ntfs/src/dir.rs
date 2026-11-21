@@ -111,7 +111,7 @@ mod windows {
     use std::ffi::OsString;
     use std::io;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::io::OwnedHandle;
+    use std::os::windows::io::{AsHandle, OwnedHandle};
     use std::path::{Component, Path, Prefix};
 
     use windows_sys::Win32::Storage::FileSystem::{
@@ -150,7 +150,7 @@ mod windows {
 
         /// The directory's own file reference number.
         pub fn file_ref(&self) -> io::Result<u64> {
-            sys::file_index(&self.handle)
+            sys::file_index(self.handle.as_handle())
         }
 
         /// Appends every entry except `.` and `..` to `out`.

@@ -11,15 +11,21 @@
 //! configured the way `rg` configures them. That gives byte-identical results without
 //! re-implementing gitignore rules, binary detection or UTF-16 BOM sniffing.
 //! `crates/mtseek-cli/tests/parity.rs` checks this against the real `rg` binary.
+//!
+//! The content index (`mtseek-index`, `mtseek-query`) reuses two pieces: [`list`] for
+//! the file set of a scope, and [`FileSearcher`] to verify candidates, so both paths run the
+//! same code (ADR 0010).
 
+use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+pub use grep_regex::RegexMatcher;
+use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
-use mtseek_core::{CaseMode, Error, PatternKind, Query, Result, Scope};
+use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Result, Scope};
 
 /// What a scan reports for each matching file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,6 +76,175 @@ pub struct Options {
     pub threads: usize,
 }
 
+impl Options {
+    /// The number of worker threads to use: [`Options::threads`], or ripgrep's default.
+    pub fn thread_count(self) -> usize {
+        if self.threads == 0 {
+            default_threads()
+        } else {
+            self.threads
+        }
+    }
+}
+
+/// Searches one file's bytes exactly as ripgrep does when it walks a directory.
+///
+/// The scanner feeds it files; the content index feeds it the stored bytes of candidates.
+/// With memory maps off (as here, and as `rg` does for directory walks), `grep-searcher`'s
+/// `search_path` is just `File::open` followed by `search_reader`, so [`search_bytes`]
+/// over a file's bytes behaves exactly like [`search_path`] over the file.
+///
+/// Every file is searched as if by a fresh searcher, which is what `rg` reports for a file
+/// searched alone. `grep-searcher`'s line buffer grows to fit a long line and is never
+/// shrunk, and in quit-on-NUL mode the searcher stops before searching a buffer fill that
+/// contains the NUL. Reusing a grown buffer can therefore hide a match that comes shortly
+/// before a NUL: `rg` reuses one searcher per thread and gives scheduling-dependent results
+/// for such files. So after any file big enough to have grown the buffer, the searcher is
+/// rebuilt.
+///
+/// [`search_bytes`]: FileSearcher::search_bytes
+/// [`search_path`]: FileSearcher::search_path
+pub struct FileSearcher {
+    searcher: Searcher,
+    filter: Filter,
+    mode: Mode,
+    lines: Vec<LineHit>,
+    /// The last file may have grown the line buffer.
+    stale: bool,
+}
+
+/// Files this big may grow the line buffer (64 KiB of decoded text; UTF-16 can decode to
+/// 1.5 times its size).
+const MAY_GROW_BUFFER: u64 = 32 * 1024;
+
+/// A file that matched, as reported by [`FileSearcher`].
+#[derive(Debug, Clone, Copy)]
+pub struct Found<'a> {
+    /// Matching lines in file order. Empty in [`Mode::Files`].
+    pub lines: &'a [LineHit],
+    /// See [`FileHit::binary_offset`].
+    pub binary_offset: Option<u64>,
+}
+
+impl FileSearcher {
+    /// A searcher configured like ripgrep for `filter` (binary handling) and `mode`.
+    pub fn new(filter: Filter, mode: Mode) -> Self {
+        Self {
+            searcher: searcher(filter),
+            filter,
+            mode,
+            lines: Vec::new(),
+            stale: false,
+        }
+    }
+
+    /// Searches the file at `path`. `None` if nothing matched.
+    pub fn search_path(
+        &mut self,
+        matcher: &RegexMatcher,
+        path: &Path,
+    ) -> io::Result<Option<Found<'_>>> {
+        // `grep_searcher::Searcher::search_path` is this open followed by `search_file`.
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata().map_or(u64::MAX, |m| m.len());
+        self.prepare(len);
+        let mut sink = Collect::new(self.mode, &mut self.lines);
+        self.searcher.search_file(matcher, &file, &mut sink)?;
+        let (is_match, binary_offset) = (sink.matched, sink.binary_offset);
+        Ok(is_match.then_some(Found {
+            lines: &self.lines,
+            binary_offset,
+        }))
+    }
+
+    /// Searches `bytes` as if they were a file's contents. `None` if nothing matched.
+    pub fn search_bytes(
+        &mut self,
+        matcher: &RegexMatcher,
+        bytes: &[u8],
+    ) -> io::Result<Option<Found<'_>>> {
+        self.prepare(bytes.len() as u64);
+        let mut sink = Collect::new(self.mode, &mut self.lines);
+        self.searcher.search_reader(matcher, bytes, &mut sink)?;
+        let (is_match, binary_offset) = (sink.matched, sink.binary_offset);
+        Ok(is_match.then_some(Found {
+            lines: &self.lines,
+            binary_offset,
+        }))
+    }
+
+    /// Gets ready to search a file of `len` bytes: a fresh searcher if the last file may
+    /// have grown the line buffer.
+    fn prepare(&mut self, len: u64) {
+        if self.stale {
+            self.searcher = searcher(self.filter);
+        }
+        self.stale = len >= MAY_GROW_BUFFER;
+        self.lines.clear();
+    }
+}
+
+/// One file or directory found by [`list`].
+#[derive(Debug, Clone, Copy)]
+pub struct Listed<'a> {
+    /// The index of the root it was found under.
+    pub root: usize,
+    /// Its path, joined onto that root.
+    pub path: &'a Path,
+    /// A directory the walk enters (or would enter, below `max_depth`). Otherwise a file.
+    pub is_dir: bool,
+    /// 0 for the root itself.
+    pub depth: usize,
+}
+
+/// Lists what `scope` covers: the files `rg --files` lists with the same flags, and the
+/// directories the walk enters to find them (the roots included).
+///
+/// `max_depth` stops the walk below that depth (`Some(1)`: a root's direct entries).
+/// `on_entry` runs for every file and directory, from worker threads when
+/// `options` asks for more than one. `on_error` runs for every unreadable directory.
+pub fn list(
+    scope: &Scope,
+    options: Options,
+    max_depth: Option<usize>,
+    on_entry: &(dyn Fn(Listed<'_>) + Sync),
+    on_error: &(dyn Fn(&Error) + Sync),
+) {
+    let visit =
+        |root: usize, entry: std::result::Result<ignore::DirEntry, ignore::Error>| match entry {
+            Ok(entry) => {
+                let Some(file_type) = entry.file_type() else {
+                    return;
+                };
+                if file_type.is_file() || file_type.is_dir() {
+                    on_entry(Listed {
+                        root,
+                        path: entry.path(),
+                        is_dir: file_type.is_dir(),
+                        depth: entry.depth(),
+                    });
+                }
+            }
+            Err(err) => on_error(&walk_error(err)),
+        };
+    for (root_index, root) in scope.roots.iter().enumerate() {
+        let mut builder = walk_builder(std::slice::from_ref(root), scope.filter, options);
+        builder.max_depth(max_depth);
+        if options.thread_count() == 1 {
+            for entry in builder.build() {
+                visit(root_index, entry);
+            }
+        } else {
+            builder.build_parallel().run(|| {
+                Box::new(move |entry| {
+                    visit(root_index, entry);
+                    WalkState::Continue
+                })
+            });
+        }
+    }
+}
+
 /// Compiles a [`Query`] into the matcher ripgrep would build for it.
 pub fn build_matcher(query: &Query) -> Result<RegexMatcher> {
     let mut builder = RegexMatcherBuilder::new();
@@ -115,8 +290,7 @@ pub fn scan(
 
     walker(scope, options).run(|| {
         let matcher = matcher.clone();
-        let mut searcher = searcher(scope);
-        let mut lines = Vec::new();
+        let mut searcher = FileSearcher::new(scope.filter, mode);
         let report_error = &report_error;
         let counts = &counts;
         Box::new(move |entry| {
@@ -131,29 +305,22 @@ pub fn scan(
                 return WalkState::Continue;
             }
             counts.searched.fetch_add(1, Ordering::Relaxed);
-            lines.clear();
-            let mut sink = Collect {
-                mode,
-                lines: &mut lines,
-                matched: false,
-                binary_offset: None,
+            let found = match searcher.search_path(&matcher, entry.path()) {
+                Ok(Some(found)) => found,
+                Ok(None) => return WalkState::Continue,
+                Err(source) => {
+                    report_error(Error::Io {
+                        path: entry.path().to_path_buf(),
+                        source,
+                    });
+                    return WalkState::Continue;
+                }
             };
-            if let Err(source) = searcher.search_path(&matcher, entry.path(), &mut sink) {
-                report_error(Error::Io {
-                    path: entry.path().to_path_buf(),
-                    source,
-                });
-                return WalkState::Continue;
-            }
-            if !sink.matched {
-                return WalkState::Continue;
-            }
             counts.matched.fetch_add(1, Ordering::Relaxed);
-            let binary_offset = sink.binary_offset;
             match on_hit(&FileHit {
                 path: entry.path(),
-                lines: &lines,
-                binary_offset,
+                lines: found.lines,
+                binary_offset: found.binary_offset,
             }) {
                 ControlFlow::Continue(()) => WalkState::Continue,
                 ControlFlow::Break(()) => WalkState::Quit,
@@ -183,32 +350,32 @@ fn default_threads() -> usize {
 }
 
 fn walker(scope: &Scope, options: Options) -> ignore::WalkParallel {
-    let mut roots = scope.roots.iter();
+    walk_builder(&scope.roots, scope.filter, options).build_parallel()
+}
+
+/// The walk ripgrep does for these roots and filter.
+fn walk_builder(roots: &[std::path::PathBuf], filter: Filter, options: Options) -> WalkBuilder {
+    let mut roots = roots.iter();
     let mut builder =
         WalkBuilder::new(roots.next().map_or_else(|| Path::new("."), |p| p.as_path()));
     for root in roots {
         builder.add(root);
     }
-    let filter = scope.filter;
     builder
         .standard_filters(filter.respect_ignore_files)
         .hidden(!filter.include_hidden)
         .follow_links(filter.follow_links)
-        .threads(if options.threads == 0 {
-            default_threads()
-        } else {
-            options.threads
-        });
+        .threads(options.thread_count());
     if filter.respect_ignore_files {
         builder.add_custom_ignore_filename(".rgignore");
     }
-    builder.build_parallel()
+    builder
 }
 
-fn searcher(scope: &Scope) -> Searcher {
+fn searcher(filter: Filter) -> Searcher {
     // Files found by walking a directory get ripgrep's "implicit" binary handling:
     // stop at the first NUL byte. `--binary` (-uuu) searches them, converting NULs.
-    let binary = if scope.filter.include_binary {
+    let binary = if filter.include_binary {
         BinaryDetection::convert(b'\x00')
     } else {
         BinaryDetection::quit(b'\x00')
@@ -242,6 +409,17 @@ struct Collect<'a> {
     lines: &'a mut Vec<LineHit>,
     matched: bool,
     binary_offset: Option<u64>,
+}
+
+impl<'a> Collect<'a> {
+    fn new(mode: Mode, lines: &'a mut Vec<LineHit>) -> Self {
+        Self {
+            mode,
+            lines,
+            matched: false,
+            binary_offset: None,
+        }
+    }
 }
 
 impl Sink for Collect<'_> {
@@ -378,6 +556,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seen.into_inner().unwrap(), vec![(vec![1], Some(nul_at))]);
+    }
+
+    #[test]
+    fn a_long_line_earlier_does_not_hide_a_match_before_a_late_nul() {
+        // A 300 KB line grows grep-searcher's line buffer well past 64 KiB. Reused as is,
+        // the next file's NUL (200 KB in) would land in its first buffer fill, and the
+        // searcher would quit before searching the match on line 1.
+        let long_line = vec![b'y'; 300_000];
+        let mut late = b"needle first\n".to_vec();
+        late.extend(std::iter::repeat_n(b"short line\n".as_slice(), 20_000).flatten());
+        late.extend_from_slice(b"\0 needle after\n");
+
+        let matcher = build_matcher(&Query::literal("needle")).unwrap();
+        let mut searcher = FileSearcher::new(Filter::default(), Mode::Lines);
+        assert!(
+            searcher
+                .search_bytes(&matcher, &long_line)
+                .unwrap()
+                .is_none()
+        );
+        let found = searcher.search_bytes(&matcher, &late).unwrap().unwrap();
+        assert_eq!(found.lines.len(), 1);
+        assert!(found.binary_offset.is_some());
     }
 
     #[test]
