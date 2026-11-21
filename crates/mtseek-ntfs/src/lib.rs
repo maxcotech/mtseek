@@ -30,7 +30,7 @@ pub use dir::{DirBuffer, Directory};
 pub use journal::{Journal, JournalInfo};
 pub use record::{RecordError, Records, UsnRecord};
 #[cfg(windows)]
-pub use volume::{MftStats, NtfsGeometry, Volume, VolumeError, file_ref};
+pub use volume::{MftStats, NtfsGeometry, Volume, VolumeError, file_ref, file_ref_of};
 
 /// Splits an NTFS file reference number into (MFT record number, sequence number).
 ///

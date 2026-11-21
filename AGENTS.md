@@ -17,6 +17,7 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | One crate's tests | `cargo test -p mtseek-walk` |
 | ripgrep parity test | `cargo test -p mtseek-cli --test parity` (needs `rg` on PATH) |
 | Index = scanner test | `cargo test -p mtseek-query --test oracle` |
+| Caught-up index = fresh build | `cargo test -p mtseek-index --test live` (Windows) |
 | Format | `cargo xtask fmt` |
 | Benchmark vs ripgrep | `cargo xtask bench --queries rare,absent --modes files` |
 | Generate a test corpus | `cargo xtask corpus <empty-dir>` |
@@ -58,7 +59,7 @@ crates/mtseek-cli      `mtseek` binary; tests/parity.rs runs rg vs mtseek
 crates/mtseek-testkit  deterministic edge-case corpus generator
 crates/mtseek-ntfs     MFT + USN journal (Win32 FFI; all unsafe in src/sys.rs)
 crates/mtseek-names    file-name index (arenas + parent links), MFT or walk source
-crates/mtseek-index    content index segment: trigram postings + zstd store of file bytes
+crates/mtseek-index    content index: segments (postings + zstd store), live catch-up; tests/live.rs
 crates/mtseek-query    regex -> trigram plan, candidate lookup, verification; tests/oracle.rs
 xtask/                 cargo xtask ci | fmt | bench | corpus
 bench/                 bench.py + bench.json + TARGETS.md (ripgrep baseline)

@@ -15,6 +15,9 @@ memchr.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+mtseek-ntfs.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

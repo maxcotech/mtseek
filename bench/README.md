@@ -79,7 +79,9 @@ Add an entry under `contenders` in `bench.json`. `argv` is a template:
 Tools without a fixed-string mode can set `"literal": "escape"`. An index-backed
 contender can set `env` (variables whose values are folders under
 `%TEMP%\mtseek-bench`) and `reset` (folders there emptied before each cell, so
-`first` includes building the index), as `mtseek-index` does. `mtseek`,
+`first` includes building the index), as `mtseek-index` does. The `mtseek` contender
+passes `--no-index`, so it always measures scanning, even if the cache holds an index for
+the scope. `mtseek`,
 `mtseek-index` and `csearch` (Russ Cox codesearch) entries are already there. Zoekt
 can be added the same way. Contenders that aren't installed are skipped automatically.
 

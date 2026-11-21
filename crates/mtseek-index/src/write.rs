@@ -8,7 +8,7 @@ use crate::format::{
     self, BLOCK_TARGET, END_MAGIC, HEADER_LEN, MAGIC, NO_BLOCK, SECTIONS, UTF16_PATH, VERSION,
     ZSTD_LEVEL,
 };
-use crate::{EXTERNAL_BLOCK, IndexError, MAX_STORED, parallel_map, text, trigram};
+use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, parallel_map, text, trigram};
 
 /// One file to put in the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,8 +17,29 @@ pub struct Doc {
     pub root: u32,
     /// Its path relative to that root.
     pub path: PathBuf,
+    /// Its NTFS file reference number, or 0 if unknown (ADR 0011).
+    pub frn: u64,
     /// What the index holds for it.
     pub content: Content,
+}
+
+/// Everything a segment holds besides its files' bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentInfo<'a> {
+    /// The scope description ([`crate::scope_key`]).
+    pub key: &'a str,
+    /// The number of roots in the scope.
+    pub roots: u32,
+    /// Files and directories that couldn't be read.
+    pub errors: &'a [StoredError],
+    /// Directories the walk entered.
+    pub dirs: &'a [Entry],
+    /// Ignore-control files in those directories.
+    pub controls: &'a [Entry],
+    /// In a delta: the base files it replaces or deletes, in increasing order.
+    pub tombstones: &'a [u32],
+    /// Build id, base id and journal checkpoints.
+    pub meta: &'a Meta,
 }
 
 /// What the index holds for a file.
@@ -67,14 +88,25 @@ pub struct WriteStats {
 /// order queries report files in.
 pub fn write_segment(
     path: &Path,
-    key: &str,
-    roots: u32,
+    info: &SegmentInfo<'_>,
     docs: &mut [Doc],
-    errors: &[StoredError],
     threads: usize,
 ) -> Result<WriteStats, IndexError> {
     let fits = |n: usize| u32::try_from(n).map_err(|_| too_big(path));
+    let roots = info.roots;
     docs.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
+    let entries_ok = info
+        .dirs
+        .iter()
+        .chain(info.controls)
+        .all(|e| e.root < roots);
+    let tombstones_ok = info.tombstones.windows(2).all(|w| w[0] < w[1]);
+    if !entries_ok || !tombstones_ok {
+        return Err(IndexError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "bad directory, control or tombstone entries",
+        });
+    }
     if docs.iter().any(|d| d.root >= roots)
         || docs
             .iter()
@@ -108,12 +140,26 @@ pub fn write_segment(
         docs: fits(docs.len())?,
         blocks: fits(packed.blocks.len())?,
         trigrams: fits(postings.trigrams)?,
-        errors: fits(errors.len())?,
+        errors: fits(info.errors.len())?,
     };
-    let error_bytes = error_records(errors);
+    let error_bytes = error_records(info.errors);
     let frames: Vec<&[u8]> = compressed.frames.iter().map(Vec::as_slice).collect();
+    let mut dirs = Vec::new();
+    for entry in info.dirs {
+        format::put_entry(&mut dirs, entry);
+    }
+    let mut controls = Vec::new();
+    for entry in info.controls {
+        format::put_entry(&mut controls, entry);
+    }
+    let tombstones: Vec<u8> = info
+        .tombstones
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect();
+    let meta = format::put_meta(info.meta);
     let sections: [&[&[u8]]; SECTIONS] = [
-        &[key.as_bytes()],
+        &[info.key.as_bytes()],
         &[&packed.docs],
         &[&packed.paths],
         &[&error_bytes],
@@ -121,6 +167,10 @@ pub fn write_segment(
         &[&postings.lists],
         &[&compressed.table],
         &frames,
+        &[&dirs],
+        &[&controls],
+        &[&tombstones],
+        &[&meta],
     ];
     let file_bytes =
         write_atomically(path, &header, &sections).map_err(|source| IndexError::Io {
@@ -280,6 +330,7 @@ fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
         for field in [block, offset, len, path_offset, path_len | flag, doc.root] {
             packed.docs.extend_from_slice(&field.to_le_bytes());
         }
+        packed.docs.extend_from_slice(&doc.frn.to_le_bytes());
     }
     if !current.is_empty() {
         packed.blocks.push(current);

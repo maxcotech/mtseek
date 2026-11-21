@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mtseek_core::{CaseMode, Filter, PatternKind, Query, Scope};
-use mtseek_index::Segment;
+use mtseek_index::Index;
 use mtseek_walk::{FileHit, Mode, Options};
 use proptest::prelude::*;
 
@@ -53,14 +53,14 @@ fn by_scan(
 }
 
 fn by_index(
-    segment: &Segment,
+    index: &Index,
     scope: &Scope,
     query: &Query,
     mode: Mode,
 ) -> mtseek_core::Result<(Results, Vec<String>)> {
     collect(|on_hit, on_error| {
         mtseek_query::search(
-            segment,
+            index,
             scope,
             query,
             mode,
@@ -72,21 +72,20 @@ fn by_index(
     })
 }
 
-fn build(scope: &Scope, dir: &Path, name: &str) -> Segment {
+fn build(scope: &Scope, dir: &Path, name: &str) -> Index {
     let path = dir.join(name);
-    mtseek_index::build(scope, Options::default(), &path).expect("index builds");
-    let segment = Segment::open(&path).expect("index opens");
+    let (index, _) = Index::build(scope, Options::default(), &path).expect("index builds");
     assert_eq!(
-        segment.key(),
+        index.base().key(),
         mtseek_index::scope_key(scope).expect("scope has a key")
     );
-    segment
+    index
 }
 
 /// Compares both paths for one query; returns a description of any difference.
-fn compare(segment: &Segment, scope: &Scope, query: &Query, mode: Mode) -> Option<String> {
+fn compare(index: &Index, scope: &Scope, query: &Query, mode: Mode) -> Option<String> {
     let expected = by_scan(scope, query, mode);
-    let actual = by_index(segment, scope, query, mode);
+    let actual = by_index(index, scope, query, mode);
     match (expected, actual) {
         (Ok(e), Ok(a)) if e == a => None,
         (Err(_), Err(_)) => None, // an invalid pattern is invalid either way
@@ -179,10 +178,10 @@ fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
     let mut failures = Vec::new();
     for level in 0..=3 {
         let scope = Scope::new([corpus.path()]).with_filter(Filter::unrestricted(level));
-        let segment = build(&scope, cache.path(), &format!("u{level}"));
+        let index = build(&scope, cache.path(), &format!("u{level}"));
         for query in &queries {
             for mode in [Mode::Files, Mode::Lines] {
-                failures.extend(compare(&segment, &scope, query, mode));
+                failures.extend(compare(&index, &scope, query, mode));
             }
         }
     }
@@ -292,10 +291,10 @@ proptest! {
         }
         let cache = tempfile::tempdir().unwrap();
         let scope = Scope::new([corpus.path()]).with_filter(Filter::unrestricted(level));
-        let segment = build(&scope, cache.path(), "seg");
+        let index = build(&scope, cache.path(), "seg");
         for query in &queries {
             for mode in [Mode::Files, Mode::Lines] {
-                if let Some(failure) = compare(&segment, &scope, query, mode) {
+                if let Some(failure) = compare(&index, &scope, query, mode) {
                     prop_assert!(false, "{}", failure);
                 }
             }

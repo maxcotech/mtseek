@@ -12,7 +12,7 @@
 //! re-implementing gitignore rules, binary detection or UTF-16 BOM sniffing.
 //! `crates/mtseek-cli/tests/parity.rs` checks this against the real `rg` binary.
 //!
-//! The content index (`mtseek-index`, `mtseek-query`) reuses two pieces: [`list_files`] for
+//! The content index (`mtseek-index`, `mtseek-query`) reuses two pieces: [`list`] for
 //! the file set of a scope, and [`FileSearcher`] to verify candidates, so both paths run the
 //! same code (ADR 0010).
 
@@ -184,33 +184,64 @@ impl FileSearcher {
     }
 }
 
-/// Lists the files `scope` covers, exactly the set `rg --files` lists with the same flags.
+/// One file or directory found by [`list`].
+#[derive(Debug, Clone, Copy)]
+pub struct Listed<'a> {
+    /// The index of the root it was found under.
+    pub root: usize,
+    /// Its path, joined onto that root.
+    pub path: &'a Path,
+    /// A directory the walk enters (or would enter, below `max_depth`). Otherwise a file.
+    pub is_dir: bool,
+    /// 0 for the root itself.
+    pub depth: usize,
+}
+
+/// Lists what `scope` covers: the files `rg --files` lists with the same flags, and the
+/// directories the walk enters to find them (the roots included).
 ///
-/// `on_file` runs from worker threads with the index of the root the file was found under
-/// and its path joined onto that root. `on_error` runs for every unreadable directory.
-pub fn list_files(
+/// `max_depth` stops the walk below that depth (`Some(1)`: a root's direct entries).
+/// `on_entry` runs for every file and directory, from worker threads when
+/// `options` asks for more than one. `on_error` runs for every unreadable directory.
+pub fn list(
     scope: &Scope,
     options: Options,
-    on_file: &(dyn Fn(usize, &Path) + Sync),
+    max_depth: Option<usize>,
+    on_entry: &(dyn Fn(Listed<'_>) + Sync),
     on_error: &(dyn Fn(&Error) + Sync),
 ) {
-    for (root_index, root) in scope.roots.iter().enumerate() {
-        let one = Scope {
-            roots: vec![root.clone()],
-            filter: scope.filter,
-        };
-        walker(&one, options).run(|| {
-            Box::new(move |entry| {
-                match entry {
-                    Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
-                        on_file(root_index, entry.path());
-                    }
-                    Ok(_) => {}
-                    Err(err) => on_error(&walk_error(err)),
+    let visit =
+        |root: usize, entry: std::result::Result<ignore::DirEntry, ignore::Error>| match entry {
+            Ok(entry) => {
+                let Some(file_type) = entry.file_type() else {
+                    return;
+                };
+                if file_type.is_file() || file_type.is_dir() {
+                    on_entry(Listed {
+                        root,
+                        path: entry.path(),
+                        is_dir: file_type.is_dir(),
+                        depth: entry.depth(),
+                    });
                 }
-                WalkState::Continue
-            })
-        });
+            }
+            Err(err) => on_error(&walk_error(err)),
+        };
+    for (root_index, root) in scope.roots.iter().enumerate() {
+        let mut builder = walk_builder(std::slice::from_ref(root), scope.filter, options);
+        builder.max_depth(max_depth);
+        if options.thread_count() == 1 {
+            for entry in builder.build() {
+                visit(root_index, entry);
+            }
+        } else {
+            builder.build_parallel().run(|| {
+                Box::new(move |entry| {
+                    visit(root_index, entry);
+                    WalkState::Continue
+                })
+            });
+        }
     }
 }
 
@@ -319,13 +350,17 @@ fn default_threads() -> usize {
 }
 
 fn walker(scope: &Scope, options: Options) -> ignore::WalkParallel {
-    let mut roots = scope.roots.iter();
+    walk_builder(&scope.roots, scope.filter, options).build_parallel()
+}
+
+/// The walk ripgrep does for these roots and filter.
+fn walk_builder(roots: &[std::path::PathBuf], filter: Filter, options: Options) -> WalkBuilder {
+    let mut roots = roots.iter();
     let mut builder =
         WalkBuilder::new(roots.next().map_or_else(|| Path::new("."), |p| p.as_path()));
     for root in roots {
         builder.add(root);
     }
-    let filter = scope.filter;
     builder
         .standard_filters(filter.respect_ignore_files)
         .hidden(!filter.include_hidden)
@@ -334,7 +369,7 @@ fn walker(scope: &Scope, options: Options) -> ignore::WalkParallel {
     if filter.respect_ignore_files {
         builder.add_custom_ignore_filename(".rgignore");
     }
-    builder.build_parallel()
+    builder
 }
 
 fn searcher(filter: Filter) -> Searcher {
