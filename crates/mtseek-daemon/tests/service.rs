@@ -120,11 +120,28 @@ fn run_as(user: &str, password: &str, command: &str, out: &Path, tag: &str) -> O
     (code, lines(&stdout), lines(&stderr))
 }
 
+/// `rg.exe` and `mtseek.exe` copied where the second account may run them (`bin`): `rg`
+/// is often installed in the administrator's own profile. Returns their paths.
+#[allow(clippy::unwrap_used)] // test setup: a failure is the test failing
+fn programs(bin: &Path, mtseek: &Path) -> (PathBuf, PathBuf) {
+    let found = Command::new("where.exe").arg("rg").output().unwrap();
+    let rg = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .map(|l| PathBuf::from(l.trim()))
+        .expect("rg on PATH");
+    let copies = (bin.join("rg.exe"), bin.join("mtseek.exe"));
+    fs::copy(&rg, &copies.0).unwrap();
+    fs::copy(mtseek, &copies.1).unwrap();
+    copies
+}
+
 /// The tree (everyone may read it, but one private file), the output folder (everyone may
-/// write it) and a cache folder someone else made first, open to Everyone.
+/// write it), the programs folder (everyone may run what's in it) and a cache folder
+/// someone else made first, open to Everyone.
 #[allow(clippy::unwrap_used)] // test setup: a failure is the test failing
 fn prepare(base: &Path, tree: &Path, out: &Path, cache: &Path) {
-    for dir in [tree, out, cache] {
+    for dir in [tree, out, cache, &base.join("bin")] {
         fs::create_dir_all(dir).unwrap();
     }
     let me = mtseek_ntfs::pipe::user_sid().unwrap();
@@ -214,6 +231,7 @@ fn a_second_account_sees_through_the_service_what_its_own_rg_sees() {
     let (tree, out, cache) = (base.join("tree"), base.join("out"), base.join("cache"));
     cleanup.dirs.push(base.clone());
     prepare(&base, &tree, &out, &cache);
+    let (rg, mtseek_copy) = programs(&base.join("bin"), &mtseek);
     let name = format!("mtseek-test-{pid}");
     let pipe = format!(r"\\.\pipe\mtseek-test-service-{pid}");
     install(&daemon, &name, &pipe, &cache);
@@ -253,7 +271,7 @@ fn a_second_account_sees_through_the_service_what_its_own_rg_sees() {
     let expected = run_as(
         &user,
         &password,
-        &format!("rg --no-config {args}"),
+        &format!("\"{}\" --no-config {args}", rg.display()),
         &out,
         "rg",
     );
@@ -262,7 +280,7 @@ fn a_second_account_sees_through_the_service_what_its_own_rg_sees() {
         &password,
         &format!(
             "set MTSEEK_PIPE=\\\\.\\pipe\\mtseek-test-nobody&& set MTSEEK_SERVICE_PIPE={pipe}&& \"{}\" --daemon --stats {args}",
-            mtseek.display()
+            mtseek_copy.display()
         ),
         &out,
         "mtseek",

@@ -336,6 +336,13 @@ Where the build differs from the proposal above, and why:
   which would let any user serve on the name. Clients ask for exactly what they use. The
   pipe's owner (the process that created it) has full access, so a test daemon running as a
   user can create instances.
+- **How a client checks the server is LocalSystem.** Only administrators may open a
+  LocalSystem process, so an ordinary user can't read the server's token. Then the client
+  reads the pipe's owner instead, which its `READ_CONTROL` allows. Every daemon sets itself
+  as its pipe's owner, and Windows lets a process make only its own user, or a group it may
+  own objects as, the owner: a squatter without administrator rights can't create a pipe
+  owned by SYSTEM. The elevated two-account test found this; the in-process tests run as
+  the server's own user, who may open its process.
 - **The cache folder:** if its owner isn't SYSTEM or Administrators, it is deleted and
   created again with the right security. If the owner is right, the DACL is set again (not
   recursively: inside a folder only those two can write to, everything inherits).

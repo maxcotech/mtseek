@@ -572,6 +572,36 @@ pub(crate) fn path_owner(path: &OsStr) -> io::Result<String> {
     }
 }
 
+/// The owner SID of an open handle's object (a file, folder or pipe; needs `READ_CONTROL`),
+/// as text.
+pub(crate) fn handle_owner(handle: BorrowedHandle<'_>) -> io::Result<String> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the handle is open; `owner` and `sd` are valid out pointers, the rest may be
+    // null.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &raw mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut sd,
+        )
+    };
+    if rc != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(code(rc)));
+    }
+    // SAFETY: `owner` points into `sd`, which is freed once after reading it.
+    unsafe {
+        let text = sid_text(owner);
+        LocalFree(sd);
+        text
+    }
+}
+
 /// `CreateDirectoryW` with `descriptor` as the new directory's security.
 pub(crate) fn create_directory(path: &OsStr, descriptor: &SecurityDescriptor) -> io::Result<()> {
     let path = wide(path);

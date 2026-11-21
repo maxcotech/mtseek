@@ -1,9 +1,12 @@
 //! Local named pipes: the daemon's transport (ADR 0013).
 //!
-//! * The server creates the pipe with a DACL that admits only the user it runs as, refuses
-//!   remote clients, and fails if the name is already taken.
+//! * The server creates the pipe owned by the user it runs as, with a DACL that admits only
+//!   that user (or, for the service, interactive users), refuses remote clients, and fails
+//!   if the name is already taken.
 //! * A client checks who runs the server before sending anything, so a process squatting on
-//!   the name can't read its queries. A server can only identify a client, never act as it.
+//!   the name can't read its queries: from the server process's token, or from the pipe's
+//!   owner when it may not open that process (an ordinary user and the `LocalSystem`
+//!   service). A server can only identify a client, never act as it.
 //!
 //! Pipes are synchronous byte streams. A connection is a plain [`File`]: read requests
 //! with a `BufReader`, write answers, and [`available`] says whether the peer sent something
@@ -55,9 +58,11 @@ impl Listener {
         Self::bind_with(name, &format!("D:P(A;;GA;;;{})", user_sid()?))
     }
 
-    /// Creates pipe `name` with the DACL in `sddl` (the service's: [`SERVICE_PIPE_SDDL`]).
+    /// Creates pipe `name` with the DACL in `sddl` (the service's: [`SERVICE_PIPE_SDDL`]),
+    /// owned by the user this process runs as, so a client that may not open this process
+    /// can still tell who serves (see [`connect`]).
     pub fn bind_with(name: &str, sddl: &str) -> io::Result<Self> {
-        let descriptor = sys::security_descriptor(sddl)?;
+        let descriptor = sys::security_descriptor(&format!("O:{}{sddl}", user_sid()?))?;
         let next = sys::create_pipe(OsStr::new(name), true, &descriptor).map_err(|err| {
             // A first instance that exists already: access denied, by design of the flag.
             if err.kind() == io::ErrorKind::PermissionDenied {
@@ -112,7 +117,7 @@ pub fn connect(name: &str, timeout: Duration, server_sid: &str) -> io::Result<Op
         Err(err) => return Err(err),
     };
     let pid = sys::pipe_server_pid(handle.as_handle())?;
-    let owner = sys::process_user_sid(Some(pid)).map_err(|err| {
+    let owner = runs_as(&handle, sys::process_user_sid(Some(pid))).map_err(|err| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("can't check who runs the server of {name}: {err}"),
@@ -125,6 +130,23 @@ pub fn connect(name: &str, timeout: Duration, server_sid: &str) -> io::Result<Op
         ));
     }
     Ok(Some(File::from(handle)))
+}
+
+/// Who runs the server of the pipe `handle` is connected to, from `process`: the user SID
+/// of its process, if this process may read that.
+///
+/// Only administrators may open a `LocalSystem` process, so an ordinary user connecting to
+/// the service gets access denied. Then the pipe's owner answers instead. The server sets
+/// itself as owner ([`Listener::bind_with`]), and no one else could have set that owner
+/// without administrator rights: Windows lets a process make only its own user (or a group
+/// it may own objects as) the owner.
+fn runs_as(handle: &OwnedHandle, process: io::Result<String>) -> io::Result<String> {
+    match process {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            sys::handle_owner(handle.as_handle())
+        }
+        other => other,
+    }
 }
 
 /// How many bytes the peer has sent that can be read without blocking. A closed peer is
@@ -206,6 +228,23 @@ mod tests {
         let err = connect(&name, Duration::from_millis(500), LOCAL_SYSTEM)
             .expect_err("this test doesn't run as LocalSystem");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn the_pipe_owner_answers_when_the_server_process_cant_be_opened() {
+        let name = unique_name("owner");
+        let mut listener = Listener::bind(&name).unwrap();
+        let server = std::thread::spawn(move || drop(listener.accept()));
+        let handle = sys::open_pipe(OsStr::new(&name)).unwrap();
+        let me = user_sid().unwrap();
+        // What an ordinary user gets opening a LocalSystem process.
+        let denied = Err(io::Error::from_raw_os_error(5));
+        assert_eq!(runs_as(&handle, denied).unwrap(), me);
+        // Other failures aren't covered up.
+        let gone = Err(io::Error::from_raw_os_error(87));
+        assert!(runs_as(&handle, gone).is_err());
+        drop(handle);
         server.join().unwrap();
     }
 

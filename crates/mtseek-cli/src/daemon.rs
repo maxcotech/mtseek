@@ -157,6 +157,8 @@ mod imp {
         };
         match Client::connect(&service, CONNECT_TIMEOUT, mtseek_ntfs::pipe::LOCAL_SYSTEM) {
             Ok(Some(client)) => Ok(Some(client)),
+            // Why the service can't be used says more than "no daemon" (with `--daemon`).
+            Err(err) if matches!(mine, Ok(None)) => Err(err.into()),
             Ok(None) | Err(_) => Ok(mine?),
         }
     }
