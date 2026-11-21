@@ -267,6 +267,61 @@ tracked since the second M3a step. Catch-up with nothing relevant changed went f
 1.2–1.3 ms to **1.5–1.9 ms** on `C:\Dev` (7 runs, release build). The extra time decodes the
 control-file table to check the folders above the root.
 
+### 2026-11-21, M3b: the daemon (`cargo xtask bench`, 5 timed runs)
+
+New contender `mtseek-daemon`: `mtseekd --console` starts on an empty cache before each
+cell and stops after it. The first run builds the index inside the daemon. The timed runs
+pay for process start (the spawn floor was 17 ms), connecting to the pipe and the search,
+with the index already open and current. Parity ✓ in all 16 cells for every contender.
+rg ran at 620 ms–1.02 s, a noisier machine than for M3a, so compare columns within this
+table. Raw: `bench/results/20261121-162523`.
+
+| query | mode | rg | mtseek (scan) | mtseek-index (direct) | mtseek-daemon | daemon vs rg |
+|---|---|---:|---:|---:|---:|---:|
+| absent | files | 724 ms | 423 ms | **54 ms** | **45 ms** | 16.1× |
+| rare | files | 656 ms | 476 ms | **67 ms** | **53 ms** | 12.4× |
+| uncommon | files | 728 ms | 444 ms | **72 ms** | **45 ms** | 16.2× |
+| medium | files | 678 ms | 444 ms | **72 ms** | **51 ms** | 13.3× |
+| common | files | 784 ms | 420 ms | 113 ms | **98 ms** | 8.0× |
+| icase | files | 638 ms | 465 ms | **65 ms** | **47 ms** | 13.6× |
+| regex-lit | files | 1.02 s | 831 ms | 118 ms | **95 ms** | 10.7× |
+| regex-nolit | files | 747 ms | 441 ms | 126 ms | 130 ms | 5.7× |
+| absent | lines | 620 ms | 417 ms | **58 ms** | **44 ms** | 14.1× |
+| rare | lines | 697 ms | 406 ms | **68 ms** | **47 ms** | 14.8× |
+| uncommon | lines | 630 ms | 418 ms | **60 ms** | **45 ms** | 14.0× |
+| medium | lines | 635 ms | 392 ms | **70 ms** | **55 ms** | 11.5× |
+| common | lines | 739 ms | 429 ms | 116 ms | 141 ms | 5.2× |
+| icase | lines | 682 ms | 395 ms | **71 ms** | **49 ms** | 13.9× |
+| regex-lit | lines | 636 ms | 471 ms | **79 ms** | **57 ms** | 11.2× |
+| regex-nolit | lines | 680 ms | 443 ms | 123 ms | **96 ms** | 7.1× |
+
+Through the daemon, 14 of 16 cells are under 100 ms (direct mode: 11 of 16 in this run).
+On selective queries the daemon saves 14–27 ms a search: no index to open, no journal to
+read on the search path. The two cells over 100 ms:
+
+- `regex-nolit` files (130 ms): verifies the whole store, in either mode.
+- `common` lines (141 ms, 25 ms *slower* than direct): 53,343 matching lines become one JSON
+  notification per file, then are parsed and printed by the CLI. ADR 0013 chose JSON for
+  version 1 and asked for this measurement. A binary frame (or batching lines and sending
+  ready-to-print bytes) is the fix, under a new protocol version.
+
+**Edit latency**: write a file in `C:\Dev`, then search at once for its new content
+(release build, 15 runs each; the script is not committed):
+
+| | median | min–max |
+|---|---:|---:|
+| direct, right after an edit | 74.6 ms | 64.5–89.6 ms |
+| direct, nothing changed | 28.9 ms | 23.8–33.5 ms |
+| daemon, right after an edit | **48.4 ms** | 38.2–56.0 ms |
+| daemon, 400 ms after an edit | 34.7 ms | 28.3–43.5 ms |
+| daemon, nothing changed | **24.0 ms** | 20.6–25.6 ms |
+
+The daemon's catch-up of one edit, from its `--stats`, takes 17–22 ms, against 38–40 ms
+when the delta is written to disk. ADR 0013 guessed about 5 ms. The rest is not I/O: each
+catch-up rebuilds the editable state from all 15,423 paths and re-packs the whole delta.
+Keeping that state resident in the daemon and appending to the delta is the next step for
+edit latency.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

@@ -5,18 +5,25 @@
 //! Searches run on `mtseek-engine`: content queries through the content index of a coverage
 //! root when one covers them (built with `--index`, caught up from the change journal on
 //! every run; ADR 0010, 0011, 0012), on the reference scanner otherwise.
+//!
+//! When the user's daemon (`mtseekd`) runs, the CLI sends it the search over its pipe and
+//! prints what comes back; the daemon runs the same engine with its indexes already open
+//! and current (ADR 0013). Without one, the CLI runs the engine itself ("direct mode").
+//! Output is the same either way.
 
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
 use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Scope};
 use mtseek_engine::{Engine, IndexUse, NamesRequest, Report, SearchRequest};
 use mtseek_walk::{FileHit, Mode, Summary};
+
+mod daemon;
 
 /// Instant full-disk search. Takes ripgrep's flags and prints ripgrep's output format.
 #[derive(Debug, Parser)]
@@ -120,6 +127,14 @@ struct Args {
     /// With --names or --index: print timings and index size to stderr.
     #[arg(long)]
     stats: bool,
+
+    /// Search in this process even if the daemon (mtseekd) is running.
+    #[arg(long, conflicts_with = "daemon")]
+    no_daemon: bool,
+
+    /// Fail unless the daemon (mtseekd) answers, instead of searching in this process.
+    #[arg(long)]
+    daemon: bool,
 }
 
 impl Args {
@@ -217,6 +232,8 @@ struct Format {
     with_filename: bool,
 }
 
+type Failure = Box<dyn std::error::Error>;
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let result = if args.names {
@@ -233,33 +250,63 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> mtseek_core::Result<ExitCode> {
+fn run(args: &Args) -> Result<ExitCode, Failure> {
     let request = args.search_request();
     let printer = Printer::new(request.mode, args.format(&args.scope()));
-    let mut engine = Engine::direct(Engine::default_cache_dir());
-    let outcome = engine.search(&request, &printer);
+    let started = Instant::now();
+    let answered = match daemon::connect(args)? {
+        Some(mut client) => daemon::search(&mut client, &request, &printer).map(|outcome| {
+            let by = daemon::answered_by(&client, started);
+            (outcome, by)
+        }),
+        None => Engine::direct(Engine::default_cache_dir())
+            .search(&request, &printer)
+            .map(|outcome| (Some(outcome), "answered in this process".to_owned()))
+            .map_err(Failure::from),
+    };
     // Flush what was found even if the search then failed.
     let finished = printer.finish();
-    let outcome = outcome?;
-    if !finished? {
-        return Ok(ExitCode::SUCCESS);
-    }
+    let (outcome, by) = answered?;
+    let Some(mut outcome) = outcome.filter(|_| finished.as_ref().is_ok_and(|&f| f)) else {
+        finished?;
+        return Ok(ExitCode::SUCCESS); // the reader went away (`mtseek x | head`)
+    };
     if args.stats {
+        outcome.stats.push(by);
         print_stats(&outcome.stats);
     }
     Ok(exit_code(&outcome.summary))
 }
 
 /// `mtseek --names`: file-name search.
-fn run_names(args: &Args) -> mtseek_core::Result<ExitCode> {
+fn run_names(args: &Args) -> Result<ExitCode, Failure> {
+    let request = args.names_request();
+    let started = Instant::now();
+    if let Some(mut client) = daemon::connect(args)? {
+        let (matched, mut stats) = daemon::names(&mut client, &request)?;
+        if args.stats {
+            stats.push(daemon::answered_by(&client, started));
+            print_stats(&stats);
+        }
+        return Ok(if matched == 0 {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     let printer = Printer::new(Mode::Files, Format::default());
     let mut engine = Engine::direct(Engine::default_cache_dir());
-    let found = engine.names(&args.names_request(), &printer)?;
+    let found = engine.names(&request, &printer)?;
     let mut stats = found.stats;
-    print_paths(&found.paths)?;
+    let mut out = PathWriter::new();
+    for path in &found.paths {
+        out.write(path);
+    }
+    out.finish()?;
     // Saved after answering, so the caller never waits for it.
     stats.extend(engine.save(Duration::ZERO));
     if args.stats {
+        stats.push("answered in this process".to_owned());
         print_stats(&stats);
     }
     Ok(if found.paths.is_empty() {
@@ -379,19 +426,46 @@ fn write_hit(
     Ok(())
 }
 
-fn print_paths(paths: &[PathBuf]) -> mtseek_core::Result<()> {
-    let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
-    let written = paths.iter().try_for_each(|path| {
-        out.write_all(path.as_os_str().to_string_lossy().as_bytes())?;
-        out.write_all(b"\n")
-    });
-    // A closed pipe (`mtseek --names x | head`) is a normal way to stop, not a failure.
-    match written.and_then(|()| out.flush()) {
-        Err(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(Error::Io {
-            path: PathBuf::from("<stdout>"),
-            source: err,
-        }),
-        _ => Ok(()),
+/// Prints `--names` results, one path per line.
+struct PathWriter {
+    out: BufWriter<io::StdoutLock<'static>>,
+    error: Option<io::Error>,
+}
+
+impl PathWriter {
+    fn new() -> Self {
+        Self {
+            out: BufWriter::with_capacity(64 * 1024, io::stdout().lock()),
+            error: None,
+        }
+    }
+
+    /// Prints `path`. `false` once stdout has failed: stop.
+    fn write(&mut self, path: &Path) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        let written = self
+            .out
+            .write_all(path.as_os_str().to_string_lossy().as_bytes())
+            .and_then(|()| self.out.write_all(b"\n"));
+        if let Err(err) = written {
+            self.error = Some(err);
+            return false;
+        }
+        true
+    }
+
+    /// Flushes. A closed pipe (`mtseek --names x | head`) is a normal way to stop.
+    fn finish(mut self) -> mtseek_core::Result<()> {
+        let flushed = self.out.flush();
+        match self.error.take().or_else(|| flushed.err()) {
+            Some(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(Error::Io {
+                path: PathBuf::from("<stdout>"),
+                source: err,
+            }),
+            _ => Ok(()),
+        }
     }
 }
 

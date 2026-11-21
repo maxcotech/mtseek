@@ -23,6 +23,8 @@ milestones. Decisions and their reasons are in [`docs/adr/`](docs/adr/).
 | Benchmark vs ripgrep | `cargo xtask bench --queries rare,absent --modes files` |
 | Generate a test corpus | `cargo xtask corpus <empty-dir>` |
 | Run the CLI | `cargo run -p mtseek-cli -- -F needle C:\some\dir` |
+| Run the daemon | `cargo run -p mtseek-daemon -- --console` (then `mtseek` answers through it) |
+| Daemon = direct mode | `cargo test -p mtseek-cli --test daemon` (Windows) |
 
 The toolchain is pinned in `rust-toolchain.toml`. Nothing needs admin rights except the MFT
 enumeration test in `mtseek-ntfs`, which skips when not elevated (CI is elevated and sets
@@ -56,9 +58,12 @@ terminal. The USN journal tests run as any user.
 ```
 crates/mtseek-core     shared types: Query, Scope, Filter, Error (no I/O)
 crates/mtseek-walk     reference scanner = test oracle + fallback (ripgrep's crates)
-crates/mtseek-cli      `mtseek` binary; tests/parity.rs runs rg vs mtseek
+crates/mtseek-cli      `mtseek` binary; tests/parity.rs runs rg vs mtseek (direct and daemon)
+crates/mtseek-engine   what answers a search, shared by direct mode and the daemon
+crates/mtseek-ipc      daemon protocol: JSON-RPC messages, framing, client
+crates/mtseek-daemon   `mtseekd`: resident engine behind a named pipe
 crates/mtseek-testkit  deterministic edge-case corpus generator
-crates/mtseek-ntfs     MFT + USN journal (Win32 FFI; all unsafe in src/sys.rs)
+crates/mtseek-ntfs     MFT + USN journal + the daemon's pipe (Win32 FFI; all unsafe in src/sys.rs)
 crates/mtseek-names    file-name index (arenas + parent links), MFT or walk source
 crates/mtseek-index    content index: segments (postings + zstd store), live catch-up; tests/live.rs
 crates/mtseek-query    regex -> trigram plan, candidate lookup, verification; tests/oracle.rs
@@ -78,6 +83,10 @@ docs/                  ARCHITECTURE.md, adr/
   (`content-coverage.txt` lists the folders with a content index).
   Tests must set `MTSEEK_CACHE_DIR` to a temp dir (see `tests/names.rs`, `tests/parity.rs`)
   so they never touch the real cache.
+- When `mtseekd` runs, `mtseek` answers through it, from the daemon's cache. CLI tests go
+  through `tests/common/mod.rs` (`How`), which sets `MTSEEK_PIPE` either to a pipe nobody
+  serves (direct mode) or to a daemon started for the test, so a daemon you are running
+  never answers a test.
 - The content index must never change *what* matches, only how fast. If the oracle test
   fails, the index is wrong. Fix the planner or the stored bytes, never the test.
 - Paths print exactly as the walker joins them onto the root you pass. Don't canonicalise

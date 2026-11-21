@@ -4,10 +4,11 @@
 in file names *and* file contents, in under 100 ms. Results are always up to date, and nothing
 rescans in the background.
 
-> **Status: pre-alpha (milestone M2, content index working).** The `mtseek` CLI gives ripgrep-identical
-> results. File-name search (`--names`) is indexed and kept current. Content search answers
-> from a content index once you create one with `--index`: 4–17× faster than ripgrep on the
-> benchmark, and kept current from the NTFS change journal. See the [roadmap](#roadmap).
+> **Status: pre-alpha (milestone M3, daemon working in console mode).** The `mtseek` CLI gives
+> ripgrep-identical results. File-name search (`--names`) is indexed and kept current. Content
+> search answers from a content index once you create one with `--index`: 5–16× faster than
+> ripgrep on the benchmark, and kept current from the NTFS change journal. `mtseekd --console`
+> keeps the indexes open between searches. See the [roadmap](#roadmap).
 
 ## Why
 
@@ -48,6 +49,13 @@ index instead of your files. `--no-index` scans instead, `--reindex` rebuilds. C
 `.gitignore`, `.ignore`, `.git/info/exclude` and ignore files in folders above are picked up
 too; git's global excludes file only takes effect after `--reindex`.
 
+`mtseekd --console` (install it with `cargo install --path crates/mtseek-daemon`) keeps the
+indexes open and current while it runs, as your user, with no admin rights. `mtseek` answers
+through it when it is running and prints exactly the same results; most indexed searches
+of the 15,000-file benchmark tree then take 44–57 ms including process start. `mtseekd --status`
+shows what it holds, `mtseekd --stop` writes what is in memory and stops it, and
+`mtseek --no-daemon` searches without it.
+
 The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
 output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`
 work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md)).
@@ -59,7 +67,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | M0 | Foundation: workspace, CI, benchmark baseline, ripgrep parity tests | ✅ |
 | M1 | Name engine: MFT + USN journal, instant file-name search | ✅ |
 | M2 | Content engine: trigram index + content store, kept current, under 100 ms | index ✅, live ✅; 12 of 16 benchmark queries under 100 ms |
-| M3 | Background service, live updates, per-user access control | |
+| M3 | Background service, live updates, per-user access control | coverage roots ✅, console daemon ✅; service mode next |
 | M4 | MCP server for AI agents, `--json` | |
 | M5 | Desktop app (GPUI): global-hotkey palette with preview | |
 | M6 | Signed installer, winget, auto-update | |

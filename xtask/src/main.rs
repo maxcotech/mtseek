@@ -59,7 +59,15 @@ fn ci() -> Result<()> {
 }
 
 fn bench(args: &[String]) -> Result<()> {
-    cargo(&["build", "--release", "--locked", "--package", "mtseek-cli"])?;
+    cargo(&[
+        "build",
+        "--release",
+        "--locked",
+        "--package",
+        "mtseek-cli",
+        "--package",
+        "mtseek-daemon",
+    ])?;
     let bench_dir = root().join("bench");
     let status = Command::new("python")
         .arg("bench.py")
