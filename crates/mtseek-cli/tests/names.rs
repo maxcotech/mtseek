@@ -6,7 +6,7 @@
 #![allow(clippy::print_stderr)] // tells the developer why the rg test was skipped
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mtseek_testkit::CorpusSpec;
@@ -133,6 +133,16 @@ fn terms_case_and_exit_codes() {
         out,
         [root.join("src").join("Payments").to_string_lossy()],
         "directories match too"
+    );
+
+    // Paths start with the root as typed, not as NTFS stores it (the MFT engine builds
+    // paths from the drive root; CI's temp dir is the 8.3 name `RUNNER~1`).
+    let typed = PathBuf::from(root.to_string_lossy().to_uppercase());
+    let (_, out) = mtseek(&["payments"], &typed);
+    assert_eq!(
+        out,
+        [typed.join("src").join("Payments").to_string_lossy()],
+        "root spelled as typed"
     );
 
     let (code, out) = mtseek(&["zq7xkvq9plmw"], root);
