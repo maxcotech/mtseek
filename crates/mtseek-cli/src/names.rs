@@ -59,7 +59,14 @@ pub(crate) fn run(args: &Args) -> Result<ExitCode> {
             };
         let index = &loaded.snapshot.index;
         let started = Instant::now();
-        let found = index.search(&query, under, args.threads);
+        let mut found = index.search(&query, under, args.threads);
+        // A drive index spells `root` as NTFS stores it: long names, stored case. Print
+        // paths as joined onto the root the user typed (`RUNNER~1`, `c:\dev`), like rg.
+        if let Some(stored) = under.and_then(|u| index.dir_path(u))
+            && stored != root
+        {
+            respell(&mut found, &stored, &root);
+        }
         stats.push(format!(
             "{}: {} matches in {:.1} ms; index of {} entries ({} MiB) from {} in {:.0} ms",
             root.display(),
@@ -115,6 +122,16 @@ pub(crate) fn run(args: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Replaces the leading `stored` of every path with `root`. Every path from a search under
+/// a directory starts with that directory's stored path, so their order is unchanged.
+fn respell(paths: &mut [PathBuf], stored: &Path, root: &Path) {
+    for path in paths {
+        if let Ok(rest) = path.strip_prefix(stored) {
+            *path = root.join(rest);
+        }
+    }
 }
 
 /// The cache directory: `MTSEEK_CACHE_DIR`, else `%LOCALAPPDATA%\mtseek\cache`.
