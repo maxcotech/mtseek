@@ -257,6 +257,9 @@ mod tests {
         };
         assert_eq!(built.method, MftMethod::Raw, "raw records must parse on C:");
         let under = file_ref(root).unwrap();
+        // The index spells paths as NTFS stores them, which differs from the temp dir's
+        // path when that has an 8.3 short name (CI: `C:\Users\RUNNER~1`).
+        let root = &built.index.dir_path(under).unwrap();
         let found = built
             .index
             .search(&NameQuery::new("linked", CaseMode::Smart), Some(under), 0);
