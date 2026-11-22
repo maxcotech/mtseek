@@ -8,6 +8,11 @@ pub enum Error {
     #[error("invalid pattern: {0}")]
     InvalidPattern(String),
 
+    /// A flag's value is invalid: a glob that doesn't parse, an unknown file type. The text
+    /// is the whole message.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     /// The daemon won't answer this search exactly (ADR 0014 §6). The caller runs it
     /// itself; nothing was reported yet.
     #[error("not answered by the daemon: {0}")]

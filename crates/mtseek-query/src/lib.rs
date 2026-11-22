@@ -14,6 +14,10 @@
 //! is reported as `rg` run by the caller would report it ("Access is denied") and never
 //! reaches planning, verification or the summary.
 //!
+//! Glob and file-type rules (`-g`, `-t`) decide which files are listed, the way the walker
+//! applies them ([`Rules`]). They can list ignored and hidden files, so an index answers
+//! them only when it holds those files ([`unanswerable`], ADR 0015).
+//!
 //! Invariant 2 (index = oracle) is checked by property tests in `tests/oracle.rs`.
 
 mod plan;
@@ -23,10 +27,13 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use mtseek_core::{Error, Filter, Query, Result};
 use mtseek_index::{Index, IndexError, Location, Segment, membership};
-use mtseek_walk::{FileHit, FileSearcher, Mode, Options, Summary};
+use mtseek_walk::{
+    FileHit, FileSearcher, Known, Options, Output, Rules, Summary, Verdict, Widening,
+};
 
 pub use plan::{Plan, plan};
 
@@ -92,32 +99,26 @@ pub struct Target<'a> {
 }
 
 /// Searches the files of `index` under `target` for `query`, the way [`mtseek_walk::scan`]
-/// searches a scope with root `target.root` and filter `target.filter`.
+/// searches a scope with root `target.root`, filter `target.filter` and `rules`.
 ///
 /// Files that couldn't be read are reported to `on_error`. An error reading the index
 /// itself ends the search with that error: the caller should rebuild the index or fall back
-/// to scanning.
+/// to scanning. A search the index can't answer exactly ([`unanswerable`]) is
+/// [`Error::Declined`] before anything is reported.
 #[allow(clippy::too_many_arguments)] // one search's inputs; a struct would only rename them
 pub fn search(
     index: &Index,
     target: Target<'_>,
+    rules: &Rules,
     query: &Query,
-    mode: Mode,
+    output: Output,
     options: Options,
     viewer: &dyn Viewer,
     on_hit: &(dyn Fn(&FileHit<'_>) -> ControlFlow<()> + Sync),
     on_error: &(dyn Fn(&Error) + Sync),
 ) -> Result<(Summary, SearchStats)> {
     let matcher = mtseek_walk::build_matcher(query)?;
-    if index.base().roots() != 1 {
-        return Err(Error::Io {
-            path: target.root.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "a content index covers one root",
-            ),
-        });
-    }
+    answers(index, target, rules, viewer)?;
     let bit = membership::bit(&target.filter);
     let plan = plan::plan(query);
     let layers = index.layers();
@@ -138,18 +139,19 @@ pub fn search(
             report_error(access_denied(path));
         }
     }
+    let mut listing = Listing::new(index, target, rules)?;
     let mut per_layer = Vec::with_capacity(layers.len());
     for &(segment, skip) in &layers {
         let range = range_under(segment, target.dir);
         let view = LayerView::new(segment, &hidden, viewer);
-        for d in view.unreadable(segment, skip, range, bit) {
+        for d in view.unreadable(segment, skip, range, &mut |d| listing.lists(segment, d)) {
             if let Some(path) = spell(&segment.path(d).1) {
                 report_error(access_denied(path));
             }
         }
         let found = layer_candidates(&plan, segment, range, target.filter.include_binary)?;
         let mut found = difference(&found, skip);
-        found.retain(|&d| segment.flags(d) & bit != 0 && view.visible(segment, d));
+        found.retain(|&d| listing.lists(segment, d) && view.visible(segment, d));
         per_layer.push(found);
     }
     let candidates: u64 = per_layer.iter().map(|c| c.len() as u64).sum();
@@ -163,6 +165,8 @@ pub fn search(
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let files_matched = AtomicU64::new(0);
+    let bytes_searched = AtomicU64::new(0);
+    let search_nanos = AtomicU64::new(0);
     let blocks = AtomicU64::new(0);
     let failure: Mutex<Option<IndexError>> = Mutex::new(None);
     let threads = options.thread_count().clamp(1, work.len().max(1));
@@ -177,8 +181,10 @@ pub fn search(
                     stop: &stop,
                     matched: &files_matched,
                     errors: &errors,
+                    bytes: &bytes_searched,
+                    nanos: &search_nanos,
                 };
-                let result = worker.run(&matcher, mode, &work, &next, &blocks);
+                let result = worker.run(&matcher, output, &work, &next, &blocks);
                 if let Err(e) = result {
                     stop.store(true, Ordering::Relaxed);
                     failure
@@ -197,6 +203,8 @@ pub fn search(
             files_searched: candidates,
             files_matched: files_matched.into_inner(),
             errors: errors.into_inner(),
+            bytes_searched: bytes_searched.into_inner(),
+            search_time: Duration::from_nanos(search_nanos.into_inner()),
         },
         SearchStats {
             plan,
@@ -204,6 +212,186 @@ pub fn search(
             blocks: blocks.into_inner(),
         },
     ))
+}
+
+/// Fails unless `index` can answer a search of `target` with `rules` exactly.
+fn answers(index: &Index, target: Target<'_>, rules: &Rules, viewer: &dyn Viewer) -> Result<()> {
+    if index.base().roots() != 1 {
+        return Err(Error::Io {
+            path: target.root.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a content index covers one root",
+            ),
+        });
+    }
+    match unanswerable(index, target, rules, viewer)? {
+        Some(why) => Err(Error::Declined(why.to_owned())),
+        None => Ok(()),
+    }
+}
+
+/// Why the index can't answer a search of `target` with `rules` exactly, if it can't
+/// (ADR 0015 §2). Without rules it always can.
+///
+/// * A glob without `!` lists ignored and hidden files in the folders the search enters,
+///   and a `-t` type lists hidden ones: the index must hold them, so its coverage must
+///   include the walk that lists them.
+/// * A glob that names a folder the search wouldn't enter makes the walk enter it.
+/// * A `!` glob can leave out folders the index recorded errors for, or that the caller may
+///   not list. Those are reported per folder; rather than work out which reports remain,
+///   such searches are left to the scanner. Both are rare.
+pub fn unanswerable(
+    index: &Index,
+    target: Target<'_>,
+    rules: &Rules,
+    viewer: &dyn Viewer,
+) -> Result<Option<&'static str>> {
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    let bit = membership::bit(&target.filter);
+    let covered = membership::covered(&index.coverage());
+    let widening = rules.widening();
+    let need = match widening {
+        Widening::None => bit,
+        Widening::Hidden => hidden_bit(target.filter),
+        Widening::All => membership::ALL,
+    };
+    if covered & need == 0 {
+        return Ok(Some(if widening == Widening::Hidden {
+            "the index leaves out hidden files, which a -t type can list"
+        } else {
+            "the index leaves out ignored and hidden files, which a glob can list"
+        }));
+    }
+    if widening == Widening::All {
+        let dirs = index.dirs()?;
+        let everywhere = target.dir.as_os_str().is_empty();
+        for dir in dirs.iter() {
+            if dir.root != 0 || dir.flags & bit != 0 {
+                continue;
+            }
+            let Ok(rest) = dir.path.strip_prefix(target.dir) else {
+                continue;
+            };
+            if (everywhere || !rest.as_os_str().is_empty())
+                && rules.glob(&target.root.join(rest), true) == Verdict::Include
+            {
+                return Ok(Some("a glob names a folder the search wouldn't enter"));
+            }
+        }
+    }
+    if rules.prunes() {
+        let hidden = unlisted(index, target, bit, viewer)?;
+        if !hidden.is_empty() || !stored_errors(index, target, bit, &hidden).is_empty() {
+            return Ok(Some(
+                "a ! glob may leave out a folder the index has an error for",
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The walk bit of `filter` with hidden files included.
+fn hidden_bit(filter: Filter) -> u8 {
+    membership::bit(&Filter {
+        include_hidden: true,
+        ..filter
+    })
+}
+
+/// Which files of an index a search lists: those its filter's walk lists, or with glob and
+/// type rules, those the walk with the rules lists (ADR 0015 §2). Only for searches the
+/// index can answer ([`unanswerable`]).
+struct Listing<'a> {
+    target: Target<'a>,
+    rules: &'a Rules,
+    bit: u8,
+    hidden_bit: u8,
+    /// The membership bits of each folder (relative to the index's root), when the rules can
+    /// list files the filter alone doesn't.
+    dirs: HashMap<PathBuf, u8>,
+    /// The bits of the index's root.
+    root_bits: u8,
+    /// Whether a folder (relative to the search root) is left out by a `!` glob, itself or
+    /// through a folder above it.
+    pruned: HashMap<PathBuf, bool>,
+}
+
+impl<'a> Listing<'a> {
+    fn new(index: &Index, target: Target<'a>, rules: &'a Rules) -> Result<Self, IndexError> {
+        let dirs = if rules.widening() == Widening::None {
+            HashMap::new()
+        } else {
+            index
+                .dirs()?
+                .iter()
+                .filter(|d| d.root == 0)
+                .map(|d| (d.path.clone(), d.flags))
+                .collect()
+        };
+        Ok(Self {
+            target,
+            rules,
+            bit: membership::bit(&target.filter),
+            hidden_bit: hidden_bit(target.filter),
+            dirs,
+            root_bits: membership::covered(&index.coverage()),
+            pruned: HashMap::new(),
+        })
+    }
+
+    /// Whether the search lists file `d` of `segment`.
+    fn lists(&mut self, segment: &Segment, d: u32) -> bool {
+        let flags = segment.flags(d);
+        let listed = flags & self.bit != 0;
+        if self.rules.is_empty() {
+            return listed;
+        }
+        let (_, relative) = segment.path(d);
+        let Ok(rest) = relative.strip_prefix(self.target.dir) else {
+            return false;
+        };
+        if let Some(parent) = rest.parent()
+            && self.pruned(parent)
+        {
+            return false;
+        }
+        // A file the walk lists is in a folder it enters; for the others, look it up.
+        let entered = listed || self.entered(relative.parent());
+        let known = Known {
+            listed,
+            not_ignored: entered && flags & self.hidden_bit != 0,
+            exists: entered && flags & membership::FILTERS != 0,
+        };
+        self.rules.lists(&self.target.root.join(rest), known)
+    }
+
+    /// Whether the search's walk enters folder `dir` (relative to the index's root).
+    fn entered(&self, dir: Option<&Path>) -> bool {
+        let bits = match dir {
+            None => self.root_bits,
+            Some(d) if d.as_os_str().is_empty() => self.root_bits,
+            Some(d) => self.dirs.get(d).copied().unwrap_or(0),
+        };
+        bits & self.bit != 0
+    }
+
+    /// Whether folder `rest` (relative to the search root) is left out by a `!` glob.
+    fn pruned(&mut self, rest: &Path) -> bool {
+        if rest.as_os_str().is_empty() || !self.rules.prunes() {
+            return false;
+        }
+        if let Some(&known) = self.pruned.get(rest) {
+            return known;
+        }
+        let above = rest.parent().is_some_and(|p| self.pruned(p));
+        let pruned =
+            above || self.rules.glob(&self.target.root.join(rest), true) == Verdict::Exclude;
+        self.pruned.insert(rest.to_path_buf(), pruned);
+        pruned
+    }
 }
 
 /// The errors the index recorded that walk `bit` from `target` reports, outside folders the
@@ -266,9 +454,15 @@ impl LayerView {
         self.readable(segment, d) && !self.pruned(d)
     }
 
-    /// The files in `range` that the caller's own `rg` would fail to open: listed by walk
-    /// `bit`, under no pruned folder, not replaced by the delta (`skip`).
-    fn unreadable(&self, segment: &Segment, skip: &[u32], range: (u32, u32), bit: u8) -> Vec<u32> {
+    /// The files in `range` that the caller's own `rg` would fail to open: listed by the
+    /// search, under no pruned folder, not replaced by the delta (`skip`).
+    fn unreadable(
+        &self,
+        segment: &Segment,
+        skip: &[u32],
+        range: (u32, u32),
+        listed: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
         if !self.readable.contains(&false) {
             return Vec::new();
         }
@@ -276,8 +470,10 @@ impl LayerView {
         let mut out = Vec::new();
         for d in range.0..range.1 {
             while skip.next_if(|&&s| s < d).is_some() {}
-            let listed = skip.peek() != Some(&&d) && segment.flags(d) & bit != 0;
-            if listed && !self.readable(segment, d) && !self.pruned(d) {
+            if skip.peek() == Some(&&d) || self.readable(segment, d) || self.pruned(d) {
+                continue;
+            }
+            if listed(d) {
                 out.push(d);
             }
         }
@@ -360,22 +556,42 @@ struct Worker<'a> {
     stop: &'a AtomicBool,
     matched: &'a AtomicU64,
     errors: &'a AtomicU64,
+    bytes: &'a AtomicU64,
+    nanos: &'a AtomicU64,
 }
 
 impl Worker<'_> {
     fn run(
         &self,
         matcher: &mtseek_walk::RegexMatcher,
-        mode: Mode,
+        output: Output,
         work: &[Work<'_>],
         next: &AtomicUsize,
         blocks: &AtomicU64,
+    ) -> Result<(), IndexError> {
+        let mut totals = Summary::default();
+        let result = self.search(matcher, output, work, next, blocks, &mut totals);
+        self.bytes
+            .fetch_add(totals.bytes_searched, Ordering::Relaxed);
+        let nanos = u64::try_from(totals.search_time.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        result
+    }
+
+    fn search(
+        &self,
+        matcher: &mtseek_walk::RegexMatcher,
+        output: Output,
+        work: &[Work<'_>],
+        next: &AtomicUsize,
+        blocks: &AtomicU64,
+        totals: &mut Summary,
     ) -> Result<(), IndexError> {
         let mut readers = Vec::with_capacity(self.layers.len());
         for (segment, _) in self.layers {
             readers.push(segment.block_reader()?);
         }
-        let mut searcher = FileSearcher::new(self.target.filter, mode);
+        let mut searcher = FileSearcher::new(self.target.filter, output);
         // In binary mode ripgrep reads past the first NUL, which the store cut off.
         let from_disk = |doc: u32, segment: &Segment| {
             self.target.filter.include_binary && segment.flags(doc) & membership::TRUNCATED != 0
@@ -410,18 +626,23 @@ impl Worker<'_> {
                 };
                 let found = match found {
                     Ok(Some(found)) => found,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        totals.add_file(&searcher.last());
+                        continue;
+                    }
                     Err(source) => {
                         self.errors.fetch_add(1, Ordering::Relaxed);
                         (self.on_error)(&Error::Io { path, source });
                         continue;
                     }
                 };
+                totals.add_file(&found.stats);
                 self.matched.fetch_add(1, Ordering::Relaxed);
                 let hit = FileHit {
                     path: &path,
                     lines: found.lines,
                     binary_offset: found.binary_offset,
+                    stats: found.stats,
                 };
                 if (self.on_hit)(&hit).is_break() {
                     self.stop.store(true, Ordering::Relaxed);
@@ -472,17 +693,20 @@ fn unlisted(
 pub fn decline_reason(
     index: &Index,
     target: Target<'_>,
+    rules: &Rules,
     viewer: &dyn Viewer,
 ) -> Result<Option<&'static str>> {
+    if let Some(why) = unanswerable(index, target, rules, viewer)? {
+        return Ok(Some(why));
+    }
     let bit = membership::bit(&target.filter);
     let hidden = unlisted(index, target, bit, viewer)?;
+    let mut listing = Listing::new(index, target, rules)?;
     for (segment, skip) in index.layers() {
         let (lo, hi) = range_under(segment, target.dir);
         let unstored = (lo..hi)
             .filter(|d| skip.binary_search(d).is_err())
-            .filter(|&d| {
-                segment.flags(d) & (membership::UNSTORED | bit) == membership::UNSTORED | bit
-            })
+            .filter(|&d| segment.flags(d) & membership::UNSTORED != 0 && listing.lists(segment, d))
             .any(|d| {
                 let (_, path) = segment.path(d);
                 viewer.may_read(segment.descriptor(d))

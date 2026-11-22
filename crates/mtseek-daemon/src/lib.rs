@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query};
+use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Select, TypeRule};
 use mtseek_engine::{Caller, Engine, IndexUse, NamesRequest, Outcome, Report, SearchRequest};
 use mtseek_ipc::{
     CancelParams, Case, Hit, Incoming, IndexMode, IndexStatus, InitializeParams, InitializeResult,
@@ -40,7 +40,7 @@ use mtseek_ipc::{
 use mtseek_ntfs::pipe::{self, Listener};
 use mtseek_ntfs::security::{self, Token};
 use mtseek_query::Viewer;
-use mtseek_walk::{FileHit, Mode as WalkMode};
+use mtseek_walk::{FileHit, Mode as WalkMode, Output};
 use serde_json::Value;
 
 /// How the daemon runs.
@@ -554,6 +554,8 @@ impl Session<'_> {
                 searched: outcome.summary.files_searched,
                 matched: outcome.summary.files_matched,
                 errors: outcome.summary.errors,
+                bytes: outcome.summary.bytes_searched,
+                nanos: nanos(outcome.summary.search_time),
             },
             stats: outcome.stats,
         })
@@ -756,9 +758,21 @@ impl Report for PipeReport<'_> {
             lines: hit
                 .lines
                 .iter()
-                .map(|l| Line::new(l.line_number, &l.bytes))
+                .map(|l| Line {
+                    off: l.offset,
+                    ctx: l.context,
+                    m: l.matches
+                        .iter()
+                        .map(|&(s, e)| [s as u64, e as u64])
+                        .collect(),
+                    ..Line::new(l.line_number, &l.bytes)
+                })
                 .collect(),
             binary_offset: hit.binary_offset,
+            matched_lines: hit.stats.matched_lines,
+            matches: hit.stats.matches,
+            bytes: hit.stats.bytes_searched,
+            nanos: nanos(hit.stats.elapsed),
         };
         self.send("$/hit", &wire);
         self.check();
@@ -837,9 +851,29 @@ pub fn search_request(params: &SearchParams) -> SearchRequest {
             include_binary: params.binary,
             follow_links: params.follow,
         },
-        mode: match params.mode {
-            SearchMode::Files => WalkMode::Files,
-            SearchMode::Lines => WalkMode::Lines,
+        select: Select {
+            globs: params.globs.clone(),
+            iglobs: params.iglobs.clone(),
+            types: params
+                .types
+                .iter()
+                .map(|t| TypeRule {
+                    name: t.name.clone(),
+                    negated: t.not,
+                })
+                .collect(),
+        },
+        output: Output {
+            mode: match params.mode {
+                SearchMode::Files => WalkMode::Files,
+                SearchMode::Lines => WalkMode::Lines,
+                SearchMode::Count => WalkMode::Count,
+                SearchMode::CountMatches => WalkMode::CountMatches,
+            },
+            before: params.before,
+            after: params.after,
+            max_count: params.max_count,
+            positions: params.positions,
         },
         threads: params.threads,
         index: match params.index {
@@ -850,6 +884,10 @@ pub fn search_request(params: &SearchParams) -> SearchRequest {
         },
         cwd: Some(params.cwd.to_path_buf()),
     }
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn case_mode(case: Case) -> CaseMode {
@@ -922,6 +960,13 @@ mod tests {
             index,
             root_ids: None,
             global_excludes: None,
+            before: 0,
+            after: 0,
+            max_count: None,
+            positions: false,
+            globs: Vec::new(),
+            iglobs: Vec::new(),
+            types: Vec::new(),
         }
     }
 

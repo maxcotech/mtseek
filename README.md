@@ -33,6 +33,8 @@ cargo install --path crates/mtseek-cli   # until there's an installer
 mtseek -F "ConnectionString" C:\Dev        # same flags and output as ripgrep
 mtseek -l -i paystack C:\Dev               # files only, case-insensitive
 mtseek -uu "TODO\(\w+\)" C:\Dev            # include ignored + hidden files
+mtseek -C2 -g "*.rs" "fn main" C:\Dev      # context lines, only Rust files
+mtseek --json -t py "import os" C:\Dev     # rg's JSON Lines, only Python files
 mtseek --names "paystack .cs" C:\Dev       # file names: every term must match
 mtseek --index -l -F Paystack C:\Dev       # build a content index for C:\Dev; later searches use it
 ```
@@ -68,9 +70,13 @@ global excludes file) is searched in the user's own process. `mtseekd --uninstal
 Secret-looking files (`.env*`, `id_rsa*`, `*.pem`, `*.key`, `*.pfx`, ...) are never stored in
 any index; searches read them from disk.
 
-The flags are ripgrep's (`-F -i -S -s -l -n -N -H -I -u -uu -uuu --hidden --no-ignore -L -j`), and the
-output is ripgrep's `path:line:text`. Editors, scripts and AI agents that already speak `rg`
-work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md)).
+The flags are ripgrep's (`-F -i -S -s -l -c --count-matches -n -N -H -I -A -B -C -m -g --iglob -t -T
+-u -uu -uuu --hidden --no-ignore -L -j --json`), and so is the output: `path:line:text`, or
+`rg --json`'s JSON Lines message for message. Editors, scripts and AI agents that already speak
+`rg` work unchanged. That's a tested contract
+([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md), [ADR 0015](docs/adr/0015-agents-json-and-mcp.md)).
+As in ripgrep, a file that matches `-g` is searched even if it is ignored or hidden, so the
+index answers a glob or `-t` search only if it was built with `-uu`; otherwise it scans.
 
 ## Roadmap
 
@@ -80,7 +86,7 @@ work unchanged. That's a tested contract ([ADR 0005](docs/adr/0005-ripgrep-compa
 | M1 | Name engine: MFT + USN journal, instant file-name search | ✅ |
 | M2 | Content engine: trigram index + content store, kept current, under 100 ms | index ✅, live ✅; 12 of 16 benchmark queries under 100 ms |
 | M3 | Background service, live updates, per-user access control | coverage roots ✅, console daemon ✅, service mode ✅ |
-| M4 | MCP server for AI agents, `--json` | |
+| M4 | MCP server for AI agents, `--json` | agent flags and `--json` ✅ |
 | M5 | Desktop app (GPUI): global-hotkey palette with preview | |
 | M6 | Signed installer, winget, auto-update | |
 

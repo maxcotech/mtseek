@@ -17,10 +17,10 @@ use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mtseek_core::{CaseMode, Error, Filter, Query, Result};
+use mtseek_core::{CaseMode, Error, Filter, Query, Result, Select};
 use mtseek_index::Index;
 use mtseek_query::Viewer;
-use mtseek_walk::{FileHit, Mode, Summary};
+use mtseek_walk::{FileHit, Output, Rules, Summary};
 
 pub mod access;
 pub mod content;
@@ -59,8 +59,11 @@ pub struct SearchRequest {
     pub roots: Vec<PathBuf>,
     /// Which files under the roots are searched.
     pub filter: Filter,
-    /// Paths only, or matching lines.
-    pub mode: Mode,
+    /// Glob and file-type rules on top of the filter (`-g`, `-t`). Globs are matched
+    /// relative to the caller's working directory.
+    pub select: Select,
+    /// What is reported per file, with context and `-m`.
+    pub output: Output,
     /// Worker threads (0: ripgrep's default).
     pub threads: usize,
     /// Whether to use the index.
@@ -204,8 +207,9 @@ impl Engine {
             disk_roots: None,
             only_indexed: false,
         };
+        let rules = rules(request)?;
         let Some(cwd) = &request.cwd else {
-            return content::search(self, request, report, &anywhere);
+            return content::search(self, request, &rules, report, &anywhere);
         };
         // Another process's working directory: search each root by its absolute path and
         // spell results as joined onto the root as typed. One root at a time, so that every
@@ -223,10 +227,8 @@ impl Engine {
                 actual: &actual,
                 typed,
             };
-            let done = content::search(self, &one, &respelled, &anywhere)?;
-            outcome.summary.files_searched += done.summary.files_searched;
-            outcome.summary.files_matched += done.summary.files_matched;
-            outcome.summary.errors += done.summary.errors;
+            let done = content::search(self, &one, &rules, &respelled, &anywhere)?;
+            outcome.summary.add(done.summary);
             outcome.stats.extend(done.stats);
         }
         Ok(outcome)
@@ -251,7 +253,8 @@ impl Engine {
             disk_roots: Some(disk_roots),
             only_indexed: true,
         };
-        content::search(self, request, report, &view)
+        let rules = rules(request)?;
+        content::search(self, request, &rules, report, &view)
     }
 
     /// Runs a name search.
@@ -310,6 +313,18 @@ impl Engine {
     }
 }
 
+/// The request's glob and type rules, with globs relative to the caller's working directory.
+fn rules(request: &SearchRequest) -> Result<Rules> {
+    if request.select.is_empty() {
+        return Ok(Rules::default());
+    }
+    let cwd = match &request.cwd {
+        Some(cwd) => cwd.clone(),
+        None => std::env::current_dir().map_err(|source| io_error(Path::new("."), source))?,
+    };
+    Rules::new(&request.select, &cwd)
+}
+
 /// `typed` found from `cwd`, without `.` components (`C:\work` and `.` give `C:\work`).
 /// `..` stays, as the walker would follow it.
 pub fn absolute_from(cwd: &Path, typed: &Path) -> PathBuf {
@@ -348,6 +363,7 @@ impl Report for Respell<'_> {
             path: &path,
             lines: hit.lines,
             binary_offset: hit.binary_offset,
+            stats: hit.stats,
         })
     }
 
@@ -432,6 +448,7 @@ mod tests {
                 path: Path::new(path),
                 lines: &[],
                 binary_offset: None,
+                stats: mtseek_walk::FileStats::default(),
             });
             r.error(&Error::Io {
                 path: PathBuf::from(path),
@@ -462,7 +479,8 @@ mod tests {
             query: Query::literal("needle"),
             roots,
             filter: Filter::default(),
-            mode: Mode::Files,
+            select: Select::default(),
+            output: mtseek_walk::Mode::Files.into(),
             threads: 1,
             index: IndexUse::Off,
             cwd,

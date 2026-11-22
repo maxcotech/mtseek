@@ -49,6 +49,37 @@ impl Filter {
     }
 }
 
+/// Glob and file-type rules on paths (`rg -g`, `--iglob`, `-t`, `-T`).
+///
+/// Unlike [`Filter`], these can list files the filter alone wouldn't: a file matching a glob
+/// is searched even if it is ignored or hidden, and a file of a selected type even if it is
+/// hidden (ripgrep's rules, which `mtseek-walk` applies).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Select {
+    /// `-g` globs, in command-line order. `!` in front excludes.
+    pub globs: Vec<String>,
+    /// `--iglob` globs: like `globs`, matched without regard to case, and after them.
+    pub iglobs: Vec<String>,
+    /// `-t` and `-T`, in command-line order.
+    pub types: Vec<TypeRule>,
+}
+
+/// One `-t` (select) or `-T` (negate) of a file type by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeRule {
+    /// The type's name, as in `rg --type-list`.
+    pub name: String,
+    /// `-T`: leave files of this type out.
+    pub negated: bool,
+}
+
+impl Select {
+    /// Whether there are no rules.
+    pub fn is_empty(&self) -> bool {
+        self.globs.is_empty() && self.iglobs.is_empty() && self.types.is_empty()
+    }
+}
+
 impl Scope {
     /// A scope over the given roots with ripgrep's default filters.
     pub fn new(roots: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {

@@ -11,7 +11,10 @@
 //!   mode prints.
 //! * **Versions:** one integer. The client offers a range and the server picks the highest
 //!   it shares ([`negotiate`]). Optional fields can be added without a new version; both
-//!   sides ignore fields they don't know.
+//!   sides ignore fields they don't know. An option that changes what a search reports
+//!   always needs a new version, because a server that ignored it would answer wrongly
+//!   (ADR 0015 §4). Version 2 added context, `-m`, counts, match positions, globs and
+//!   types; [`SearchParams::version`] says which version a search needs.
 //!
 //! This crate knows nothing about indexes, so clients can depend on it alone. [`client`]
 //! (Windows) connects over the named pipe.
@@ -29,7 +32,7 @@ pub mod base64;
 pub mod client;
 
 /// The newest protocol version this crate speaks.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 /// The oldest protocol version this crate speaks.
 pub const MIN_PROTOCOL: u32 = 1;
 /// A message longer than this is refused (the connection is closed).
@@ -88,7 +91,8 @@ impl WirePath {
     }
 }
 
-/// One matching line: its number and its exact bytes.
+/// One reported line: its number, its exact bytes and, from version 2, where it is, whether
+/// it is a context line and where its matches are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Line {
     /// 1-based line number.
@@ -99,22 +103,31 @@ pub struct Line {
     /// The bytes in base64, when they aren't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub b64: Option<String>,
+    /// Where the line starts in the searched text, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub off: u64,
+    /// A context line, not a matching one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ctx: bool,
+    /// Where each match is in the line: [start, end] (with `positions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m: Vec<[u64; 2]>,
 }
 
 impl Line {
-    /// The wire form of line `n` with bytes `bytes`.
+    /// The wire form of matching line `n` with bytes `bytes`.
     pub fn new(n: u64, bytes: &[u8]) -> Self {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => Self {
-                n,
-                text: Some(text.to_owned()),
-                b64: None,
-            },
-            Err(_) => Self {
-                n,
-                text: None,
-                b64: Some(base64::encode(bytes)),
-            },
+        let (text, b64) = match std::str::from_utf8(bytes) {
+            Ok(text) => (Some(text.to_owned()), None),
+            Err(_) => (None, Some(base64::encode(bytes))),
+        };
+        Self {
+            n,
+            text,
+            b64,
+            off: 0,
+            ctx: false,
+            m: Vec::new(),
         }
     }
 
@@ -164,12 +177,26 @@ pub enum Case {
 
 /// What a content search reports per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Paths only (`-l`).
     Files,
-    /// Matching lines.
+    /// Matching lines, with context lines if asked for.
     Lines,
+    /// Matching lines per file (`-c`). Version 2.
+    Count,
+    /// Matches per file (`--count-matches`). Version 2.
+    CountMatches,
+}
+
+/// One `-t` or `-T` file type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeRule {
+    /// The type's name.
+    pub name: String,
+    /// `-T`: leave its files out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub not: bool,
 }
 
 /// Whether a content search uses the index.
@@ -225,6 +252,44 @@ pub struct SearchParams {
     /// Git's global excludes file as the client's `rg` would read it (ADR 0014 §5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_excludes: Option<GlobalExcludes>,
+    /// Version 2: lines of context before each match (`-B`).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub before: usize,
+    /// Version 2: lines of context after each match (`-A`).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub after: usize,
+    /// Version 2: matching lines per file at most (`-m`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count: Option<u64>,
+    /// Version 2: report where each match is in its line (`--json`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions: bool,
+    /// Version 2: `-g` globs, matched relative to `cwd`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globs: Vec<String>,
+    /// Version 2: `--iglob` globs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iglobs: Vec<String>,
+    /// Version 2: `-t` and `-T`, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<TypeRule>,
+}
+
+impl SearchParams {
+    /// The oldest protocol version that carries this search exactly. A server that speaks
+    /// an older one must not get it: it would ignore what it doesn't know and answer a
+    /// different search.
+    pub fn version(&self) -> u32 {
+        let v2 = matches!(self.mode, SearchMode::Count | SearchMode::CountMatches)
+            || self.before > 0
+            || self.after > 0
+            || self.max_count.is_some()
+            || self.positions
+            || !self.globs.is_empty()
+            || !self.iglobs.is_empty()
+            || !self.types.is_empty();
+        if v2 { 2 } else { 1 }
+    }
 }
 
 /// A folder's identity: its volume's serial number and its file reference number.
@@ -254,12 +319,24 @@ pub struct Hit {
     pub id: Value,
     /// The path, joined onto the root as typed.
     pub path: WirePath,
-    /// Matching lines (empty for `files` mode).
+    /// Matching and context lines (only in `lines` mode).
     #[serde(default)]
     pub lines: Vec<Line>,
     /// Set when the file turned out to be binary after it matched: the NUL's offset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_offset: Option<u64>,
+    /// Version 2: matching lines in the file.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub matched_lines: u64,
+    /// Version 2: matches in the file (counted for `count_matches` and `positions`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub matches: u64,
+    /// Version 2: bytes searched in the file.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes: u64,
+    /// Version 2: how long searching the file took, in nanoseconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nanos: u64,
 }
 
 /// `$/error` (a file that couldn't be read) and `$/note` (a note for a person watching).
@@ -280,6 +357,27 @@ pub struct Summary {
     pub matched: u64,
     /// Files or folders that couldn't be read.
     pub errors: u64,
+    /// Version 2: bytes searched.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes: u64,
+    /// Version 2: time spent searching files, added up, in nanoseconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nanos: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes fields by reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes fields by reference
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes fields by reference
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// `search` result.
@@ -610,6 +708,73 @@ mod tests {
         assert_eq!(negotiate([1, 1], [2, 3]), None);
     }
 
+    fn plain_search() -> SearchParams {
+        SearchParams {
+            pattern: "needle".into(),
+            fixed: true,
+            case: Case::Sensitive,
+            roots: vec![WirePath::Text(".".into())],
+            cwd: WirePath::Text(r"C:\".into()),
+            ignore_files: true,
+            hidden: false,
+            binary: false,
+            follow: false,
+            mode: SearchMode::Lines,
+            threads: 0,
+            index: IndexMode::Auto,
+            root_ids: None,
+            global_excludes: None,
+            before: 0,
+            after: 0,
+            max_count: None,
+            positions: false,
+            globs: Vec::new(),
+            iglobs: Vec::new(),
+            types: Vec::new(),
+        }
+    }
+
+    /// A version 1 search is sent exactly as version 1 sent it, and every option of
+    /// version 2 makes the search need version 2.
+    #[test]
+    fn a_search_needs_version_2_only_for_what_version_2_added() {
+        let plain = plain_search();
+        assert_eq!(plain.version(), 1);
+        let json = serde_json::to_string(&plain).unwrap();
+        for v2 in [
+            "before",
+            "after",
+            "max_count",
+            "positions",
+            "globs",
+            "iglobs",
+            "types",
+        ] {
+            assert!(!json.contains(v2), "{json}");
+        }
+        let needs = |change: &dyn Fn(&mut SearchParams)| {
+            let mut p = plain_search();
+            change(&mut p);
+            p.version()
+        };
+        assert_eq!(needs(&|p| p.mode = SearchMode::Count), 2);
+        assert_eq!(needs(&|p| p.mode = SearchMode::CountMatches), 2);
+        assert_eq!(needs(&|p| p.mode = SearchMode::Files), 1);
+        assert_eq!(needs(&|p| p.before = 1), 2);
+        assert_eq!(needs(&|p| p.after = 1), 2);
+        assert_eq!(needs(&|p| p.max_count = Some(0)), 2);
+        assert_eq!(needs(&|p| p.positions = true), 2);
+        assert_eq!(needs(&|p| p.globs = vec!["*.rs".into()]), 2);
+        assert_eq!(needs(&|p| p.iglobs = vec!["*.rs".into()]), 2);
+        let rust = TypeRule {
+            name: "rust".into(),
+            not: false,
+        };
+        assert_eq!(needs(&|p| p.types = vec![rust.clone()]), 2);
+        let mode = serde_json::to_string(&SearchMode::CountMatches).unwrap();
+        assert_eq!(mode, r#""count_matches""#);
+    }
+
     #[test]
     fn lines_are_text_when_utf8_and_base64_otherwise() {
         let text = Line::new(3, "café\r\n".as_bytes());
@@ -732,6 +897,13 @@ mod tests {
                 root_ids: Some(vec![Some(RootId { volume: 7, frn: 9 }), None]),
                 global_excludes: Some(GlobalExcludes { path: None, b64: base64::encode(b"*.log
     ") }),
+                before: 2,
+                after: 1,
+                max_count: Some(3),
+                positions: true,
+                globs: vec!["*.rs".into(), "!target".into()],
+                iglobs: vec!["*.MD".into()],
+                types: vec![TypeRule { name: "rust".into(), not: true }],
             };
             let mut line = Vec::new();
             super::request(&mut line, &Value::from(1), "search", &request);
