@@ -168,10 +168,19 @@ impl Drop for Cleanup {
     }
 }
 
-/// A PowerShell command running `script`.
+/// A Windows PowerShell command running `script`, stopping at the first error.
+///
+/// Without the inherited `PSModulePath`: started from PowerShell 7 (CI's shell), Windows
+/// PowerShell would otherwise load 7's modules, fail (`ConvertTo-SecureString` not found),
+/// and carry on into `Start-Process` waiting at a credential prompt nobody sees.
 fn powershell(script: &str) -> Command {
     let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    command.env_remove("PSModulePath").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!("$ErrorActionPreference = 'Stop'; {script}"),
+    ]);
     command
 }
 
