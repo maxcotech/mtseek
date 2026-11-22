@@ -14,4 +14,4 @@ mod scope;
 
 pub use error::{Error, Result};
 pub use query::{CaseMode, PatternKind, Query};
-pub use scope::{Filter, Scope, Select, TypeRule};
+pub use scope::{Filter, IgnoreFiles, Scope, Select, TypeRule};

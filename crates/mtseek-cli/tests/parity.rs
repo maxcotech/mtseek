@@ -298,6 +298,86 @@ fn agent_flags_match_ripgrep() {
     );
 }
 
+/// Finer control over ignore files: `--no-ignore-vcs` and its siblings, `--ignore-file`
+/// (which applies even with `-u`), `--no-ignore-files`, and an ignore file that can't be
+/// read (reported, not an error). No index answers these walks; with `--index` they must
+/// still scan rather than use the corpus's index.
+#[test]
+fn ignore_flags_match_ripgrep() {
+    if !ripgrep_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    mtseek_testkit::generate(dir.path(), &CorpusSpec::default()).unwrap();
+    std::fs::create_dir_all(dir.path().join("app/.git/info")).unwrap();
+    std::fs::write(dir.path().join("app/.git/info/exclude"), "*.json\n").unwrap();
+    let extra_dir = tempfile::tempdir().unwrap();
+    let extra = extra_dir.path().join("extra.ignore");
+    std::fs::write(&extra, "*.md\ndocs/\n").unwrap();
+    let extra = extra.to_str().unwrap();
+    let ways = How::both("ignores");
+    let rg = How::direct();
+    let corpus = Some(dir.path());
+
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "."),
+        (&["--no-ignore-vcs"], "."),
+        (&["--no-ignore-dot"], "."),
+        (&["--no-ignore-exclude"], "."),
+        (&["--no-ignore-global"], "."),
+        (&["--no-ignore-vcs", "--no-ignore-dot"], "."),
+        (&[], "app/src"),
+        (&["--no-ignore-parent"], "app/src"),
+        (&["--ignore-file", extra], "."),
+        (&["--ignore-file", extra, "--no-ignore-files"], "."),
+        (&["--ignore-file", extra, "-u"], "."),
+        (&["--ignore-file", extra, "-uu"], "."),
+        (&["--no-ignore-vcs", "--ignore-file", extra], "."),
+        (&["--ignore-file", "missing.ignore"], "."),
+        (&["--no-ignore-vcs", "-g", "*.log"], "."),
+        (&["--no-ignore-dot", "-c"], "."),
+    ];
+    let mut failures = Vec::new();
+    let mut total = 0;
+    for &(case_flags, root) in cases {
+        let mut flags = vec!["-F", "-l"];
+        flags.extend(case_flags);
+        flags.extend(LINES_MODE);
+        let root = Path::new(root);
+        let expected = run_in(
+            &rg,
+            "rg",
+            &["--no-config"],
+            &flags,
+            tokens::COMMON,
+            root,
+            corpus,
+        );
+        for (how, variant) in ways
+            .iter()
+            .flat_map(|how| MTSEEK_VARIANTS.iter().map(move |v| (how, v)))
+        {
+            let exe = env!("CARGO_BIN_EXE_mtseek");
+            let actual = run_in(how, exe, variant, &flags, tokens::COMMON, root, corpus);
+            total += 1;
+            if expected != actual {
+                let mut all = vec![how.label()];
+                all.extend(variant.iter().copied());
+                all.extend(&flags);
+                let shown = root.to_string_lossy();
+                all.push(&shown);
+                failures.push(describe(tokens::COMMON, &all, &expected, &actual));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {total} cases differ from rg:\n\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn json_matches_ripgrep() {
     if !ripgrep_available() {

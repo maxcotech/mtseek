@@ -62,6 +62,39 @@ pub struct Select {
     pub iglobs: Vec<String>,
     /// `-t` and `-T`, in command-line order.
     pub types: Vec<TypeRule>,
+    /// Which ignore files are read, when it isn't all or none of them.
+    pub ignore_files: IgnoreFiles,
+}
+
+/// Finer control over ignore files than [`Filter::respect_ignore_files`], with ripgrep's
+/// flags. The default reads what the filter says.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // each flag maps 1:1 to a ripgrep option
+pub struct IgnoreFiles {
+    /// Skip `.gitignore`, `.git/info/exclude` and git's global excludes (`--no-ignore-vcs`).
+    pub no_vcs: bool,
+    /// Skip `.ignore` and `.rgignore` (`--no-ignore-dot`).
+    pub no_dot: bool,
+    /// Skip ignore files in folders above the search root (`--no-ignore-parent`).
+    pub no_parent: bool,
+    /// Skip git's global excludes file (`--no-ignore-global`).
+    pub no_global: bool,
+    /// Skip `.git/info/exclude` (`--no-ignore-exclude`).
+    pub no_exclude: bool,
+    /// More ignore files in gitignore syntax (`--ignore-file`), read even when the filter
+    /// doesn't respect ignore files, as ripgrep does. Relative paths are found from the
+    /// working directory.
+    pub extra: Vec<PathBuf>,
+}
+
+impl IgnoreFiles {
+    /// Whether a walk with `filter` and these settings reads exactly the ignore files the
+    /// filter alone reads: the walks a content index records (ADR 0012).
+    pub fn is_standard_for(&self, filter: &Filter) -> bool {
+        let finer =
+            self.no_vcs || self.no_dot || self.no_parent || self.no_global || self.no_exclude;
+        self.extra.is_empty() && !(filter.respect_ignore_files && finer)
+    }
 }
 
 /// One `-t` (select) or `-T` (negate) of a file type by name.
@@ -76,7 +109,10 @@ pub struct TypeRule {
 impl Select {
     /// Whether there are no rules.
     pub fn is_empty(&self) -> bool {
-        self.globs.is_empty() && self.iglobs.is_empty() && self.types.is_empty()
+        self.globs.is_empty()
+            && self.iglobs.is_empty()
+            && self.types.is_empty()
+            && self.ignore_files == IgnoreFiles::default()
     }
 }
 
@@ -100,6 +136,7 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn unrestricted_levels_match_ripgrep() {
@@ -111,5 +148,25 @@ mod tests {
         assert!(!f2.respect_ignore_files && f2.include_hidden && !f2.include_binary);
         let f3 = Filter::unrestricted(3);
         assert!(!f3.respect_ignore_files && f3.include_hidden && f3.include_binary);
+    }
+
+    /// The `--no-ignore-*` flags change nothing once `-u` reads no ignore files, but
+    /// `--ignore-file` applies even then (ripgrep 15).
+    #[test]
+    fn finer_ignore_settings_leave_the_standard_walks_only_where_they_change_them() {
+        let default = Filter::default();
+        let no_ignore = Filter::unrestricted(1);
+        assert!(IgnoreFiles::default().is_standard_for(&default));
+        let vcs = IgnoreFiles {
+            no_vcs: true,
+            ..IgnoreFiles::default()
+        };
+        assert!(!vcs.is_standard_for(&default));
+        assert!(vcs.is_standard_for(&no_ignore));
+        let extra = IgnoreFiles {
+            extra: vec![PathBuf::from("x.ignore")],
+            ..IgnoreFiles::default()
+        };
+        assert!(!extra.is_standard_for(&no_ignore));
     }
 }

@@ -19,7 +19,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
-use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Scope, Select, TypeRule};
+use mtseek_core::{
+    CaseMode, Error, Filter, IgnoreFiles, PatternKind, Query, Scope, Select, TypeRule,
+};
 use mtseek_engine::{Engine, IndexUse, NamesRequest, Report, SearchRequest};
 use mtseek_walk::{FileHit, Mode, Output, Summary};
 
@@ -144,6 +146,36 @@ struct Args {
     #[arg(long)]
     no_ignore: bool,
 
+    /// Don't honour .gitignore, .git/info/exclude or git's global excludes file; .ignore and
+    /// .rgignore still apply.
+    #[arg(long)]
+    no_ignore_vcs: bool,
+
+    /// Don't honour .ignore or .rgignore files.
+    #[arg(long)]
+    no_ignore_dot: bool,
+
+    /// Don't honour ignore files in folders above the one searched.
+    #[arg(long)]
+    no_ignore_parent: bool,
+
+    /// Don't honour git's global excludes file.
+    #[arg(long)]
+    no_ignore_global: bool,
+
+    /// Don't honour .git/info/exclude.
+    #[arg(long)]
+    no_ignore_exclude: bool,
+
+    /// Also leave out what this file lists, in .gitignore syntax. Can be repeated. Applies
+    /// even with -u, as in ripgrep.
+    #[arg(long = "ignore-file", value_name = "PATH")]
+    ignore_files: Vec<PathBuf>,
+
+    /// Don't honour files given with --ignore-file.
+    #[arg(long)]
+    no_ignore_files: bool,
+
     /// Follow symbolic links and junctions.
     #[arg(short = 'L', long)]
     follow: bool,
@@ -166,7 +198,9 @@ struct Args {
             "fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden",
             "no_ignore", "follow", "index", "reindex", "no_index", "count", "count_matches",
             "json", "after_context", "before_context", "context", "max_count", "globs",
-            "iglobs", "types", "types_not",
+            "iglobs", "types", "types_not", "no_ignore_vcs", "no_ignore_dot",
+            "no_ignore_parent", "no_ignore_global", "no_ignore_exclude", "ignore_files",
+            "no_ignore_files",
         ]
     )]
     names: bool,
@@ -281,6 +315,18 @@ impl Args {
                 globs: self.globs.clone(),
                 iglobs: self.iglobs.clone(),
                 types: self.type_rules.clone(),
+                ignore_files: IgnoreFiles {
+                    no_vcs: self.no_ignore_vcs,
+                    no_dot: self.no_ignore_dot,
+                    no_parent: self.no_ignore_parent,
+                    no_global: self.no_ignore_global,
+                    no_exclude: self.no_ignore_exclude,
+                    extra: if self.no_ignore_files {
+                        Vec::new()
+                    } else {
+                        self.ignore_files.clone()
+                    },
+                },
             },
             output: self.output(),
             threads: self.threads,

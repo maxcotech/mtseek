@@ -250,6 +250,11 @@ pub fn unanswerable(
     if rules.is_empty() {
         return Ok(None);
     }
+    if !rules.ignore_files().is_standard_for(&target.filter) {
+        return Ok(Some(
+            "the index records walks that read all ignore files or none",
+        ));
+    }
     let bit = membership::bit(&target.filter);
     let covered = membership::covered(&index.coverage());
     let widening = rules.widening();
