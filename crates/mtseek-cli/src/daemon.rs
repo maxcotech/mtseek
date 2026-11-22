@@ -7,7 +7,8 @@
 //! search exactly as parsed, plus this process's working directory, which folder each root
 //! is and git's global excludes file, and sends back what the direct engine would have
 //! printed. The service may decline a search it can't answer exactly; the CLI then
-//! searches in this process, and `--stats` says why.
+//! searches in this process, and `--stats` says why. So does a search that needs a newer
+//! protocol than the daemon speaks (ADR 0015 §4).
 
 use std::time::{Duration, Instant};
 
@@ -126,6 +127,7 @@ mod imp {
     use std::io::{self, Write};
     use std::ops::ControlFlow;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use mtseek_core::{CaseMode, PatternKind};
     use mtseek_engine::{IndexUse, NamesRequest, Outcome, Report, SearchRequest};
@@ -133,9 +135,9 @@ mod imp {
     use mtseek_ipc::client::{ClientError, Sink};
     use mtseek_ipc::{
         Case, GlobalExcludes, Hit, IndexMode, NamesParams, RootId, SearchMode, SearchParams,
-        WirePath, code,
+        TypeRule, WirePath, code,
     };
-    use mtseek_walk::{FileHit, LineHit, Mode, Summary};
+    use mtseek_walk::{FileHit, FileStats, LineHit, Mode, Summary};
 
     use super::{Answer, CONNECT_TIMEOUT};
     use crate::{Failure, PathWriter, Printer, hint};
@@ -208,9 +210,11 @@ mod imp {
             hidden: request.filter.include_hidden,
             binary: request.filter.include_binary,
             follow: request.filter.follow_links,
-            mode: match request.mode {
+            mode: match request.output.mode {
                 Mode::Files => SearchMode::Files,
                 Mode::Lines => SearchMode::Lines,
+                Mode::Count => SearchMode::Count,
+                Mode::CountMatches => SearchMode::CountMatches,
             },
             threads: request.threads,
             index: match request.index {
@@ -221,7 +225,29 @@ mod imp {
             },
             root_ids: Some(root_ids(&request.roots, &cwd)),
             global_excludes: Some(global_excludes()),
+            before: request.output.before,
+            after: request.output.after,
+            max_count: request.output.max_count,
+            positions: request.output.positions,
+            globs: request.select.globs.clone(),
+            iglobs: request.select.iglobs.clone(),
+            types: request
+                .select
+                .types
+                .iter()
+                .map(|t| TypeRule {
+                    name: t.name.clone(),
+                    not: t.negated,
+                })
+                .collect(),
         };
+        let speaks = client.info().protocol;
+        if params.version() > speaks {
+            return Ok(Answer::Declined(format!(
+                "this search needs protocol {}, the daemon speaks {speaks}",
+                params.version()
+            )));
+        }
         let mut forward = Forward {
             printer,
             paths: None,
@@ -241,6 +267,8 @@ mod imp {
                 files_searched: result.summary.searched,
                 files_matched: result.summary.matched,
                 errors: result.summary.errors,
+                bytes_searched: result.summary.bytes,
+                search_time: Duration::from_nanos(result.summary.nanos),
             },
             stats: result.stats,
         })))
@@ -257,7 +285,7 @@ mod imp {
             cwd: WirePath::new(&std::env::current_dir()?),
             threads: request.threads,
         };
-        let printer = Printer::new(Mode::Files, crate::Format::default());
+        let printer = Printer::new(crate::Style::Paths, crate::Format::default());
         let mut forward = Forward {
             printer: &printer,
             paths: Some(PathWriter::new()),
@@ -303,13 +331,21 @@ mod imp {
         fn hit(&mut self, hit: Hit) -> ControlFlow<()> {
             let mut lines = Vec::with_capacity(hit.lines.len());
             for line in &hit.lines {
-                let Some(bytes) = line.bytes() else {
+                let matches: Option<Vec<(usize, usize)>> = line
+                    .m
+                    .iter()
+                    .map(|&[s, e]| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                    .collect();
+                let (Some(bytes), Some(matches)) = (line.bytes(), matches) else {
                     self.bad = Some("the daemon sent a malformed line".into());
                     return ControlFlow::Break(());
                 };
                 lines.push(LineHit {
                     line_number: line.n,
+                    offset: line.off,
                     bytes,
+                    context: line.ctx,
+                    matches,
                 });
             }
             let path: PathBuf = hit.path.to_path_buf();
@@ -317,6 +353,12 @@ mod imp {
                 path: &path,
                 lines: &lines,
                 binary_offset: hit.binary_offset,
+                stats: FileStats {
+                    matched_lines: hit.matched_lines,
+                    matches: hit.matches,
+                    bytes_searched: hit.bytes,
+                    elapsed: Duration::from_nanos(hit.nanos),
+                },
             })
         }
 

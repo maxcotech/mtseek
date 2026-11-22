@@ -19,4 +19,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0012](0012-index-coverage.md) | What the daemon indexes: coverage roots, narrowed at query time | Accepted, partly superseded by 0014 |
 | [0013](0013-daemon-and-ipc.md) | The daemon and its pipe protocol | Accepted |
 | [0014](0014-service-mode.md) | Service mode: one machine-wide daemon that shows each caller only what it could read | Accepted |
-| [0015](0015-agents-json-and-mcp.md) | Agents: `--json`, the flags agents use, and an MCP server | Proposed |
+| [0015](0015-agents-json-and-mcp.md) | Agents: `--json`, the flags agents use, and an MCP server | Accepted |

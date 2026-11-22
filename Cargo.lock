@@ -479,6 +479,8 @@ dependencies = [
  "mtseek-ntfs",
  "mtseek-testkit",
  "mtseek-walk",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

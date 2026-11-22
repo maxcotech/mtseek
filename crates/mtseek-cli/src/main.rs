@@ -18,16 +18,23 @@ use std::process::ExitCode;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use clap::{ArgAction, Parser};
-use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Scope};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Scope, Select, TypeRule};
 use mtseek_engine::{Engine, IndexUse, NamesRequest, Report, SearchRequest};
-use mtseek_walk::{FileHit, Mode, Summary};
+use mtseek_walk::{FileHit, Mode, Output, Summary};
 
 mod daemon;
+mod json;
 
 /// Instant full-disk search. Takes ripgrep's flags and prints ripgrep's output format.
 #[derive(Debug, Parser)]
-#[command(name = "mtseek", version, max_term_width = 100)]
+#[command(
+    name = "mtseek",
+    version,
+    max_term_width = 100,
+    // As in ripgrep, a flag given twice takes its last value.
+    args_override_self = true
+)]
 #[allow(clippy::struct_excessive_bools)] // one field per command-line flag
 struct Args {
     /// A regular expression to search for, or literal text with -F.
@@ -53,8 +60,57 @@ struct Args {
     case_sensitive: bool,
 
     /// Print only the paths of files with at least one match.
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, overrides_with_all = ["count", "count_matches", "json"])]
     files_with_matches: bool,
+
+    /// Print the number of matching lines in each file with a match.
+    #[arg(short = 'c', long, overrides_with_all = ["files_with_matches", "count_matches", "json"])]
+    count: bool,
+
+    /// Print the number of matches in each file with a match.
+    #[arg(long, overrides_with_all = ["files_with_matches", "count", "json"])]
+    count_matches: bool,
+
+    /// Print results as JSON Lines, message for message as `rg --json` does.
+    #[arg(long, overrides_with_all = ["files_with_matches", "count", "count_matches"])]
+    json: bool,
+
+    /// Show NUM lines after each match.
+    #[arg(short = 'A', long, value_name = "NUM")]
+    after_context: Option<usize>,
+
+    /// Show NUM lines before each match.
+    #[arg(short = 'B', long, value_name = "NUM")]
+    before_context: Option<usize>,
+
+    /// Show NUM lines before and after each match. -A and -B take precedence.
+    #[arg(short = 'C', long, value_name = "NUM")]
+    context: Option<usize>,
+
+    /// Stop searching a file after NUM matching lines.
+    #[arg(short = 'm', long, value_name = "NUM")]
+    max_count: Option<u64>,
+
+    /// Search only files that match GLOB, or with `!GLOB`, leave them out. Can be repeated;
+    /// later globs win. A matching file is searched even if it is ignored or hidden.
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    globs: Vec<String>,
+
+    /// Like -g, ignoring case.
+    #[arg(long = "iglob", value_name = "GLOB")]
+    iglobs: Vec<String>,
+
+    /// Search only files of type TYPE (ripgrep's built-in types: rust, py, js, ...).
+    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    types: Vec<String>,
+
+    /// Leave out files of type TYPE.
+    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
+    types_not: Vec<String>,
+
+    /// `-t` and `-T` in command-line order, which decides between them.
+    #[arg(skip)]
+    type_rules: Vec<TypeRule>,
 
     /// Show line numbers [default: on when printing to a terminal].
     #[arg(short = 'n', long, overrides_with = "no_line_number")]
@@ -106,7 +162,12 @@ struct Args {
     /// master file table when run as administrator; otherwise walks directories.
     #[arg(
         long,
-        conflicts_with_all = ["fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden", "no_ignore", "follow", "index", "reindex", "no_index"]
+        conflicts_with_all = [
+            "fixed_strings", "files_with_matches", "line_number", "unrestricted", "hidden",
+            "no_ignore", "follow", "index", "reindex", "no_index", "count", "count_matches",
+            "json", "after_context", "before_context", "context", "max_count", "globs",
+            "iglobs", "types", "types_not",
+        ]
     )]
     names: bool,
 
@@ -138,6 +199,14 @@ struct Args {
 }
 
 impl Args {
+    /// Parses the command line.
+    fn parse_all() -> Self {
+        let matches = Self::command().get_matches();
+        let mut args = Self::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        args.type_rules = type_rules(&matches);
+        args
+    }
+
     fn query(&self) -> Query {
         let kind = if self.fixed_strings {
             PatternKind::Literal
@@ -183,20 +252,54 @@ impl Args {
         }
     }
 
+    fn output(&self) -> Output {
+        let mode = if self.files_with_matches {
+            Mode::Files
+        } else if self.count {
+            Mode::Count
+        } else if self.count_matches {
+            Mode::CountMatches
+        } else {
+            Mode::Lines
+        };
+        Output {
+            mode,
+            before: self.before_context.or(self.context).unwrap_or(0),
+            after: self.after_context.or(self.context).unwrap_or(0),
+            max_count: self.max_count,
+            positions: self.json,
+        }
+    }
+
     fn search_request(&self) -> SearchRequest {
         let scope = self.scope();
         SearchRequest {
             query: self.query(),
             roots: scope.roots,
             filter: scope.filter,
-            mode: if self.files_with_matches {
-                Mode::Files
-            } else {
-                Mode::Lines
+            select: Select {
+                globs: self.globs.clone(),
+                iglobs: self.iglobs.clone(),
+                types: self.type_rules.clone(),
             },
+            output: self.output(),
             threads: self.threads,
             index: self.index_use(),
             cwd: None,
+        }
+    }
+
+    fn style(&self, output: &Output) -> Style {
+        if self.json {
+            return Style::Json;
+        }
+        match output.mode {
+            Mode::Files => Style::Paths,
+            Mode::Count => Style::Count,
+            Mode::CountMatches => Style::CountMatches,
+            Mode::Lines => Style::Lines {
+                context: output.context(),
+            },
         }
     }
 
@@ -226,16 +329,53 @@ impl Args {
     }
 }
 
+/// `-t` and `-T` in the order they were given.
+fn type_rules(matches: &ArgMatches) -> Vec<TypeRule> {
+    let mut rules: Vec<(usize, TypeRule)> = Vec::new();
+    for (id, negated) in [("types", false), ("types_not", true)] {
+        let (Some(names), Some(at)) = (matches.get_many::<String>(id), matches.indices_of(id))
+        else {
+            continue;
+        };
+        rules.extend(at.zip(names).map(|(i, name)| {
+            (
+                i,
+                TypeRule {
+                    name: name.clone(),
+                    negated,
+                },
+            )
+        }));
+    }
+    rules.sort_by_key(|&(i, _)| i);
+    rules.into_iter().map(|(_, rule)| rule).collect()
+}
+
 #[derive(Debug, Default)]
 struct Format {
     line_number: bool,
     with_filename: bool,
 }
 
+/// How a content search's results are printed, as ripgrep prints them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Style {
+    /// One path per matching file (`-l`).
+    Paths,
+    /// Matching lines per file (`-c`).
+    Count,
+    /// Matches per file (`--count-matches`).
+    CountMatches,
+    /// Matching lines; with context lines and `--` between groups if `context`.
+    Lines { context: bool },
+    /// JSON Lines (`--json`).
+    Json,
+}
+
 type Failure = Box<dyn std::error::Error>;
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let args = Args::parse_all();
     let result = if args.names {
         run_names(&args)
     } else {
@@ -252,7 +392,7 @@ fn main() -> ExitCode {
 
 fn run(args: &Args) -> Result<ExitCode, Failure> {
     let request = args.search_request();
-    let printer = Printer::new(request.mode, args.format(&args.scope()));
+    let printer = Printer::new(args.style(&request.output), args.format(&args.scope()));
     let started = Instant::now();
     let direct = |by: String| {
         Engine::direct(Engine::default_cache_dir())
@@ -271,7 +411,11 @@ fn run(args: &Args) -> Result<ExitCode, Failure> {
         None => direct("answered in this process".to_owned()),
     };
     // Flush what was found even if the search then failed.
-    let finished = printer.finish();
+    let summary = match &answered {
+        Ok((Some(outcome), _)) => Some(outcome.summary),
+        _ => None,
+    };
+    let finished = printer.finish(summary.as_ref());
     let (outcome, by) = answered?;
     let Some(mut outcome) = outcome.filter(|_| finished.as_ref().is_ok_and(|&f| f)) else {
         finished?;
@@ -305,7 +449,7 @@ fn run_names(args: &Args) -> Result<ExitCode, Failure> {
             Err(why) => by = daemon::declined_by(&client, &why),
         }
     }
-    let printer = Printer::new(Mode::Files, Format::default());
+    let printer = Printer::new(Style::Paths, Format::default());
     let mut engine = Engine::direct(Engine::default_cache_dir());
     let found = engine.names(&request, &printer)?;
     let mut stats = found.stats;
@@ -340,34 +484,57 @@ fn exit_code(summary: &Summary) -> ExitCode {
 
 /// Prints what a content search finds, as ripgrep would.
 struct Printer {
-    out: Mutex<BufWriter<io::Stdout>>,
+    out: Mutex<Out>,
     write_error: Mutex<Option<io::Error>>,
-    mode: Mode,
+    style: Style,
     format: Format,
+    started: Instant,
+}
+
+/// Stdout and what has been printed to it.
+struct Out {
+    writer: BufWriter<io::Stdout>,
+    /// Whether any file's results have been printed: with context, ripgrep puts `--`
+    /// between files.
+    printed: bool,
+    /// Totals for the JSON summary.
+    json: json::Totals,
 }
 
 impl Printer {
-    fn new(mode: Mode, format: Format) -> Self {
+    fn new(style: Style, format: Format) -> Self {
         Self {
-            out: Mutex::new(BufWriter::with_capacity(64 * 1024, io::stdout())),
+            out: Mutex::new(Out {
+                writer: BufWriter::with_capacity(64 * 1024, io::stdout()),
+                printed: false,
+                json: json::Totals::default(),
+            }),
             write_error: Mutex::new(None),
-            mode,
+            style,
             format,
+            started: Instant::now(),
         }
     }
 
-    /// Flushes stdout. Returns `Ok(false)` if the reader went away: a closed pipe
+    /// Prints the JSON summary for a search that finished with `summary`, and flushes
+    /// stdout. Returns `Ok(false)` if the reader went away: a closed pipe
     /// (`mtseek foo | head`) is a normal way to stop, not a failure.
-    fn finish(self) -> mtseek_core::Result<bool> {
-        let flushed = self
+    fn finish(self, summary: Option<&Summary>) -> mtseek_core::Result<bool> {
+        let mut out = self
             .out
             .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
-            .flush();
-        let write_error = self
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut write_error = self
             .write_error
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
+        if let (Style::Json, Some(summary), None) = (self.style, summary, &write_error) {
+            let elapsed = self.started.elapsed();
+            if let Err(err) = json::write_summary(&mut out.writer, &out.json, summary, elapsed) {
+                write_error = Some(err);
+            }
+        }
+        let flushed = out.writer.flush();
         match write_error.or_else(|| flushed.err()) {
             None => Ok(true),
             Some(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(false),
@@ -382,7 +549,12 @@ impl Printer {
 impl Report for Printer {
     fn hit(&self, hit: &FileHit<'_>) -> ControlFlow<()> {
         let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
-        match write_hit(&mut *out, hit, self.mode, &self.format) {
+        let out = &mut *out;
+        let written = match self.style {
+            Style::Json => json::write_file(&mut out.writer, hit, &mut out.json),
+            style => write_hit(out, hit, style, &self.format),
+        };
+        match written {
             Ok(()) => ControlFlow::Continue(()),
             Err(err) => {
                 *self
@@ -403,30 +575,53 @@ impl Report for Printer {
     }
 }
 
-fn write_hit(
-    out: &mut impl Write,
-    hit: &FileHit<'_>,
-    mode: Mode,
-    format: &Format,
-) -> io::Result<()> {
+/// Prints one file's results in a text style.
+fn write_hit(out: &mut Out, hit: &FileHit<'_>, style: Style, format: &Format) -> io::Result<()> {
     let path = hit.path.to_string_lossy();
-    if mode == Mode::Files {
-        out.write_all(path.as_bytes())?;
-        return out.write_all(b"\n");
-    }
-    for line in hit.lines {
+    let w = &mut out.writer;
+    let count = match style {
+        Style::Paths => {
+            w.write_all(path.as_bytes())?;
+            return w.write_all(b"\n");
+        }
+        Style::Count => Some(hit.stats.matched_lines),
+        Style::CountMatches => Some(hit.stats.matches),
+        Style::Lines { .. } | Style::Json => None,
+    };
+    if let Some(count) = count {
         if format.with_filename {
-            out.write_all(path.as_bytes())?;
-            out.write_all(b":")?;
+            w.write_all(path.as_bytes())?;
+            w.write_all(b":")?;
+        }
+        return writeln!(w, "{count}");
+    }
+    let context = matches!(style, Style::Lines { context: true });
+    if context && out.printed {
+        w.write_all(b"--\n")?;
+    }
+    out.printed = true;
+    let mut previous: Option<u64> = None;
+    for line in hit.lines {
+        // ripgrep marks a gap between groups of lines with `--`.
+        if context && previous.is_some_and(|p| line.line_number > p + 1) {
+            w.write_all(b"--\n")?;
+        }
+        previous = Some(line.line_number);
+        let sep: &[u8] = if line.context { b"-" } else { b":" };
+        if format.with_filename {
+            w.write_all(path.as_bytes())?;
+            w.write_all(sep)?;
         }
         if format.line_number {
-            write!(out, "{}:", line.line_number)?;
+            write!(w, "{}", line.line_number)?;
+            w.write_all(sep)?;
         }
-        out.write_all(&line.bytes)?;
+        w.write_all(&line.bytes)?;
         if !line.bytes.ends_with(b"\n") {
-            out.write_all(b"\n")?;
+            w.write_all(b"\n")?;
         }
     }
+    let out = w;
     if let (Some(offset), false) = (hit.binary_offset, hit.lines.is_empty()) {
         // ripgrep's exact wording, so line counts and parsers agree.
         writeln!(

@@ -1,6 +1,7 @@
 # 0015: Agents: `--json`, the flags agents use, and an MCP server
 
-**Status:** Proposed, 2026-11-22. First decision of M4. Builds on
+**Status:** Accepted, 2026-11-22. First decision of M4; M4a is built (see
+[As built](#as-built-m4a)). Builds on
 [0005](0005-ripgrep-compatible-contract.md) (ripgrep is the contract),
 [0013](0013-daemon-and-ipc.md) (the pipe protocol) and [0014](0014-service-mode.md) (what a
 caller may see). Amends one dependency rule in [ARCHITECTURE](../ARCHITECTURE.md); see
@@ -53,10 +54,31 @@ speak 2025-11-25. The official Rust SDK (`rmcp`) supports 2026-07-28 only in bet
   - the byte offset of each line
   - the start and end of each match within its line
   - context lines, marked as such
-- **Globs and types on the index path are path predicates**, applied to candidates before
-  verification, with ripgrep's rules: relative to the root as typed, a glob that matches a
-  folder applies to everything inside it, and later globs override earlier ones. They are
-  narrowings in 0012's sense, so an index built without them still answers.
+- **Globs and types follow ripgrep's rules, which aren't only narrowings.** Measured with
+  ripgrep 15 (and pinned by `mtseek-walk`'s unit tests):
+  - A glob is checked before ignore files and hidden names. A file that matches a glob
+    without `!` is searched even if it is ignored or hidden, in every folder the walk enters
+    (`-g '*.log'` finds gitignored logs). With any such glob, other files are left out. A
+    folder that matches a glob without `!` is entered even if ignored or hidden; one that
+    matches a `!` glob is not entered. Later globs win; `--iglob`s come after all `-g`s.
+  - A `-t` type is checked after ignore files but before hidden names, so it lists hidden
+    files of that type. `-T` only leaves files out. Later `-t`/`-T` win.
+  - Globs are relative to the working directory, not the search root: a path inside it is
+    matched without it, any other path whole. The daemon gets the client's working
+    directory and uses it.
+- **On the index path they are a path check** on each candidate, applied before
+  verification with the walker's own matchers (`mtseek-walk`'s `Rules`). The index answers
+  only when it holds every file the rules can list (`mtseek_query::unanswerable`):
+  - a glob without `!` needs an index built with `-uu` (it holds ignored and hidden files),
+    and no glob may name a folder the search wouldn't enter;
+  - a `-t` needs an index that holds hidden files;
+  - `!` globs and `-T` narrow, so any index answers them.
+
+  Otherwise the root is scanned. So does a search with a `!` glob where the index recorded an
+  unreadable folder, since working out which error lines remain isn't worth the code.
+  An index built with default filters therefore scans most glob and type searches. Recording
+  the names of ignored and hidden files in the folders an index enters would let it answer
+  them; that changes the index format and its catch-up, so it gets its own decision.
 - **Out of scope:** `-U` (multiline), `-r` (replace), `-o` (only matching), `--sort`. The
   planner can't yet plan a pattern that spans lines; `-U` searches keep failing with a clear
   error rather than being slow or wrong.
@@ -178,6 +200,29 @@ minutes and leaves files in the cache, so a person decides it (`mtseek --index`)
 - **Benchmark:** `tools/call search` round trips for the benchmark's queries, against `rg`
   and against the CLI through the daemon.
 
+## As built (M4a)
+
+- **Flag combinations, measured against ripgrep 15:**
+  - `-l`, `-c`, `--count-matches` and `--json` override each other; the last one given wins.
+  - `-A` and `-B` win over `-C` whatever the order. A flag given twice takes its last value.
+  - `-m` is the searcher's limit, as in ripgrep: the context after the last allowed match is
+    still printed, a match inside it is printed and counted as a match (`-c -m1 -A2` can
+    count 2), and the searcher gets context and `-m` in every output mode.
+  - With context, `--` separates groups of lines and files.
+- **Match positions** (`--json`, `--count-matches`) are found as ripgrep's printers find them:
+  in the line without its `\n`, an empty match at the very end of a line without a `\n` left
+  out.
+- **`--json` is byte for byte ripgrep's**: per-file messages in ripgrep's field order, the
+  summary's keys sorted. The parity test compares `bytes_printed` too, which is equal only
+  if every message is.
+- **One scanner for both paths.** Context lines, offsets, positions and per-file counts all
+  come from `FileSearcher`'s `Sink`, so the index's verifier reports exactly what the scanner
+  reports. The oracle test covers every output mode, context, `-m` and random globs and
+  types.
+- **Protocol version 2** carries everything above: `SearchParams::version` says which version
+  a search needs, and the CLI runs a search a version 1 daemon can't carry in this process,
+  with the reason in `--stats`.
+
 ## Alternatives considered
 
 - **Only the CLI, no MCP server.** Agents can already shell out to `mtseek`. But each call
@@ -212,3 +257,6 @@ minutes and leaves files in the cache, so a person decides it (`mtseek --index`)
   a note on untrusted file contents.
 - **CI time grows**: more parity cases, run twice (direct and daemon).
 - **Multiline search stays unsupported.** Agents fall back to their own tools for it.
+- **Globs and types are fast only on wide indexes, for now.** With an index built with
+  default filters, `-g '*.rs'` and `-t rust` scan (§2). That is the common agent search, so
+  the follow-up decision on recording ignored and hidden names comes before M4b's benchmark.

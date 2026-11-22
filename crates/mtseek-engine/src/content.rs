@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use mtseek_core::{Error, Filter, Result, Scope};
 use mtseek_index::{CatchUp, Index, Persist, membership};
 use mtseek_query::Viewer;
-use mtseek_walk::{FileHit, Options, Summary};
+use mtseek_walk::{FileHit, Options, Rules};
 
 use crate::{Engine, IndexUse, Open, Outcome, Report, SearchRequest, io_error, ms};
 
@@ -39,10 +39,12 @@ pub(crate) struct View<'a> {
 
 /// Searches each root through the index that covers it, where one can answer exactly, and
 /// scans the rest: no covering index (and `--index` not given), a filter the index doesn't
-/// cover, `--no-index`, a search that follows links, a file, or a path through a junction.
+/// cover, globs or types that list files it doesn't hold, `--no-index`, a search that follows
+/// links, a file, or a path through a junction.
 pub(crate) fn search(
     engine: &mut Engine,
     request: &SearchRequest,
+    rules: &Rules,
     report: &dyn Report,
     view: &View<'_>,
 ) -> Result<Outcome> {
@@ -51,7 +53,7 @@ pub(crate) fn search(
     };
     let filter = request.filter;
     let mut outcome = Outcome::default();
-    let rest = indexed(engine, request, options, report, view, &mut outcome)?;
+    let rest = indexed(engine, request, rules, options, report, view, &mut outcome)?;
     if !rest.is_empty() {
         if view.only_indexed {
             return Err(Error::Declined("a root no index answers".into()));
@@ -64,13 +66,14 @@ pub(crate) fn search(
         let on_error = |err: &Error| report.error(err);
         let scanned = mtseek_walk::scan(
             &scope,
+            rules,
             &request.query,
-            request.mode,
+            request.output,
             options,
             &on_hit,
             &on_error,
         )?;
-        add(&mut outcome.summary, scanned);
+        outcome.summary.add(scanned);
     }
     if !engine.resident {
         // The CLI wrote every change before searching; this only closes the indexes.
@@ -83,6 +86,7 @@ pub(crate) fn search(
 fn indexed(
     engine: &mut Engine,
     request: &SearchRequest,
+    rules: &Rules,
     options: Options,
     report: &dyn Report,
     view: &View<'_>,
@@ -129,7 +133,7 @@ fn indexed(
     let mut rest = Vec::new();
     // First every root's index, opened and caught up, so that a search the service must
     // decline is declined before anything is reported.
-    let routes = run.routes(request, view)?;
+    let routes = run.routes(request, rules, view)?;
     for Route { typed, disk, found } in routes {
         let Some((root, dir)) = found else {
             rest.push(typed.clone());
@@ -145,14 +149,26 @@ fn indexed(
             dir: &dir,
             filter: request.filter,
         };
+        let unanswerable = match mtseek_query::unanswerable(index, target, rules, view.viewer) {
+            Ok(why) => why,
+            Err(err) => return Err(run.discard(&root, err)),
+        };
+        if let Some(why) = unanswerable {
+            if explicit {
+                report.note(&format!("{}: {why}; scanning", typed.display()));
+            }
+            rest.push(typed.clone());
+            continue;
+        }
         let on_hit = |hit: &FileHit<'_>| report.hit(hit);
         let on_error = |err: &Error| report.error(err);
         let searched = Instant::now();
         let result = mtseek_query::search(
             index,
             target,
+            rules,
             &request.query,
-            request.mode,
+            request.output,
             options,
             view.viewer,
             &on_hit,
@@ -163,21 +179,9 @@ fn indexed(
             Err(err @ Error::InvalidPattern(_)) => return Err(err),
             Err(err) => return Err(run.discard(&root, err)),
         };
-        let mut plan = search_stats.plan.to_string();
-        if plan.len() > 300 {
-            let cut = (0..=300).rev().find(|&i| plan.is_char_boundary(i));
-            plan.truncate(cut.unwrap_or(0));
-            plan.push_str("...");
-        }
-        run.stats.push(format!(
-            "{}: {} candidates, {} blocks read, {} matched in {:.1} ms; plan {plan}",
-            typed.display(),
-            search_stats.candidates,
-            search_stats.blocks,
-            found.files_matched,
-            ms(searched.elapsed()),
-        ));
-        add(&mut outcome.summary, found);
+        run.stats
+            .push(search_line(typed, &search_stats, &found, searched));
+        outcome.summary.add(found);
     }
     run.registry.save(&cache, report);
     if !rest.is_empty() && !run.stats.is_empty() {
@@ -187,10 +191,27 @@ fn indexed(
     Ok(rest)
 }
 
-fn add(total: &mut Summary, part: Summary) {
-    total.files_searched += part.files_searched;
-    total.files_matched += part.files_matched;
-    total.errors += part.errors;
+/// The `--stats` line for a search of root `typed` through an index.
+fn search_line(
+    typed: &Path,
+    stats: &mtseek_query::SearchStats,
+    found: &mtseek_walk::Summary,
+    started: Instant,
+) -> String {
+    let mut plan = stats.plan.to_string();
+    if plan.len() > 300 {
+        let cut = (0..=300).rev().find(|&i| plan.is_char_boundary(i));
+        plan.truncate(cut.unwrap_or(0));
+        plan.push_str("...");
+    }
+    format!(
+        "{}: {} candidates, {} blocks read, {} matched in {:.1} ms; plan {plan}",
+        typed.display(),
+        stats.candidates,
+        stats.blocks,
+        found.files_matched,
+        ms(started.elapsed()),
+    )
 }
 
 /// Catches up every open index (see [`Engine::refresh`]).
@@ -346,6 +367,7 @@ impl Run<'_> {
     fn routes<'r>(
         &mut self,
         request: &'r SearchRequest,
+        rules: &Rules,
         view: &View<'r>,
     ) -> Result<Vec<Route<'r>>> {
         let decline = |why: &str| Err(Error::Declined(why.to_owned()));
@@ -369,7 +391,8 @@ impl Run<'_> {
                     filter: request.filter,
                 };
                 if let Some(index) = self.index(root)?
-                    && let Some(why) = mtseek_query::decline_reason(index, target, view.viewer)?
+                    && let Some(why) =
+                        mtseek_query::decline_reason(index, target, rules, view.viewer)?
                 {
                     return decline(why);
                 }

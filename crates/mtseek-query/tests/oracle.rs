@@ -1,21 +1,48 @@
 //! Invariant 2, index = oracle: for any corpus and query, searching through the index reports
-//! exactly what the reference scanner reports. Same files, same lines, same binary warnings.
-//! That holds for every filter the index covers and for searches of its subfolders
-//! (ADR 0012).
+//! exactly what the reference scanner reports. Same files, same lines and context lines with
+//! their offsets and match positions, same counts, same binary warnings. That holds for every
+//! filter the index covers, for searches of its subfolders (ADR 0012), and for glob and type
+//! rules wherever the index says it can answer them (ADR 0015).
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mtseek_core::{CaseMode, Filter, PatternKind, Query, Scope};
+use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Scope, Select, TypeRule};
 use mtseek_index::{Index, membership};
-use mtseek_walk::{FileHit, Mode, Options};
+use mtseek_walk::{FileHit, Mode, Options, Output, Rules};
 use proptest::prelude::*;
 
-/// Per matching file: its lines `(number, bytes)` and the binary offset, if any.
-type Results = BTreeMap<PathBuf, (Vec<(u64, Vec<u8>)>, Option<u64>)>;
+/// One reported line: number, offset, context or not, bytes, match positions.
+type Line = (u64, u64, bool, Vec<u8>, Vec<(usize, usize)>);
+
+/// Per matching file: its lines, the binary offset, and (matching lines, matches).
+type Results = BTreeMap<PathBuf, (Vec<Line>, Option<u64>, (u64, u64))>;
+
+/// How a search is shaped beyond its query and filter.
+#[derive(Debug, Clone)]
+struct Shape {
+    select: Select,
+    output: Output,
+}
+
+impl Shape {
+    fn plain(mode: Mode) -> Self {
+        Self {
+            select: Select::default(),
+            output: mode.into(),
+        }
+    }
+}
+
+thread_local! {
+    /// Rule cases the index answered, and those it left to the scanner, in this test.
+    static ANSWERED: Cell<usize> = const { Cell::new(0) };
+    static LEFT: Cell<usize> = const { Cell::new(0) };
+}
 
 fn collect(
     run: impl FnOnce(
@@ -30,11 +57,20 @@ fn collect(
             let lines = hit
                 .lines
                 .iter()
-                .map(|l| (l.line_number, l.bytes.clone()))
+                .map(|l| {
+                    (
+                        l.line_number,
+                        l.offset,
+                        l.context,
+                        l.bytes.clone(),
+                        l.matches.clone(),
+                    )
+                })
                 .collect();
+            let counts = (hit.stats.matched_lines, hit.stats.matches);
             hits.lock()
                 .expect("not poisoned")
-                .insert(hit.path.to_path_buf(), (lines, hit.binary_offset));
+                .insert(hit.path.to_path_buf(), (lines, hit.binary_offset, counts));
             ControlFlow::Continue(())
         },
         &|err| errors.lock().expect("not poisoned").push(err.to_string()),
@@ -44,13 +80,29 @@ fn collect(
     Ok((hits.into_inner().expect("not poisoned"), errors))
 }
 
+/// Globs are matched relative to the corpus root, as if `rg` ran there.
+fn rules(base: &Path, shape: &Shape) -> Rules {
+    Rules::new(&shape.select, base).expect("the test's rules compile")
+}
+
 fn by_scan(
+    base: &Path,
     scope: &Scope,
     query: &Query,
-    mode: Mode,
+    shape: &Shape,
 ) -> mtseek_core::Result<(Results, Vec<String>)> {
+    let rules = rules(base, shape);
     collect(|on_hit, on_error| {
-        mtseek_walk::scan(scope, query, mode, Options::default(), on_hit, on_error).map(|_| ())
+        mtseek_walk::scan(
+            scope,
+            &rules,
+            query,
+            shape.output,
+            Options::default(),
+            on_hit,
+            on_error,
+        )
+        .map(|_| ())
     })
 }
 
@@ -61,9 +113,10 @@ fn by_index(
     dir: &Path,
     filter: Filter,
     query: &Query,
-    mode: Mode,
+    shape: &Shape,
 ) -> mtseek_core::Result<(Results, Vec<String>)> {
     let root = base.join(dir);
+    let rules = rules(base, shape);
     collect(|on_hit, on_error| {
         let target = mtseek_query::Target {
             root: &root,
@@ -74,8 +127,9 @@ fn by_index(
         mtseek_query::search(
             index,
             target,
+            &rules,
             query,
-            mode,
+            shape.output,
             Options::default(),
             &mtseek_query::Everyone,
             on_hit,
@@ -140,13 +194,22 @@ fn compare(
     dir: &Path,
     filter: Filter,
     query: &Query,
-    mode: Mode,
+    shape: &Shape,
 ) -> Option<String> {
     let scope = Scope::new([base.join(dir)]).with_filter(filter);
-    let expected = by_scan(&scope, query, mode);
-    let actual = by_index(index, base, dir, filter, query, mode);
+    let expected = by_scan(base, &scope, query, shape);
+    let actual = by_index(index, base, dir, filter, query, shape);
+    let counter = match &actual {
+        Err(Error::Declined(_)) => &LEFT,
+        _ => &ANSWERED,
+    };
+    if !shape.select.is_empty() {
+        counter.with(|c| c.set(c.get() + 1));
+    }
     match (expected, actual) {
         (Ok(e), Ok(a)) if e == a => None,
+        // The index says it can't answer these rules exactly; the engine scans instead.
+        (_, Err(Error::Declined(_))) if !shape.select.is_empty() => None,
         (Err(_), Err(_)) => None, // an invalid pattern is invalid either way
         (e, a) => {
             let describe = |r: &mtseek_core::Result<(Results, Vec<String>)>| match r {
@@ -156,7 +219,7 @@ fn compare(
                 Err(e) => format!("error {e}"),
             };
             Some(format!(
-                "{query:?} {mode:?} in {} filter {filter:?} (index {:?})\n  scan:  {}\n  index: {}",
+                "{query:?} {shape:?} in {} filter {filter:?} (index {:?})\n  scan:  {}\n  index: {}",
                 dir.display(),
                 index.coverage(),
                 describe(&e),
@@ -166,17 +229,10 @@ fn compare(
     }
 }
 
-#[test]
-fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
-    let corpus = tempfile::tempdir().unwrap();
-    let spec = mtseek_testkit::CorpusSpec {
-        files: 150,
-        ..Default::default()
-    };
-    mtseek_testkit::generate(corpus.path(), &spec).unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    let queries: Vec<Query> = [
+/// Patterns for the edge-case corpus: every token, case modes, regexes the planner narrows
+/// and ones it can't, an empty pattern and an invalid one.
+fn edge_queries() -> Vec<Query> {
+    [
         (
             mtseek_testkit::tokens::ABSENT,
             PatternKind::Literal,
@@ -233,8 +289,35 @@ fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
         kind,
         case,
     })
-    .collect();
+    .collect()
+}
 
+#[test]
+fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
+    let corpus = tempfile::tempdir().unwrap();
+    let spec = mtseek_testkit::CorpusSpec {
+        files: 150,
+        ..Default::default()
+    };
+    mtseek_testkit::generate(corpus.path(), &spec).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let queries = edge_queries();
+
+    let plain = [Shape::plain(Mode::Files), Shape::plain(Mode::Lines)];
+    let shapes = corpus_shapes();
+    // Outputs and rules don't depend on the pattern's plan: a few queries cover them.
+    let few: Vec<&Query> = queries
+        .iter()
+        .filter(|q| {
+            [
+                mtseek_testkit::tokens::RARE,
+                mtseek_testkit::tokens::NEEDLE,
+                "needle|import",
+            ]
+            .contains(&q.pattern.as_str())
+        })
+        .collect();
     let mut failures = Vec::new();
     // The narrowest and the widest coverage; the widest answers every filter.
     for (name, coverage) in [
@@ -245,16 +328,82 @@ fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
         let index = build(&scope, cache.path(), name);
         for filter in filters(coverage) {
             // The root and a few subfolders: each is a search of its own.
-            for dir in entered(&index, filter).iter().take(4) {
+            for (i, dir) in entered(&index, filter).iter().take(4).enumerate() {
+                let base = corpus.path();
                 for query in &queries {
-                    for mode in [Mode::Files, Mode::Lines] {
-                        failures.extend(compare(&index, corpus.path(), dir, filter, query, mode));
+                    for shape in &plain {
+                        failures.extend(compare(&index, base, dir, filter, query, shape));
+                    }
+                }
+                for query in few.iter().filter(|_| i < 2) {
+                    for shape in &shapes {
+                        failures.extend(compare(&index, base, dir, filter, query, shape));
                     }
                 }
             }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    let (answered, left) = (ANSWERED.with(Cell::get), LEFT.with(Cell::get));
+    assert!(
+        answered > left / 4,
+        "the index answered {answered} rule cases and left {left}: too few to test"
+    );
+}
+
+/// Outputs and rules for the edge-case corpus: every output mode, context, `-m`, and globs
+/// and types that only narrow, that list hidden files, and that list ignored ones (`*.log`
+/// files are ignored in `app/`).
+fn corpus_shapes() -> Vec<Shape> {
+    let globs = |g: &[&str]| Select {
+        globs: g.iter().map(|s| (*s).to_owned()).collect(),
+        ..Select::default()
+    };
+    let types = |t: &[(&str, bool)]| Select {
+        types: t
+            .iter()
+            .map(|&(name, negated)| TypeRule {
+                name: name.to_owned(),
+                negated,
+            })
+            .collect(),
+        ..Select::default()
+    };
+    let mut shapes = vec![
+        Shape::plain(Mode::Count),
+        Shape::plain(Mode::CountMatches),
+        Shape {
+            select: Select::default(),
+            output: Output {
+                mode: Mode::Lines,
+                before: 1,
+                after: 2,
+                max_count: Some(2),
+                positions: true,
+            },
+        },
+    ];
+    for select in [
+        globs(&["*.rs"]),
+        globs(&["!*.md", "!app/tests"]),
+        globs(&["*.log"]),
+        globs(&["app/**", "!*.json"]),
+        Select {
+            iglobs: vec!["*.TXT".into()],
+            ..Select::default()
+        },
+        types(&[("rust", false)]),
+        types(&[("markdown", true), ("json", true)]),
+        types(&[("txt", false), ("txt", true), ("rust", false)]),
+    ] {
+        for mode in [Mode::Files, Mode::Lines] {
+            shapes.push(Shape {
+                select: select.clone(),
+                output: mode.into(),
+            });
+        }
+    }
+    shapes
 }
 
 /// Pieces of file content: case variants (including non-ASCII ones that fold to ASCII),
@@ -264,12 +413,13 @@ const PIECES: &[&str] = &[
     "S", "\u{17F}", " ", "\n", "\r\n", "0", "1", "-", "\0",
 ];
 
-/// One generated file: content, and how it is encoded.
+/// One generated file: content, how it is encoded, and its extension.
 #[derive(Debug, Clone)]
 struct GenFile {
     text: String,
     encoding: u8, // 0 plain, 1 UTF-8 BOM, 2 UTF-16LE BOM, 3 UTF-16BE BOM
     hidden: bool,
+    extension: &'static str,
 }
 
 fn gen_file() -> impl Strategy<Value = GenFile> {
@@ -277,12 +427,65 @@ fn gen_file() -> impl Strategy<Value = GenFile> {
         proptest::collection::vec(proptest::sample::select(PIECES), 0..40),
         prop_oneof![6 => Just(0u8), 1 => Just(1u8), 1 => Just(2u8), 1 => Just(3u8)],
         proptest::bool::weighted(0.15),
+        proptest::sample::select(&["", ".rs", ".txt", ".log"][..]),
     )
-        .prop_map(|(pieces, encoding, hidden)| GenFile {
+        .prop_map(|(pieces, encoding, hidden, extension)| GenFile {
             text: pieces.concat(),
             encoding,
             hidden,
+            extension,
         })
+}
+
+/// Globs and types over the random corpora's names and folders.
+const GLOBS: &[&str] = &[
+    "*.rs", "!*.rs", "f1*", "!sub", "sub/**", "!.hid", ".hid", "deep", "!deep/**", "**/f2*",
+    "*.log", "!*.txt", "node", "*",
+];
+const TYPES: &[(&str, bool)] = &[
+    ("rust", false),
+    ("rust", true),
+    ("txt", false),
+    ("txt", true),
+];
+
+fn gen_shape() -> impl Strategy<Value = Shape> {
+    let select = (
+        proptest::collection::vec(proptest::sample::select(GLOBS), 0..3),
+        proptest::collection::vec(proptest::sample::select(GLOBS), 0..2),
+        proptest::collection::vec(proptest::sample::select(TYPES), 0..3),
+    )
+        .prop_map(|(globs, iglobs, types)| Select {
+            globs: globs.iter().map(|s| (*s).to_owned()).collect(),
+            iglobs: iglobs.iter().map(|s| s.to_uppercase()).collect(),
+            types: types
+                .iter()
+                .map(|&(name, negated)| TypeRule {
+                    name: name.to_owned(),
+                    negated,
+                })
+                .collect(),
+        });
+    let output = (
+        prop_oneof![
+            Just(Mode::Files),
+            Just(Mode::Lines),
+            Just(Mode::Count),
+            Just(Mode::CountMatches)
+        ],
+        0usize..3,
+        0usize..3,
+        proptest::option::of(0u64..3),
+        any::<bool>(),
+    )
+        .prop_map(|(mode, before, after, max_count, positions)| Output {
+            mode,
+            before,
+            after,
+            max_count,
+            positions,
+        });
+    (select, output).prop_map(|(select, output)| Shape { select, output })
 }
 
 fn encode(file: &GenFile) -> Vec<u8> {
@@ -359,10 +562,12 @@ proptest! {
         repo in any::<bool>(),
         coverage in 0u8..4,
         search in (0u8..4, any::<bool>(), any::<prop::sample::Index>()),
+        shapes in proptest::collection::vec(gen_shape(), 1..4),
     ) {
         let corpus = tempfile::tempdir().unwrap();
         for (i, (file, folder)) in files.iter().enumerate() {
-            let name = if file.hidden { format!(".f{i}") } else { format!("f{i}") };
+            let dot = if file.hidden { "." } else { "" };
+            let name = format!("{dot}f{i}{}", file.extension);
             let dir = corpus.path().join(FOLDERS[*folder]);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(name), encode(file)).unwrap();
@@ -388,9 +593,10 @@ proptest! {
         filter.include_binary = binary;
         let dirs = entered(&index, filter);
         let dir = pick.get(&dirs);
+        let plain = [Shape::plain(Mode::Files), Shape::plain(Mode::Lines)];
         for query in &queries {
-            for mode in [Mode::Files, Mode::Lines] {
-                if let Some(failure) = compare(&index, corpus.path(), dir, filter, query, mode) {
+            for shape in plain.iter().chain(&shapes) {
+                if let Some(failure) = compare(&index, corpus.path(), dir, filter, query, shape) {
                     prop_assert!(false, "{}", failure);
                 }
             }
