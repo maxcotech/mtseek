@@ -1,16 +1,23 @@
 //! Keeping the content index current (ADR 0011): an immutable base segment, a delta segment
 //! with every file added or re-read since, and catch-up from the NTFS change journal.
+//!
+//! The CLI writes each new delta to disk before searching it. The daemon keeps it in memory
+//! and writes it later, once changes stop ([`Persist::Later`], ADR 0013), so writing never
+//! adds to a search's time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use mtseek_core::Scope;
 use mtseek_walk::Options;
 
-use crate::build::{Found, list_level, new_build_id, read_file, walk_tree};
+use crate::build::{
+    Found, coverage, is_above, list_level, new_build_id, read_file, repo_of, walk_tree,
+};
 use crate::{
-    Checkpoint, Content, Doc, Entry, IndexError, Location, Meta, Segment, SegmentInfo, StoredError,
-    WriteStats, ntfs,
+    BlockReader, Checkpoint, Content, Doc, Entry, IndexError, Location, Meta, Sd, Segment,
+    SegmentInfo, StoredError, WriteStats, membership, ntfs,
 };
 
 /// A delta holding more files than this (or 1/8 of the base, if more) is folded into a
@@ -25,6 +32,20 @@ pub struct Index {
     base: Segment,
     delta: Option<Segment>,
     base_path: PathBuf,
+    persist: Persist,
+    /// The newest layer's directories, parsed once: every search reads them.
+    dirs: OnceLock<Arc<Vec<Entry>>>,
+}
+
+/// When [`Index::catch_up`] writes the delta it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Persist {
+    /// Write it to disk before returning.
+    #[default]
+    Now,
+    /// Keep it in memory until [`Index::save`]. A crash loses only the memory: the next
+    /// open catches up from the last delta written.
+    Later,
 }
 
 /// What [`Index::catch_up`] did.
@@ -64,7 +85,34 @@ impl Index {
             base,
             delta,
             base_path: base_path.to_path_buf(),
+            persist: Persist::Now,
+            dirs: OnceLock::new(),
         })
+    }
+
+    /// Sets when catch-up writes the delta. The default is [`Persist::Now`].
+    pub fn set_persist(&mut self, persist: Persist) {
+        self.persist = persist;
+    }
+
+    /// Whether the delta holds changes not yet written to disk.
+    pub fn unsaved(&self) -> bool {
+        self.delta.as_ref().is_some_and(Segment::in_memory)
+    }
+
+    /// Writes a delta held in memory to disk, then reads it from there. Returns whether
+    /// there was one.
+    pub fn save(&mut self) -> Result<bool, IndexError> {
+        let Some(bytes) = self.delta.as_ref().and_then(Segment::bytes).cloned() else {
+            return Ok(false);
+        };
+        let path = delta_path(&self.base_path);
+        crate::write_bytes(&path, &bytes).map_err(|source| IndexError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        self.set_delta(Some(Segment::open(&path)?));
+        Ok(true)
     }
 
     /// Builds a fresh base for `scope` at `base_path` and removes any delta.
@@ -81,9 +129,16 @@ impl Index {
                 base,
                 delta: None,
                 base_path: base_path.to_path_buf(),
+                persist: Persist::Now,
+                dirs: OnceLock::new(),
             },
             stats,
         ))
+    }
+
+    /// Where the base segment is.
+    pub fn path(&self) -> &Path {
+        &self.base_path
     }
 
     /// The base segment.
@@ -134,6 +189,50 @@ impl Index {
         self.layers().iter().map(|(s, _)| s.file_bytes()).sum()
     }
 
+    /// The membership bits of folder `dir` (relative to the root): which filters' walks enter
+    /// it. `None` if the walk that built the index doesn't enter it (ADR 0012).
+    pub fn entered(&self, dir: &Path) -> Result<Option<u8>, IndexError> {
+        if dir.as_os_str().is_empty() {
+            return Ok(Some(membership::covered(&self.coverage())));
+        }
+        Ok(self
+            .dirs()?
+            .iter()
+            .find(|e| e.root == 0 && e.path == dir)
+            .map(|e| e.flags))
+    }
+
+    /// The directories the index's walk entered, with their descriptors (newest layer),
+    /// parents before their children. Read once, then kept until the delta changes.
+    pub fn dirs(&self) -> Result<Arc<Vec<Entry>>, IndexError> {
+        if let Some(dirs) = self.dirs.get() {
+            return Ok(Arc::clone(dirs));
+        }
+        let dirs = Arc::new(self.newest().dirs()?);
+        let _ = self.dirs.set(Arc::clone(&dirs));
+        Ok(dirs)
+    }
+
+    /// Replaces the delta, and forgets what was read from the old one.
+    fn set_delta(&mut self, delta: Option<Segment>) {
+        self.delta = delta;
+        self.dirs = OnceLock::new();
+    }
+
+    /// The ignore-control files the index tracks, with their descriptors (newest layer).
+    pub fn controls(&self) -> Result<Vec<Entry>, IndexError> {
+        self.newest().controls()
+    }
+
+    /// The coverage filter the index was built with, read from its key.
+    pub fn coverage(&self) -> mtseek_core::Filter {
+        let key = self.base.key();
+        let mut filter = mtseek_core::Filter::unrestricted(0);
+        filter.respect_ignore_files = !key.contains("ignore files=false");
+        filter.include_hidden = key.contains("hidden=true");
+        filter
+    }
+
     fn newest(&self) -> &Segment {
         self.delta.as_ref().unwrap_or(&self.base)
     }
@@ -145,14 +244,30 @@ impl Index {
         if scope.filter.follow_links {
             return Ok(CatchUp::NeedsRebuild("the scope follows links"));
         }
+        let scope = &Scope {
+            roots: scope.roots.clone(),
+            filter: coverage(scope.filter),
+        };
         let meta = self.meta().clone();
         if meta.checkpoints.is_empty() {
             return Ok(CatchUp::NeedsRebuild("no change journal"));
         }
         let mut records: Vec<(u64, u64)> = Vec::new();
+        // Files whose contents or names may have changed, and files whose permissions did.
+        let mut content: HashSet<u64> = HashSet::new();
+        let mut security: HashSet<u64> = HashSet::new();
         let mut checkpoints = Vec::new();
         for from in &meta.checkpoints {
-            match ntfs::read_journal(from, &mut |frn, parent| records.push((frn, parent))) {
+            let read = ntfs::read_journal(from, &mut |frn, parent, reason| {
+                records.push((frn, parent));
+                if reason & !ntfs::NOT_CONTENT != 0 {
+                    content.insert(frn);
+                }
+                if reason & ntfs::SECURITY_CHANGE != 0 {
+                    security.insert(frn);
+                }
+            });
+            match read {
                 Ok(next) => checkpoints.push(next),
                 Err(ntfs::JournalError::Lost) => {
                     return Ok(CatchUp::NeedsRebuild(
@@ -167,6 +282,11 @@ impl Index {
         if records.is_empty() {
             return Ok(CatchUp::Current { records: 0 });
         }
+        if self.above_changed(scope, &records)? {
+            return Ok(CatchUp::NeedsRebuild(
+                "an ignore file above the indexed folder changed",
+            ));
+        }
         // Most records are about the rest of the drive. Check cheaply before loading paths.
         if records.len() <= MAX_SKIPPED_RECORDS && !self.any_tracked(&records)? {
             return Ok(CatchUp::Current {
@@ -174,16 +294,18 @@ impl Index {
             });
         }
         let mut state = State::load(self)?;
-        let work = state.classify(&records);
+        let mut work = state.classify(&records, &content, &security);
         if work.is_empty() && records.len() <= MAX_SKIPPED_RECORDS {
             return Ok(CatchUp::Current {
                 records: records.len(),
             });
         }
         let mut counts = Stats::default();
+        let permissions = std::mem::take(&mut work.security);
         if let Err(reason) = state.apply(scope, options, work, &mut counts) {
             return Ok(CatchUp::NeedsRebuild(reason));
         }
+        state.refresh_descriptors(scope, &permissions);
         let limit = MAX_DELTA_FILES.max(u64::from(self.base.len()) / 8);
         if state.delta_files() > limit {
             return Ok(CatchUp::NeedsRebuild("many files changed"));
@@ -206,11 +328,88 @@ impl Index {
             tracked.extend((0..segment.len()).map(|id| segment.frn(id)));
         }
         tracked.extend(newest.dirs()?.into_iter().map(|e| e.frn));
-        tracked.extend(newest.controls()?.into_iter().map(|e| e.frn));
+        tracked.extend(
+            newest
+                .controls()?
+                .into_iter()
+                .filter(|e| !is_above(&e.path))
+                .map(|e| e.frn),
+        );
         tracked.remove(&0);
         Ok(records
             .iter()
             .any(|(frn, parent)| tracked.contains(frn) || tracked.contains(parent)))
+    }
+
+    /// Whether a record shows that an ignore source above the root changed (ADR 0012): an
+    /// ignore file there was edited, or a folder above the root (or its `.git\info`) now
+    /// holds other control files than when the index was built. Such a change can alter
+    /// every file's membership, so the caller rebuilds.
+    fn above_changed(&self, scope: &Scope, records: &[(u64, u64)]) -> Result<bool, IndexError> {
+        let above: Vec<Entry> = self
+            .newest()
+            .controls()?
+            .into_iter()
+            .filter(|e| is_above(&e.path))
+            .collect();
+        if above.is_empty() {
+            return Ok(false);
+        }
+        let files: HashSet<u64> = above
+            .iter()
+            .filter(|e| !is_folder_entry(&e.path) && e.frn != 0)
+            .map(|e| e.frn)
+            .collect();
+        let folders: HashMap<u64, &Entry> = above
+            .iter()
+            .filter(|e| is_folder_entry(&e.path) && e.frn != 0)
+            .map(|e| (e.frn, e))
+            .collect();
+        let mut check: Vec<&Entry> = Vec::new();
+        for (frn, parent) in records {
+            if files.contains(frn) {
+                return Ok(true);
+            }
+            if let Some(&folder) = folders.get(parent)
+                && !check.iter().any(|c| c.path == folder.path)
+            {
+                check.push(folder);
+            }
+        }
+        for folder in check {
+            let Some(real) = resolve_above(&scope.roots[folder.root as usize], &folder.path) else {
+                return Ok(true);
+            };
+            let in_info = repo_of(&folder.path).is_some();
+            let wanted = |name: &str| {
+                if in_info {
+                    name.eq_ignore_ascii_case("exclude")
+                } else {
+                    ntfs::is_control(name)
+                }
+            };
+            let Ok(listing) = ntfs::list_dir(&real) else {
+                return Ok(true);
+            };
+            let now: BTreeSet<(String, u64)> = listing
+                .entries
+                .iter()
+                .filter(|e| wanted(&e.name))
+                .map(|e| (e.name.to_ascii_lowercase(), e.frn))
+                .collect();
+            let recorded: BTreeSet<(String, u64)> = above
+                .iter()
+                .filter(|e| e.path.parent() == Some(folder.path.as_path()))
+                .filter_map(|e| {
+                    let name = e.path.file_name()?.to_str()?;
+                    wanted(name).then(|| (name.to_ascii_lowercase(), e.frn))
+                })
+                .collect();
+            if now != recorded {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn write_delta(
@@ -223,47 +422,62 @@ impl Index {
         let mut kept_base = vec![false; self.base.len() as usize];
         let mut docs = Vec::new();
         let mut reader = self.delta.as_ref().map(Segment::block_reader).transpose()?;
+        let mut base_reader = self.base.block_reader()?;
         for ((root, SortPath { path, .. }), live) in state.docs {
             let content = match live.source {
-                Source::Base(id) => {
+                // A base file is kept unless its permissions changed: the descriptor is part
+                // of the file's entry, so the delta then holds a copy with the new one.
+                Source::Base(id) if self.base.descriptor(id) == &live.sd => {
                     kept_base[id as usize] = true;
                     continue;
                 }
+                Source::Base(id) => copy_content(&self.base, &mut base_reader, id)?,
                 Source::New(content) => content,
                 Source::Delta(id) => {
                     let (Some(delta), Some(reader)) = (&self.delta, reader.as_mut()) else {
                         continue;
                     };
-                    match delta.location(id) {
-                        Location::Empty => Content::Stored(Vec::new()),
-                        Location::External => Content::External,
-                        Location::Block { block, offset, len } => {
-                            let raw = reader.read(block)?;
-                            Content::Stored(raw[offset as usize..(offset + len) as usize].to_vec())
-                        }
-                    }
+                    copy_content(delta, reader, id)?
                 }
             };
             docs.push(Doc {
                 root,
                 path,
                 frn: live.frn,
+                flags: live.flags,
                 content,
+                sd: live.sd,
             });
         }
         drop(reader);
+        drop(base_reader);
         let tombstones: Vec<u32> = (0u32..)
             .zip(&kept_base)
             .filter(|&(_, &kept)| !kept)
             .map(|(id, _)| id)
             .collect();
-        let entries = |map: BTreeMap<Key, u64>| -> Vec<Entry> {
-            map.into_iter()
-                .map(|((root, SortPath { path, .. }), frn)| Entry { frn, root, path })
-                .collect()
-        };
-        let dirs = entries(state.dirs);
-        let controls = entries(state.controls);
+        let dirs: Vec<Entry> = state
+            .dirs
+            .into_iter()
+            .map(|((root, SortPath { path, .. }), (frn, flags, sd))| Entry {
+                frn,
+                root,
+                path,
+                flags,
+                sd,
+            })
+            .collect();
+        let controls: Vec<Entry> = state
+            .controls
+            .into_iter()
+            .map(|((root, SortPath { path, .. }), (frn, sd))| Entry {
+                frn,
+                root,
+                path,
+                flags: 0,
+                sd,
+            })
+            .collect();
         let meta = Meta {
             build_id: new_build_id(),
             base_id: self.base.meta().build_id,
@@ -280,12 +494,34 @@ impl Index {
             meta: &meta,
         };
         let path = delta_path(&self.base_path);
+        if self.persist == Persist::Later {
+            let (bytes, _) = crate::segment_bytes(&path, &info, &mut docs, options.thread_count())?;
+            self.set_delta(Some(Segment::from_bytes(&path, bytes.into())?));
+            return Ok(());
+        }
         // Close the old delta first: Windows can't replace a file that is open.
-        self.delta = None;
+        self.set_delta(None);
         crate::write_segment(&path, &info, &mut docs, options.thread_count())?;
-        self.delta = Some(Segment::open(&path)?);
+        self.set_delta(Some(Segment::open(&path)?));
         Ok(())
     }
+}
+
+/// What `segment` holds for file `id`, to write it into a new delta.
+fn copy_content(
+    segment: &Segment,
+    reader: &mut BlockReader<'_>,
+    id: u32,
+) -> Result<Content, IndexError> {
+    Ok(match segment.location(id) {
+        Location::Empty => Content::Stored(Vec::new()),
+        Location::External if segment.flags(id) & membership::UNSTORED != 0 => Content::Unstored,
+        Location::External => Content::External,
+        Location::Block { block, offset, len } => {
+            let raw = reader.read(block)?;
+            Content::Stored(raw[offset as usize..(offset + len) as usize].to_vec())
+        }
+    })
 }
 
 /// Where the delta of the base at `base_path` lives.
@@ -311,6 +547,9 @@ enum Source {
 #[derive(Debug)]
 struct Live {
     frn: u64,
+    /// Membership bits ([`membership::FILTERS`] only).
+    flags: u8,
+    sd: Sd,
     source: Source,
 }
 
@@ -380,11 +619,12 @@ fn make_key(root: u32, path: PathBuf) -> Key {
     (root, SortPath::new(path))
 }
 
-/// The index as an editable set of files, directories, control files and errors.
+/// The index as an editable set of files, directories (FRN, membership bits and
+/// descriptor), control files (FRN and descriptor) and errors.
 struct State {
     docs: BTreeMap<Key, Live>,
-    dirs: BTreeMap<Key, u64>,
-    controls: BTreeMap<Key, u64>,
+    dirs: BTreeMap<Key, (u64, u8, Sd)>,
+    controls: BTreeMap<Key, (u64, Sd)>,
     errors: Vec<StoredError>,
 }
 
@@ -395,13 +635,15 @@ struct Work {
     dirty: BTreeSet<Key>,
     /// Directories whose whole subtree must be walked again.
     rewalk: BTreeSet<Key>,
-    /// FRNs of indexed files that changed in any way.
+    /// FRNs of indexed files whose contents or names may have changed.
     changed: HashSet<u64>,
+    /// FRNs of indexed files, directories and control files whose permissions changed.
+    security: HashSet<u64>,
 }
 
 impl Work {
     fn is_empty(&self) -> bool {
-        self.dirty.is_empty() && self.rewalk.is_empty()
+        self.dirty.is_empty() && self.rewalk.is_empty() && self.security.is_empty()
     }
 }
 
@@ -426,6 +668,8 @@ impl State {
                     make_key(root, path),
                     Live {
                         frn: segment.frn(id),
+                        flags: segment.flags(id) & membership::FILTERS,
+                        sd: segment.descriptor(id).clone(),
                         source,
                     },
                 ));
@@ -435,16 +679,18 @@ impl State {
         docs.sort_by(|a, b| a.0.cmp(&b.0));
         let docs: BTreeMap<Key, Live> = docs.into_iter().collect();
         let newest = index.newest();
-        let map = |entries: Vec<Entry>| -> BTreeMap<Key, u64> {
-            entries
-                .into_iter()
-                .map(|e| (make_key(e.root, e.path), e.frn))
-                .collect()
-        };
         Ok(Self {
             docs,
-            dirs: map(newest.dirs()?),
-            controls: map(newest.controls()?),
+            dirs: newest
+                .dirs()?
+                .into_iter()
+                .map(|e| (make_key(e.root, e.path), (e.frn, e.flags, e.sd)))
+                .collect(),
+            controls: newest
+                .controls()?
+                .into_iter()
+                .map(|e| (make_key(e.root, e.path), (e.frn, e.sd)))
+                .collect(),
             errors: newest.errors().to_vec(),
         })
     }
@@ -457,7 +703,14 @@ impl State {
     }
 
     /// Maps journal records `(frn, parent frn)` to the directories that need looking at.
-    fn classify(&self, records: &[(u64, u64)]) -> Work {
+    /// `content` holds the FRNs with a change other than to permissions, `security` those
+    /// whose permissions changed.
+    fn classify(
+        &self,
+        records: &[(u64, u64)],
+        content: &HashSet<u64>,
+        security: &HashSet<u64>,
+    ) -> Work {
         fn by_frn<'a>(items: impl Iterator<Item = (&'a Key, u64)>) -> HashMap<u64, Vec<&'a Key>> {
             let mut map: HashMap<u64, Vec<&Key>> = HashMap::new();
             for (key, frn) in items {
@@ -468,12 +721,35 @@ impl State {
             map
         }
         let docs = by_frn(self.docs.iter().map(|(k, l)| (k, l.frn)));
-        let dirs = by_frn(self.dirs.iter().map(|(k, &f)| (k, f)));
-        let controls = by_frn(self.controls.iter().map(|(k, &f)| (k, f)));
+        let dirs = by_frn(self.dirs.iter().map(|(k, (f, _, _))| (k, *f)));
+        let controls = by_frn(
+            self.controls
+                .iter()
+                .filter(|(k, _)| !is_above(&k.1))
+                .map(|(k, (f, _))| (k, *f)),
+        );
+        // `.git\info` folders: anything created or renamed in one may be a new `exclude`.
+        let infos = by_frn(
+            self.controls
+                .iter()
+                .filter(|(k, _)| !is_above(&k.1) && is_folder_entry(&k.1))
+                .map(|(k, (f, _))| (k, *f)),
+        );
         let mut work = Work::default();
         for &(frn, parent) in records {
             for key in dirs.get(&parent).into_iter().flatten() {
                 work.dirty.insert((*key).clone());
+            }
+            if security.contains(&frn)
+                && (docs.contains_key(&frn)
+                    || dirs.contains_key(&frn)
+                    || controls.contains_key(&frn))
+            {
+                work.security.insert(frn);
+            }
+            // A change to permissions alone doesn't make a file worth reading again.
+            if !content.contains(&frn) {
+                continue;
             }
             for key in docs.get(&frn).into_iter().flatten() {
                 work.changed.insert(frn);
@@ -485,7 +761,10 @@ impl State {
                 }
             }
             for key in controls.get(&frn).into_iter().flatten() {
-                work.rewalk.insert(parent_of(key));
+                work.rewalk.insert(owner_of(key));
+            }
+            for key in infos.get(&parent).into_iter().flatten() {
+                work.rewalk.insert(owner_of(key));
             }
         }
         work
@@ -503,11 +782,16 @@ impl State {
             dirty,
             rewalk,
             changed,
+            security: _,
         } = work;
         let mut walked: Vec<Key> = Vec::new();
         for key in &rewalk {
-            if !walked.iter().any(|w| is_under(key, w)) {
-                self.rewalk(scope, options, key, stats);
+            if walked.iter().any(|w| is_under(key, w)) {
+                continue;
+            }
+            // A folder the index doesn't hold is settled by its parent's re-listing.
+            if let Some(&(_, within, _)) = self.dirs.get(key) {
+                self.rewalk(scope, options, key, within, stats);
                 walked.push(key.clone());
             }
         }
@@ -551,6 +835,9 @@ impl State {
     ) -> Relisted {
         let (root, dir) = key;
         let full = scope.roots[*root as usize].join(dir);
+        let Some(&(frn_before, within, _)) = self.dirs.get(key) else {
+            return Relisted::Done;
+        };
         let Ok(listing) = ntfs::list_dir(&full) else {
             self.remove_under(key);
             return Relisted::Gone;
@@ -563,11 +850,18 @@ impl State {
             .filter(|e| ntfs::is_control(&e.name))
             .map(|e| (make_key(*root, dir.join(&e.name)), e.frn))
             .collect();
+        // Only the control files of this folder's own listing: `.git\info` and its `exclude`
+        // are tracked under `.git` but belong to the repository's folder.
         let controls_before: BTreeMap<Key, u64> = children(&self.controls, key)
-            .map(|(k, &f)| (k.clone(), f))
+            .filter(|(k, _)| {
+                k.1.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(ntfs::is_control)
+            })
+            .map(|(k, (f, _))| (k.clone(), *f))
             .collect();
-        if self.dirs.get(key) != Some(&listing.frn) || controls_now != controls_before {
-            self.rewalk(scope, options, key, stats);
+        if frn_before != listing.frn || controls_now != controls_before {
+            self.rewalk(scope, options, key, within, stats);
             return Relisted::Walked;
         }
         let frns: HashMap<&str, u64> = listing
@@ -581,20 +875,22 @@ impl State {
                 .and_then(|n| frns.get(n).copied())
                 .unwrap_or(0)
         };
-        let level = list_level(scope, *root as usize, dir);
+        let level = list_level(scope, *root as usize, dir, within);
 
         self.refresh_files(scope, key, &level.files, &frn_of, changed, stats);
+        let listed_files: HashSet<&PathBuf> = level.files.iter().map(|(p, _)| p).collect();
         self.errors.retain(|e| {
             !(e.root == Some(*root)
                 && (e.path == dir.path
                     || (e.path.parent() == Some(&**dir)
                         && !self.dirs.contains_key(&key_of(*root, &e.path))
-                        && !level.files.contains(&e.path))))
+                        && !listed_files.contains(&e.path))))
         });
         self.errors.extend(level.errors);
 
-        // Subdirectories: walk the new or replaced, drop the vanished.
-        let listed_dirs: HashSet<&PathBuf> = level.dirs.iter().collect();
+        // Subdirectories: walk the new, the replaced and those whose membership changed (it
+        // changes for everything under them); drop the vanished.
+        let listed_dirs: HashSet<&PathBuf> = level.dirs.iter().map(|(p, _)| p).collect();
         let vanished: Vec<Key> = children(&self.dirs, key)
             .filter(|(k, _)| !listed_dirs.contains(&k.1.path))
             .map(|(k, _)| k.clone())
@@ -602,11 +898,15 @@ impl State {
         for k in vanished {
             self.remove_under(&k);
         }
-        for path in &level.dirs {
+        for (path, flags) in &level.dirs {
             let sub = key_of(*root, path);
             let frn = frn_of(path);
-            if frn == 0 || self.dirs.get(&sub) != Some(&frn) {
-                self.rewalk(scope, options, &sub, stats);
+            let same = self
+                .dirs
+                .get(&sub)
+                .is_some_and(|&(f, fl, _)| f == frn && fl == *flags);
+            if frn == 0 || !same {
+                self.rewalk(scope, options, &sub, *flags, stats);
             }
         }
         Relisted::Done
@@ -618,13 +918,13 @@ impl State {
         &mut self,
         scope: &Scope,
         key: &Key,
-        listed: &[PathBuf],
+        listed: &[(PathBuf, u8)],
         frn_of: &dyn Fn(&Path) -> u64,
         changed: &HashSet<u64>,
         stats: &mut Stats,
     ) {
         let root = &key.0;
-        let wanted: HashSet<&PathBuf> = listed.iter().collect();
+        let wanted: HashSet<&PathBuf> = listed.iter().map(|(p, _)| p).collect();
         let gone: Vec<Key> = children(&self.docs, key)
             .filter(|(k, _)| !wanted.contains(&k.1.path))
             .map(|(k, _)| k.clone())
@@ -635,24 +935,26 @@ impl State {
         // Errors about these files are recomputed below.
         self.errors
             .retain(|e| !(e.root == Some(*root) && wanted.contains(&e.path)));
-        for path in listed {
+        for (path, flags) in listed {
+            let flags = *flags;
             let frn = frn_of(path);
             let doc_key = key_of(*root, path);
-            let unchanged = self
-                .docs
-                .get(&doc_key)
-                .is_some_and(|l| frn != 0 && l.frn == frn && !changed.contains(&frn));
+            let unchanged = self.docs.get(&doc_key).is_some_and(|l| {
+                frn != 0 && l.frn == frn && l.flags == flags && !changed.contains(&frn)
+            });
             if unchanged {
                 continue;
             }
             stats.read += 1;
             let full = scope.roots[*root as usize].join(path);
             match read_file(&full, scope.filter.include_binary) {
-                Ok((content, frn)) => {
+                Ok((content, frn, sd)) => {
                     self.docs.insert(
                         doc_key,
                         Live {
                             frn,
+                            flags,
+                            sd,
                             source: Source::New(content),
                         },
                     );
@@ -663,38 +965,87 @@ impl State {
                         root: Some(*root),
                         path: path.clone(),
                         message: e.to_string(),
+                        flags,
                     });
                 }
             }
         }
     }
 
-    /// Drops everything under directory `key` and walks it again.
-    fn rewalk(&mut self, scope: &Scope, options: Options, key: &Key, stats: &mut Stats) {
+    /// Drops everything under directory `key` and walks it again. `within` is the membership
+    /// of `key` itself.
+    fn rewalk(
+        &mut self,
+        scope: &Scope,
+        options: Options,
+        key: &Key,
+        within: u8,
+        stats: &mut Stats,
+    ) {
+        // Control entries under `key` that a folder above it owns (a `.git` folder's own
+        // entry, `.git\info` and `exclude`) aren't found again by walking `key`: keep them.
+        let owned_above: Vec<(Key, (u64, Sd))> = self
+            .controls
+            .range(key.clone()..)
+            .take_while(|(k, _)| is_under(k, key))
+            .filter(|(k, _)| !is_above(&k.1) && !is_under(&owner_of(k), key))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         self.remove_under(key);
+        for (k, v) in owned_above {
+            self.controls.insert(k, v);
+        }
         let (root, dir) = key;
         if !scope.roots[*root as usize].join(dir).is_dir() {
             return; // gone: its parent's re-listing (it is dirty too) settles the rest
         }
         stats.walked += 1;
-        let found: Found = walk_tree(scope, *root as usize, dir, options);
+        let found: Found = walk_tree(scope, *root as usize, dir, within, options);
         stats.read += found.docs.len();
         for doc in found.docs {
             self.docs.insert(
                 make_key(doc.root, doc.path),
                 Live {
                     frn: doc.frn,
+                    flags: doc.flags,
+                    sd: doc.sd,
                     source: Source::New(doc.content),
                 },
             );
         }
         for e in found.dirs {
-            self.dirs.insert(make_key(e.root, e.path), e.frn);
+            self.dirs
+                .insert(make_key(e.root, e.path), (e.frn, e.flags, e.sd));
         }
         for e in found.controls {
-            self.controls.insert(make_key(e.root, e.path), e.frn);
+            self.controls
+                .insert(make_key(e.root, e.path), (e.frn, e.sd));
         }
         self.errors.extend(found.errors);
+    }
+
+    /// Reads the descriptor again of every file, directory and control file whose FRN is in
+    /// `frns`: their permissions changed, their contents didn't (ADR 0014).
+    fn refresh_descriptors(&mut self, scope: &Scope, frns: &HashSet<u64>) {
+        if frns.is_empty() {
+            return;
+        }
+        let at = |key: &Key| scope.roots[key.0 as usize].join(&*key.1);
+        for (key, live) in &mut self.docs {
+            if frns.contains(&live.frn) {
+                live.sd = ntfs::descriptor_at(&at(key));
+            }
+        }
+        for (key, (frn, _, sd)) in &mut self.dirs {
+            if frns.contains(frn) {
+                *sd = ntfs::descriptor_at(&at(key));
+            }
+        }
+        for (key, (frn, sd)) in &mut self.controls {
+            if frns.contains(frn) && !is_above(&key.1) && !is_folder_entry(&key.1) {
+                *sd = ntfs::descriptor_at(&at(key));
+            }
+        }
     }
 
     /// Removes directory `key`, and everything under it, from every table.
@@ -728,6 +1079,37 @@ fn is_under(key: &Key, dir: &Key) -> bool {
     key.0 == dir.0 && key.1.starts_with(&*dir.1)
 }
 
+/// The folder whose walk a control entry affects: its repository for `.git\info` and
+/// `exclude`, else its parent.
+fn owner_of(k: &Key) -> Key {
+    match repo_of(&k.1) {
+        Some(repo) => key_of(k.0, repo),
+        None => parent_of(k),
+    }
+}
+
+/// Whether a control entry is a folder: one above the root (`..`, `..\..`) or a `.git\info`.
+fn is_folder_entry(path: &Path) -> bool {
+    matches!(
+        path.components().next_back(),
+        Some(std::path::Component::ParentDir)
+    ) || (repo_of(path).is_some()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("info")))
+}
+
+/// The real path of an entry above the root: `..\..\x` under `C:\a\b\c` is `C:\a\x`.
+fn resolve_above(root: &Path, path: &Path) -> Option<PathBuf> {
+    let up = path
+        .components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count();
+    let rest: PathBuf = path.components().skip(up).collect();
+    Some(root.ancestors().nth(up)?.join(rest))
+}
+
 fn parent_of(k: &Key) -> Key {
     make_key(k.0, k.1.parent().map(Path::to_path_buf).unwrap_or_default())
 }
@@ -743,5 +1125,5 @@ fn children<'a, V>(
 ) -> impl Iterator<Item = (&'a Key, &'a V)> {
     map.range(dir.clone()..)
         .take_while(move |(k, _)| is_under(k, dir))
-        .filter(move |(k, _)| k.1.parent() == Some(&*dir.1))
+        .filter(move |(k, _)| k.1.parent() == Some(&*dir.1) && !is_above(&k.1))
 }

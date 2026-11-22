@@ -1,0 +1,31 @@
+[package]
+name = "mtseek-daemon"
+description = "`mtseekd`: keeps the indexes open and current, and answers searches over a local named pipe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mtseekd"
+path = "src/main.rs"
+
+[dependencies]
+mtseek-core.workspace = true
+mtseek-walk.workspace = true
+mtseek-engine.workspace = true
+mtseek-query.workspace = true
+mtseek-ipc.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mtseek-ntfs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

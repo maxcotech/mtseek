@@ -8,6 +8,11 @@ pub enum Error {
     #[error("invalid pattern: {0}")]
     InvalidPattern(String),
 
+    /// The daemon won't answer this search exactly (ADR 0014 §6). The caller runs it
+    /// itself; nothing was reported yet.
+    #[error("not answered by the daemon: {0}")]
+    Declined(String),
+
     /// An I/O error tied to a specific path.
     #[error("{}: {source}", path.display())]
     Io {

@@ -1,24 +1,28 @@
-//! Opening and reading a segment file.
+//! Opening and reading a segment, from a file or from memory.
 //!
 //! Small sections are read whole when the segment opens and checked there, so the accessors
 //! below can't go out of bounds. Postings and store blocks are read with positioned reads
 //! only when a query needs them, and checked as they are decoded.
+//!
+//! A segment in memory is a delta the daemon hasn't written yet (ADR 0013): the same bytes
+//! a file would hold, so it is checked and read by the same code.
 
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::format::{
     self, BLOCK_LEN, DICT_LEN, DOC_LEN, END_MAGIC, HEADER_LEN, MAGIC, NO_BLOCK, SECTIONS,
     TRAILER_LEN, UTF16_PATH, VERSION, section, u32_at, u64_at,
 };
-use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, StoredError};
+use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, Sd, StoredError};
 
 /// An open segment.
 #[derive(Debug)]
 pub struct Segment {
     path: PathBuf,
-    file: File,
+    file: Storage,
     key: String,
     roots: u32,
     doc_count: u32,
@@ -29,6 +33,7 @@ pub struct Segment {
     errors: Vec<StoredError>,
     tombstones: Vec<u32>,
     meta: Meta,
+    descriptors: Vec<Sd>,
     postings: (u64, u64),
     store: (u64, u64),
     dirs: (u64, u64),
@@ -54,9 +59,63 @@ pub enum Location {
     },
 }
 
+/// Where a segment's bytes are.
+#[derive(Debug)]
+enum Storage {
+    File(File),
+    Memory(Arc<[u8]>),
+}
+
+impl Storage {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        match self {
+            Self::File(file) => read_at(file, buf, offset),
+            Self::Memory(bytes) => {
+                let start = usize::try_from(offset).map_err(|_| io::ErrorKind::UnexpectedEof)?;
+                let part = start
+                    .checked_add(buf.len())
+                    .and_then(|end| bytes.get(start..end))
+                    .ok_or(io::ErrorKind::UnexpectedEof)?;
+                buf.copy_from_slice(part);
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Segment {
     /// Opens and checks the segment at `path`.
     pub fn open(path: &Path) -> Result<Self, IndexError> {
+        let io_err = |source| IndexError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let file = File::open(path).map_err(io_err)?;
+        let file_bytes = file.metadata().map_err(io_err)?.len();
+        Self::load(path, Storage::File(file), file_bytes)
+    }
+
+    /// Checks and opens a segment held in memory: the bytes [`crate::segment_bytes`]
+    /// made. `path` is where it will be written, for error messages.
+    pub fn from_bytes(path: &Path, bytes: Arc<[u8]>) -> Result<Self, IndexError> {
+        let len = bytes.len() as u64;
+        Self::load(path, Storage::Memory(bytes), len)
+    }
+
+    /// Whether the segment is held in memory rather than read from its file.
+    pub fn in_memory(&self) -> bool {
+        matches!(self.file, Storage::Memory(_))
+    }
+
+    /// The bytes of a segment held in memory.
+    pub(crate) fn bytes(&self) -> Option<&Arc<[u8]>> {
+        match &self.file {
+            Storage::Memory(bytes) => Some(bytes),
+            Storage::File(_) => None,
+        }
+    }
+
+    fn load(path: &Path, file: Storage, file_bytes: u64) -> Result<Self, IndexError> {
         let corrupt = |reason| IndexError::Corrupt {
             path: path.to_path_buf(),
             reason,
@@ -65,13 +124,11 @@ impl Segment {
             path: path.to_path_buf(),
             source,
         };
-        let file = File::open(path).map_err(io_err)?;
-        let file_bytes = file.metadata().map_err(io_err)?.len();
         if file_bytes < (HEADER_LEN + TRAILER_LEN) as u64 {
             return Err(corrupt("too short"));
         }
         let mut header = [0u8; HEADER_LEN];
-        read_at(&file, &mut header, 0).map_err(io_err)?;
+        file.read_at(&mut header, 0).map_err(io_err)?;
         if &header[..8] != MAGIC {
             return Err(corrupt("not a content index"));
         }
@@ -86,7 +143,7 @@ impl Segment {
             let (offset, len) = ranges[i];
             let len = usize::try_from(len).map_err(|_| corrupt("section too big"))?;
             let mut buf = vec![0u8; len];
-            read_at(&file, &mut buf, offset).map_err(io_err)?;
+            file.read_at(&mut buf, offset).map_err(io_err)?;
             Ok(buf)
         };
         let key = String::from_utf8(read_section(section::SCOPE)?)
@@ -99,6 +156,8 @@ impl Segment {
         let tombstone_bytes = read_section(section::TOMBSTONES)?;
         let meta =
             format::parse_meta(&read_section(section::META)?).ok_or_else(|| corrupt("bad meta"))?;
+        let descriptors = format::parse_descriptors(&read_section(section::DESCRIPTORS)?)
+            .ok_or_else(|| corrupt("bad descriptors"))?;
 
         if docs.len() as u64 != u64::from(doc_count) * DOC_LEN as u64
             || dictionary.len() as u64 != u64::from(trigram_count) * DICT_LEN as u64
@@ -109,7 +168,7 @@ impl Segment {
         let store = ranges[section::STORE];
         let postings = ranges[section::POSTINGS];
         let block_raw = check_blocks(&blocks, store.1).map_err(corrupt)?;
-        check_docs(&docs, &paths, &block_raw, roots).map_err(corrupt)?;
+        check_docs(&docs, &paths, &block_raw, roots, descriptors.len()).map_err(corrupt)?;
         check_dictionary(&dictionary, doc_count, postings.1).map_err(corrupt)?;
         let errors =
             parse_errors(&error_bytes, error_count, roots).ok_or_else(|| corrupt("bad errors"))?;
@@ -132,6 +191,7 @@ impl Segment {
             errors,
             tombstones,
             meta,
+            descriptors,
             postings,
             store,
             dirs: ranges[section::DIRS],
@@ -199,6 +259,41 @@ impl Segment {
         u64_at(self.doc(doc), 24)
     }
 
+    /// Which filters list `doc`, and whether its stored bytes were cut at a NUL
+    /// ([`crate::membership`]).
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn flags(&self, doc: u32) -> u8 {
+        // Checked when the segment was opened.
+        u8::try_from(u32_at(self.doc(doc), 32)).unwrap_or(0)
+    }
+
+    /// The distinct security descriptors files, directories and control files refer to.
+    pub fn descriptors(&self) -> &[Sd] {
+        &self.descriptors
+    }
+
+    /// The number of `doc`'s security descriptor in [`Segment::descriptors`].
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn descriptor_id(&self, doc: u32) -> u32 {
+        u32_at(self.doc(doc), 36)
+    }
+
+    /// `doc`'s security descriptor (ADR 0014); empty if unknown.
+    ///
+    /// # Panics
+    ///
+    /// If `doc` is not less than [`Segment::len`].
+    pub fn descriptor(&self, doc: u32) -> &Sd {
+        // Checked when the segment was opened.
+        &self.descriptors[self.descriptor_id(doc) as usize]
+    }
+
     /// The root `doc` was found under and its path relative to that root.
     ///
     /// # Panics
@@ -256,12 +351,12 @@ impl Segment {
         };
         let len = usize::try_from(end - start).map_err(|_| corrupt())?;
         let mut bytes = vec![0u8; len];
-        read_at(&self.file, &mut bytes, self.postings.0 + start).map_err(|source| {
-            IndexError::Io {
+        self.file
+            .read_at(&mut bytes, self.postings.0 + start)
+            .map_err(|source| IndexError::Io {
                 path: self.path.clone(),
                 source,
-            }
-        })?;
+            })?;
         let mut ids = Vec::with_capacity(count);
         let mut pos = 0;
         let mut previous = 0u32;
@@ -298,11 +393,13 @@ impl Segment {
             reason: "bad directory or control entries",
         };
         let mut bytes = vec![0u8; usize::try_from(len).map_err(|_| corrupt())?];
-        read_at(&self.file, &mut bytes, offset).map_err(|source| IndexError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        format::parse_entries(&bytes, self.roots).ok_or_else(corrupt)
+        self.file
+            .read_at(&mut bytes, offset)
+            .map_err(|source| IndexError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        format::parse_entries(&bytes, self.roots, &self.descriptors).ok_or_else(corrupt)
     }
 
     fn doc(&self, doc: u32) -> &[u8] {
@@ -345,15 +442,13 @@ impl BlockReader<'_> {
         let entry = segment.blocks.get(at..at + BLOCK_LEN).ok_or_else(corrupt)?;
         let (offset, compressed, raw) = (u64_at(entry, 0), u32_at(entry, 8), u32_at(entry, 12));
         self.compressed.resize(compressed as usize, 0);
-        read_at(
-            &segment.file,
-            &mut self.compressed,
-            segment.store.0 + offset,
-        )
-        .map_err(|source| IndexError::Io {
-            path: segment.path.clone(),
-            source,
-        })?;
+        segment
+            .file
+            .read_at(&mut self.compressed, segment.store.0 + offset)
+            .map_err(|source| IndexError::Io {
+                path: segment.path.clone(),
+                source,
+            })?;
         self.raw.resize(raw as usize, 0);
         let n = self
             .decompressor
@@ -370,10 +465,11 @@ impl BlockReader<'_> {
 const MAX_EAGER_SECTION: u64 = 1 << 32;
 
 /// Reads the trailer and checks that every section lies between header and trailer.
-fn section_ranges(file: &File, file_bytes: u64) -> Result<[(u64, u64); SECTIONS], &'static str> {
+fn section_ranges(file: &Storage, file_bytes: u64) -> Result<[(u64, u64); SECTIONS], &'static str> {
     let mut trailer = [0u8; TRAILER_LEN];
     let data_end = file_bytes - TRAILER_LEN as u64;
-    read_at(file, &mut trailer, data_end).map_err(|_| "unreadable trailer")?;
+    file.read_at(&mut trailer, data_end)
+        .map_err(|_| "unreadable trailer")?;
     if &trailer[SECTIONS * 16..] != END_MAGIC {
         return Err("incomplete");
     }
@@ -413,6 +509,7 @@ fn check_docs(
     paths: &[u8],
     block_raw: &[u32],
     roots: u32,
+    descriptors: usize,
 ) -> Result<(), &'static str> {
     let (entries, _) = docs.as_chunks::<DOC_LEN>();
     for d in entries {
@@ -424,7 +521,11 @@ fn check_docs(
                 .get(b as usize)
                 .is_some_and(|&raw| u64::from(offset) + u64::from(len) <= u64::from(raw)),
         };
-        if !in_block || root >= roots {
+        if !in_block
+            || root >= roots
+            || u32_at(d, 32) > u32::from(u8::MAX)
+            || u32_at(d, 36) as usize >= descriptors
+        {
             return Err("file entry out of bounds");
         }
         let start = path_offset as usize;
@@ -467,6 +568,7 @@ fn parse_errors(mut bytes: &[u8], count: u32, roots: u32) -> Option<Vec<StoredEr
     let mut errors = Vec::new();
     for _ in 0..count {
         let root = u32_at(take(&mut bytes, 4)?, 0);
+        let flags = u8::try_from(u32_at(take(&mut bytes, 4)?, 0)).ok()?;
         let path_len = u32_at(take(&mut bytes, 4)?, 0);
         let path = format::decode_path(
             take(&mut bytes, (path_len & !UTF16_PATH) as usize)?,
@@ -484,6 +586,7 @@ fn parse_errors(mut bytes: &[u8], count: u32, roots: u32) -> Option<Vec<StoredEr
             root,
             path,
             message,
+            flags,
         });
     }
     bytes.is_empty().then_some(errors)

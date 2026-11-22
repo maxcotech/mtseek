@@ -221,6 +221,155 @@ A new file is found by the very next search, and a deleted one is gone from it.
   reference numbers, with no measurable cost. Warm rebuilds take 1.34–1.38 s (M2a: 1.75 s,
   measured once, colder). The first build after the cache had gone cold took 3.35 s.
 
+### 2026-11-21, M3a: coverage roots (`cargo xtask bench --modes files,lines`, 5 timed runs)
+
+Segment format v3 (ADR 0012) adds membership bits to every file, folder and error. At the
+default coverage filter the build walks no more than before. Parity ✓ in all 16 cells; rg
+ran at 637–742 ms, so the machine was quieter than for M2b.
+
+| query | mode | rg | mtseek (scan) | mtseek-index | speedup vs rg |
+|---|---|---:|---:|---:|---:|
+| absent | files | 637 ms | 417 ms | **49 ms** | 12.9× |
+| rare | files | 695 ms | 499 ms | **70 ms** | 9.9× |
+| uncommon | files | 675 ms | 413 ms | **60 ms** | 11.3× |
+| medium | files | 654 ms | 404 ms | **71 ms** | 9.2× |
+| common | files | 742 ms | 395 ms | **88 ms** | 8.5× |
+| icase | files | 643 ms | 397 ms | **63 ms** | 10.2× |
+| regex-lit | files | 689 ms | 400 ms | **70 ms** | 9.8× |
+| regex-nolit | files | 654 ms | 462 ms | 136 ms | 4.8× |
+| absent | lines | 641 ms | 394 ms | **50 ms** | 12.9× |
+| rare | lines | 674 ms | 467 ms | **73 ms** | 9.3× |
+| uncommon | lines | 641 ms | 399 ms | **58 ms** | 11.0× |
+| medium | lines | 664 ms | 420 ms | **70 ms** | 9.4× |
+| common | lines | 730 ms | 490 ms | 155 ms | 4.7× |
+| icase | lines | 638 ms | 405 ms | **69 ms** | 9.3× |
+| regex-lit | lines | 699 ms | 417 ms | **74 ms** | 9.4× |
+| regex-nolit | lines | 654 ms | 441 ms | 131 ms | 5.0× |
+
+13 of 16 cells are under 100 ms. The other three are output volume (`common` lines) and
+the no-literal regex, which verifies the whole store.
+
+**Subfolder searches** were scanned before, because M2 used an index only for the exact
+scope it was built for. Now they are answered from the covering index. The test searched
+`C:\Dev\Signsig` (3,976 files) for `Paystack` with an index of `C:\Dev`, using the release
+build, 5 runs after a warmup:
+
+| | median |
+|---|---:|
+| rg | 177 ms |
+| mtseek `--no-index` | 111 ms |
+| mtseek through the `C:\Dev` index | **25 ms** |
+
+The 25 ms includes opening the index (3.6 ms), catch-up (1.5 ms) and looking up the folder.
+
+**Ignore sources outside the walk** (`.git/info/exclude`, ignore files above the root) are
+tracked since the second M3a step. Catch-up with nothing relevant changed went from
+1.2–1.3 ms to **1.5–1.9 ms** on `C:\Dev` (7 runs, release build). The extra time decodes the
+control-file table to check the folders above the root.
+
+### 2026-11-21, M3b: the daemon (`cargo xtask bench`, 5 timed runs)
+
+New contender `mtseek-daemon`: `mtseekd --console` starts on an empty cache before each
+cell and stops after it. The first run builds the index inside the daemon. The timed runs
+pay for process start (the spawn floor was 17 ms), connecting to the pipe and the search,
+with the index already open and current. Parity ✓ in all 16 cells for every contender.
+rg ran at 620 ms–1.02 s, a noisier machine than for M3a, so compare columns within this
+table. Raw: `bench/results/20261121-162523`.
+
+| query | mode | rg | mtseek (scan) | mtseek-index (direct) | mtseek-daemon | daemon vs rg |
+|---|---|---:|---:|---:|---:|---:|
+| absent | files | 724 ms | 423 ms | **54 ms** | **45 ms** | 16.1× |
+| rare | files | 656 ms | 476 ms | **67 ms** | **53 ms** | 12.4× |
+| uncommon | files | 728 ms | 444 ms | **72 ms** | **45 ms** | 16.2× |
+| medium | files | 678 ms | 444 ms | **72 ms** | **51 ms** | 13.3× |
+| common | files | 784 ms | 420 ms | 113 ms | **98 ms** | 8.0× |
+| icase | files | 638 ms | 465 ms | **65 ms** | **47 ms** | 13.6× |
+| regex-lit | files | 1.02 s | 831 ms | 118 ms | **95 ms** | 10.7× |
+| regex-nolit | files | 747 ms | 441 ms | 126 ms | 130 ms | 5.7× |
+| absent | lines | 620 ms | 417 ms | **58 ms** | **44 ms** | 14.1× |
+| rare | lines | 697 ms | 406 ms | **68 ms** | **47 ms** | 14.8× |
+| uncommon | lines | 630 ms | 418 ms | **60 ms** | **45 ms** | 14.0× |
+| medium | lines | 635 ms | 392 ms | **70 ms** | **55 ms** | 11.5× |
+| common | lines | 739 ms | 429 ms | 116 ms | 141 ms | 5.2× |
+| icase | lines | 682 ms | 395 ms | **71 ms** | **49 ms** | 13.9× |
+| regex-lit | lines | 636 ms | 471 ms | **79 ms** | **57 ms** | 11.2× |
+| regex-nolit | lines | 680 ms | 443 ms | 123 ms | **96 ms** | 7.1× |
+
+Through the daemon, 14 of 16 cells are under 100 ms (direct mode: 11 of 16 in this run).
+On selective queries the daemon saves 14–27 ms a search: no index to open, no journal to
+read on the search path. The two cells over 100 ms:
+
+- `regex-nolit` files (130 ms): verifies the whole store, in either mode.
+- `common` lines (141 ms, 25 ms *slower* than direct): 53,343 matching lines become one JSON
+  notification per file, then are parsed and printed by the CLI. ADR 0013 chose JSON for
+  version 1 and asked for this measurement. A binary frame (or batching lines and sending
+  ready-to-print bytes) is the fix, under a new protocol version.
+
+**Edit latency**: write a file in `C:\Dev`, then search at once for its new content
+(release build, 15 runs each; the script is not committed):
+
+| | median | min–max |
+|---|---:|---:|
+| direct, right after an edit | 74.6 ms | 64.5–89.6 ms |
+| direct, nothing changed | 28.9 ms | 23.8–33.5 ms |
+| daemon, right after an edit | **48.4 ms** | 38.2–56.0 ms |
+| daemon, 400 ms after an edit | 34.7 ms | 28.3–43.5 ms |
+| daemon, nothing changed | **24.0 ms** | 20.6–25.6 ms |
+
+The daemon's catch-up of one edit, from its `--stats`, takes 17–22 ms, against 38–40 ms
+when the delta is written to disk. ADR 0013 guessed about 5 ms. The rest is not I/O: each
+catch-up rebuilds the editable state from all 15,423 paths and re-packs the whole delta.
+Keeping that state resident in the daemon and appending to the delta is the next step for
+edit latency.
+
+### 2026-11-21, M3c: service mode, every search checked against the caller's access (`bench.py`, 5 timed runs)
+
+ADR 0014 checks what each caller may see against the security descriptors the index recorded.
+That happens in direct mode and the console daemon too, with their own token. Secret-looking
+files are now listed but never stored, so each search reads them from disk. To compare like
+with like, this run added M3b (`staging` at `e8dcee5`, built in a worktree) as two more
+contenders: `m3b-index` and `m3b-daemon`. Parity ✓ in all 16 cells for every contender. Raw:
+`bench/results/20261121-191806` (an earlier run, `20261121-191207`, was before the
+visibility-pass fix below).
+
+| query | mode | rg | M3c direct | M3b direct | M3c daemon | M3b daemon |
+|---|---|---:|---:|---:|---:|---:|
+| absent | files | 621 ms | 49 ms | 40 ms | 39 ms | 35 ms |
+| rare | files | 696 ms | 50 ms | 47 ms | 46 ms | 42 ms |
+| uncommon | files | 586 ms | 43 ms | 40 ms | 39 ms | 34 ms |
+| medium | files | 653 ms | 56 ms | 53 ms | 50 ms | 45 ms |
+| common | files | 675 ms | 89 ms | 85 ms | 75 ms | 72 ms |
+| icase | files | 674 ms | 59 ms | 59 ms | 53 ms | 49 ms |
+| regex-lit | files | 658 ms | 54 ms | 51 ms | 48 ms | 45 ms |
+| regex-nolit | files | 653 ms | 101 ms | 100 ms | 99 ms | 93 ms |
+| absent | lines | 632 ms | 45 ms | 39 ms | 36 ms | 34 ms |
+| rare | lines | 607 ms | 50 ms | 47 ms | 45 ms | 43 ms |
+| uncommon | lines | 624 ms | 43 ms | 40 ms | 41 ms | 36 ms |
+| medium | lines | 631 ms | 61 ms | 55 ms | 54 ms | 52 ms |
+| common | lines | 759 ms | 112 ms | 109 ms | 147 ms | 159 ms |
+| icase | lines | 626 ms | 53 ms | 52 ms | 48 ms | 45 ms |
+| regex-lit | lines | 601 ms | 55 ms | 51 ms | 49 ms | 46 ms |
+| regex-nolit | lines | 668 ms | 110 ms | 109 ms | 106 ms | 107 ms |
+
+M3c costs 0–6 ms per search over M3b (about 3 ms typically), in both modes. Where it goes
+(`--stats`, `absent`, direct mode):
+
+- **Secret files read from disk: about 2 ms.** `C:\Dev` has 7 `.env*` files. They are
+  candidates for every search now (31 candidates instead of 24), and each is opened. That is
+  the cost of keeping secrets out of the index (ADR 0012 §4). The same change fixed a gap:
+  files over 256 MiB were never candidates before, so searches through the index missed
+  them.
+- **The visible set: under 1 ms.** The first version took 2 ms, because it parsed the
+  folder table a second time and hashed a descriptor for every folder. Now the open index
+  keeps the parsed folders (the daemon re-parses only after a change), and decisions are
+  looked up by the shared descriptor: one `AccessCheck` per distinct descriptor, of which
+  `C:\Dev` has one.
+
+**Build**: `--reindex` of `C:\Dev` at level 0, release, median of 3, alternating builds:
+1,432 ms (M3c) against 1,300 ms (M3b), +10%. That is one `GetSecurityInfo` per file and one
+extra open per folder, as ADR 0014 expected. On disk: 38.3 MiB for both. The descriptor table
+holds one entry, and each file entry grew by 4 bytes.
+
 ## Pass criteria
 
 1. **Parity**: in files mode, the exact set of matching paths equals rg's

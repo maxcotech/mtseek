@@ -22,10 +22,21 @@ mod write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use build::{build, read_file, scope_key};
-pub use live::{CatchUp, Index, delta_path};
+pub use build::{build, coverage, is_secret, read_file, scope_key};
+pub use live::{CatchUp, Index, Persist, delta_path};
 pub use read::{BlockReader, Location, Segment};
-pub use write::{Content, Doc, SegmentInfo, StoredError, WriteStats, write_segment};
+pub use write::{
+    Content, Doc, SegmentInfo, StoredError, WriteStats, segment_bytes, write_bytes, write_segment,
+};
+
+/// A security descriptor as self-relative bytes (owner, group, DACL, mandatory label), as
+/// the index records it for each file and folder (ADR 0014). Empty when unknown.
+pub type Sd = std::sync::Arc<[u8]>;
+
+/// The empty descriptor: unknown.
+pub fn no_sd() -> Sd {
+    Sd::from(&[][..])
+}
 
 /// A directory or control file the index tracks by file reference number (ADR 0011).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,6 +47,76 @@ pub struct Entry {
     pub root: u32,
     /// Its path relative to that root (empty for the root itself).
     pub path: PathBuf,
+    /// For a directory: the filters whose walk enters it ([`membership`]). 0 for control
+    /// files.
+    pub flags: u8,
+    /// Its security descriptor (ADR 0014).
+    pub sd: Sd,
+}
+
+/// Which walks list an entry (ADR 0012).
+///
+/// An index covers a root at one filter: its *coverage filter*. Every file, directory and
+/// error in it records which of the four combinations of "honour ignore files" and "include
+/// hidden entries" would list it too, as long as that combination lists no more than the
+/// coverage filter does. A search with a narrower filter is then answered from the same index,
+/// exactly. Binary mode (`-uuu`) and following links are not part of this: binary mode reads
+/// [`membership::TRUNCATED`] files from disk, and a search that follows links never uses the
+/// index.
+pub mod membership {
+    use mtseek_core::Filter;
+
+    /// Ignore files honoured, hidden entries skipped: ripgrep's defaults.
+    pub const DEFAULT: u8 = 1;
+    /// Ignore files not honoured, hidden entries skipped (`-u`, `--no-ignore`).
+    pub const NO_IGNORE: u8 = 2;
+    /// Ignore files honoured, hidden entries included (`--hidden`).
+    pub const HIDDEN: u8 = 4;
+    /// Neither (`-uu`).
+    pub const ALL: u8 = 8;
+    /// All four filter bits.
+    pub const FILTERS: u8 = DEFAULT | NO_IGNORE | HIDDEN | ALL;
+    /// Files only: the stored bytes end at a NUL (ripgrep stops reading there unless it
+    /// searches binary files). A binary-mode search reads the file from disk.
+    pub const TRUNCATED: u8 = 16;
+    /// Files only: never read when the index was built, because reading would cost what the
+    /// index mustn't spend in the background (an EFS-encrypted file, a cloud placeholder whose
+    /// data isn't on disk). Read from disk by searches that reach it (ADR 0014).
+    pub const UNSTORED: u8 = 32;
+
+    /// The bit of `filter`'s walk.
+    pub fn bit(filter: &Filter) -> u8 {
+        match (filter.respect_ignore_files, filter.include_hidden) {
+            (true, false) => DEFAULT,
+            (false, false) => NO_IGNORE,
+            (true, true) => HIDDEN,
+            (false, true) => ALL,
+        }
+    }
+
+    /// The bits of every walk that lists no more than `filter`'s walk: the filters an index
+    /// built with `filter` can answer.
+    pub fn covered(filter: &Filter) -> u8 {
+        let mut bits = DEFAULT;
+        if !filter.respect_ignore_files {
+            bits |= NO_IGNORE;
+        }
+        if filter.include_hidden {
+            bits |= HIDDEN;
+        }
+        if !filter.respect_ignore_files && filter.include_hidden {
+            bits |= ALL;
+        }
+        bits
+    }
+
+    /// The filter of walk `bit`, with binary files skipped and links not followed.
+    pub fn filter(bit: u8) -> Filter {
+        let mut f = Filter::unrestricted(0);
+        f.respect_ignore_files = bit & (DEFAULT | HIDDEN) != 0;
+        f.include_hidden = bit & (HIDDEN | ALL) != 0;
+        f
+    }
 }
 
 /// Where a segment is up to date in one drive's change journal.
@@ -151,7 +232,9 @@ mod tests {
             root,
             path: PathBuf::from(path),
             frn: bytes.len() as u64 + 1,
+            flags: membership::DEFAULT,
             content: Content::Stored(bytes.to_vec()),
+            sd: Sd::from(path.as_bytes()),
         }
     }
 
@@ -203,16 +286,27 @@ mod tests {
                 root: 0,
                 path: PathBuf::from("huge"),
                 frn: 99,
+                flags: membership::DEFAULT | membership::ALL,
                 content: Content::External,
+                sd: no_sd(),
+            },
+            Doc {
+                root: 0,
+                path: PathBuf::from("vault"),
+                frn: 98,
+                flags: membership::DEFAULT,
+                content: Content::Unstored,
+                sd: Sd::from(&b"locked"[..]),
             },
         ];
         let errors = vec![StoredError {
             root: Some(0),
             path: PathBuf::from("locked"),
             message: "Access is denied. (os error 5)".into(),
+            flags: membership::NO_IGNORE,
         }];
         let stats = write(&path, 2, &mut docs, &errors);
-        assert_eq!((stats.files, stats.external), (6, 1));
+        assert_eq!((stats.files, stats.external), (7, 2));
 
         let segment = Segment::open(&path).unwrap();
         assert_eq!(segment.key(), "key");
@@ -224,20 +318,30 @@ mod tests {
             (0, "big".into(), Some(big.clone())),
             (0, "empty".into(), Some(Vec::new())),
             (0, "huge".into(), None),
+            (0, "vault".into(), None),
             (0, "z.txt".into(), Some(b"Hello World".to_vec())),
             (1, "b.txt".into(), Some(b"second root".to_vec())),
         ];
         assert_eq!(got, expected);
+        assert_eq!(&**segment.descriptor(0), b"a.txt");
+        assert!(segment.descriptor(3).is_empty());
+        assert_eq!(&**segment.descriptor(4), b"locked");
+        assert_eq!(
+            segment.flags(4) & membership::UNSTORED,
+            membership::UNSTORED
+        );
+        assert_eq!(segment.flags(3) & membership::UNSTORED, 0);
+        assert_eq!(segment.descriptors().len(), 7, "distinct descriptors only");
 
         // "hel" is in a.txt and z.txt (case-folded), "sec" only in b.txt.
         assert_eq!(
             segment.postings(trigram::key(b'H', b'E', b'L')).unwrap(),
-            vec![0, 4]
+            vec![0, 5]
         );
         assert_eq!(segment.count(trigram::key(b'h', b'e', b'l')), 2);
         assert_eq!(
             segment.postings(trigram::key(b's', b'e', b'c')).unwrap(),
-            vec![5]
+            vec![6]
         );
         assert_eq!(
             segment.postings(trigram::key(b'q', b'q', b'q')).unwrap(),
@@ -254,17 +358,23 @@ mod tests {
                 frn: 1,
                 root: 0,
                 path: PathBuf::new(),
+                flags: membership::FILTERS,
+                sd: Sd::from(&b"root"[..]),
             },
             Entry {
                 frn: 2,
                 root: 0,
                 path: PathBuf::from("src"),
+                flags: membership::ALL,
+                sd: no_sd(),
             },
         ];
         let controls = vec![Entry {
             frn: 3,
             root: 0,
             path: PathBuf::from(".gitignore"),
+            flags: 0,
+            sd: Sd::from(&b"root"[..]),
         }];
         let meta = Meta {
             build_id: 10,

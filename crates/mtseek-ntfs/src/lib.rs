@@ -10,6 +10,11 @@
 //!   through a directory handle. Unprivileged records carry no names, only the file's and
 //!   its parent directory's reference numbers.
 //! * [`Directory`] (Windows only): lists a directory with each entry's reference number.
+//! * [`pipe`] (Windows only): the daemon's local named pipe, with its access checks
+//!   (ADR 0013). It lives here because it needs `unsafe` Win32 calls too.
+//! * [`security`] (Windows only): security descriptors, callers' tokens and access checks;
+//!   [`service`] (Windows only): the service control manager and the machine-wide data
+//!   folder (ADR 0014). Here for the same reason.
 //!
 //! All `unsafe` in the project lives in this crate's private `sys` module.
 
@@ -17,7 +22,13 @@ pub mod dir;
 #[cfg(windows)]
 mod journal;
 pub mod mft;
+#[cfg(windows)]
+pub mod pipe;
 pub mod record;
+#[cfg(windows)]
+pub mod security;
+#[cfg(windows)]
+pub mod service;
 #[cfg(windows)]
 mod sys;
 #[cfg(windows)]
@@ -30,7 +41,7 @@ pub use dir::{DirBuffer, Directory};
 pub use journal::{Journal, JournalInfo};
 pub use record::{RecordError, Records, UsnRecord};
 #[cfg(windows)]
-pub use volume::{MftStats, NtfsGeometry, Volume, VolumeError, file_ref, file_ref_of};
+pub use volume::{MftStats, NtfsGeometry, Volume, VolumeError, file_ref, file_ref_of, identity};
 
 /// Splits an NTFS file reference number into (MFT record number, sequence number).
 ///

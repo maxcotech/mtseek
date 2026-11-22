@@ -85,6 +85,23 @@
       "ok_codes": [0, 1],
       "note": "mtseek through its content index (M2). The index is emptied before each cell, so `first` includes building it; the timed runs search the saved index without opening a user file."
     },
+    "mtseek-daemon": {
+      "argv": ["../target/release/mtseek.exe", "--daemon", "--index", "{flags}", "--", "{pattern}", "{root}"],
+      "flags": {
+        "files": ["--files-with-matches"],
+        "lines": ["--line-number", "--no-heading", "--with-filename"],
+        "literal": ["--fixed-strings"],
+        "ignore_case": ["--ignore-case"],
+        "scope:all": ["-uu"]
+      },
+      "env": { "MTSEEK_CACHE_DIR": "mtseek-daemon" },
+      "env_literal": { "MTSEEK_PIPE": "\\\\.\\pipe\\mtseek-bench" },
+      "reset": ["mtseek-daemon"],
+      "serve": ["../target/release/mtseekd.exe", "--console"],
+      "stop": ["../target/release/mtseekd.exe", "--stop"],
+      "ok_codes": [0, 1],
+      "note": "mtseek answered by its daemon (M3b, ADR 0013): `mtseekd --console` is started on an empty cache before each cell and stopped after it, so `first` includes building the index inside the daemon; the timed runs pay process start, the pipe, and the search, with the index already open and current."
+    },
     "csearch": {
       "argv": ["csearch", "{flags}", "{pattern}"],
       "flags": { "files": ["-l"], "lines": ["-n"], "ignore_case": ["-i"] },

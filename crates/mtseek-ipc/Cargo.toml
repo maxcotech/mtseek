@@ -1,0 +1,21 @@
+[package]
+name = "mtseek-ipc"
+description = "The daemon's protocol: newline-delimited JSON-RPC 2.0 messages, framing, version negotiation and a client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mtseek-ntfs.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

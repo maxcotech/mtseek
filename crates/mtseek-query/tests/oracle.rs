@@ -1,5 +1,7 @@
 //! Invariant 2, index = oracle: for any corpus and query, searching through the index reports
 //! exactly what the reference scanner reports. Same files, same lines, same binary warnings.
+//! That holds for every filter the index covers and for searches of its subfolders
+//! (ADR 0012).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mtseek_core::{CaseMode, Filter, PatternKind, Query, Scope};
-use mtseek_index::Index;
+use mtseek_index::{Index, membership};
 use mtseek_walk::{FileHit, Mode, Options};
 use proptest::prelude::*;
 
@@ -52,19 +54,30 @@ fn by_scan(
     })
 }
 
+/// Searches `dir` (relative to the index's root `base`) through the index, with `filter`.
 fn by_index(
     index: &Index,
-    scope: &Scope,
+    base: &Path,
+    dir: &Path,
+    filter: Filter,
     query: &Query,
     mode: Mode,
 ) -> mtseek_core::Result<(Results, Vec<String>)> {
+    let root = base.join(dir);
     collect(|on_hit, on_error| {
+        let target = mtseek_query::Target {
+            root: &root,
+            disk_root: &root,
+            dir,
+            filter,
+        };
         mtseek_query::search(
             index,
-            scope,
+            target,
             query,
             mode,
             Options::default(),
+            &mtseek_query::Everyone,
             on_hit,
             on_error,
         )
@@ -82,10 +95,56 @@ fn build(scope: &Scope, dir: &Path, name: &str) -> Index {
     index
 }
 
-/// Compares both paths for one query; returns a description of any difference.
-fn compare(index: &Index, scope: &Scope, query: &Query, mode: Mode) -> Option<String> {
-    let expected = by_scan(scope, query, mode);
-    let actual = by_index(index, scope, query, mode);
+/// The search filters an index built with `coverage` answers: every covered combination of
+/// ignore files and hidden entries, each with and without binary mode.
+fn filters(coverage: Filter) -> Vec<Filter> {
+    let covered = membership::covered(&coverage);
+    let mut out = Vec::new();
+    for bit in [
+        membership::DEFAULT,
+        membership::NO_IGNORE,
+        membership::HIDDEN,
+        membership::ALL,
+    ] {
+        if covered & bit != 0 {
+            for binary in [false, true] {
+                let mut f = membership::filter(bit);
+                f.include_binary = binary;
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// The folders of the index the walk with `filter` enters, the root first.
+fn entered(index: &Index, filter: Filter) -> Vec<PathBuf> {
+    let bit = membership::bit(&filter);
+    let mut dirs: Vec<PathBuf> = index
+        .base()
+        .dirs()
+        .expect("dirs")
+        .into_iter()
+        .filter(|e| e.flags & bit != 0)
+        .map(|e| e.path)
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Compares the scanner on `base/dir` with the index for one query; returns a description of
+/// any difference.
+fn compare(
+    index: &Index,
+    base: &Path,
+    dir: &Path,
+    filter: Filter,
+    query: &Query,
+    mode: Mode,
+) -> Option<String> {
+    let scope = Scope::new([base.join(dir)]).with_filter(filter);
+    let expected = by_scan(&scope, query, mode);
+    let actual = by_index(index, base, dir, filter, query, mode);
     match (expected, actual) {
         (Ok(e), Ok(a)) if e == a => None,
         (Err(_), Err(_)) => None, // an invalid pattern is invalid either way
@@ -97,8 +156,9 @@ fn compare(index: &Index, scope: &Scope, query: &Query, mode: Mode) -> Option<St
                 Err(e) => format!("error {e}"),
             };
             Some(format!(
-                "{query:?} {mode:?} filter {:?}\n  scan:  {}\n  index: {}",
-                scope.filter,
+                "{query:?} {mode:?} in {} filter {filter:?} (index {:?})\n  scan:  {}\n  index: {}",
+                dir.display(),
+                index.coverage(),
                 describe(&e),
                 describe(&a)
             ))
@@ -176,12 +236,21 @@ fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
     .collect();
 
     let mut failures = Vec::new();
-    for level in 0..=3 {
-        let scope = Scope::new([corpus.path()]).with_filter(Filter::unrestricted(level));
-        let index = build(&scope, cache.path(), &format!("u{level}"));
-        for query in &queries {
-            for mode in [Mode::Files, Mode::Lines] {
-                failures.extend(compare(&index, &scope, query, mode));
+    // The narrowest and the widest coverage; the widest answers every filter.
+    for (name, coverage) in [
+        ("default", Filter::unrestricted(0)),
+        ("all", Filter::unrestricted(2)),
+    ] {
+        let scope = Scope::new([corpus.path()]).with_filter(coverage);
+        let index = build(&scope, cache.path(), name);
+        for filter in filters(coverage) {
+            // The root and a few subfolders: each is a search of its own.
+            for dir in entered(&index, filter).iter().take(4) {
+                for query in &queries {
+                    for mode in [Mode::Files, Mode::Lines] {
+                        failures.extend(compare(&index, corpus.path(), dir, filter, query, mode));
+                    }
+                }
             }
         }
     }
@@ -273,28 +342,55 @@ fn gen_query() -> impl Strategy<Value = Query> {
         })
 }
 
+/// Folders the random corpora put files in; `.git` and `.gitignore` go in the first two.
+const FOLDERS: &[&str] = &["", "sub", "sub/deep", ".hid", "node"];
+const IGNORES: &[&str] = &["f1\n", "deep/\n", "*\n!f2\n", "node\n", ".hid\n", "!.hid\n"];
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(48)
+    ))]
 
     #[test]
     fn the_index_matches_the_scanner_on_random_corpora(
-        files in proptest::collection::vec(gen_file(), 1..12),
+        files in proptest::collection::vec((gen_file(), 0..FOLDERS.len()), 1..12),
         queries in proptest::collection::vec(gen_query(), 1..8),
-        level in 0u8..=3,
+        ignores in proptest::collection::vec((0..2usize, 0..IGNORES.len()), 0..3),
+        repo in any::<bool>(),
+        coverage in 0u8..4,
+        search in (0u8..4, any::<bool>(), any::<prop::sample::Index>()),
     ) {
         let corpus = tempfile::tempdir().unwrap();
-        for (i, file) in files.iter().enumerate() {
+        for (i, (file, folder)) in files.iter().enumerate() {
             let name = if file.hidden { format!(".f{i}") } else { format!("f{i}") };
-            let dir = if i % 3 == 0 { corpus.path().join("sub") } else { corpus.path().to_path_buf() };
+            let dir = corpus.path().join(FOLDERS[*folder]);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(name), encode(file)).unwrap();
         }
+        for (folder, ignore) in &ignores {
+            let dir = corpus.path().join(FOLDERS[*folder]);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".gitignore"), IGNORES[*ignore]).unwrap();
+        }
+        if repo {
+            fs::create_dir_all(corpus.path().join(".git")).unwrap();
+        }
         let cache = tempfile::tempdir().unwrap();
-        let scope = Scope::new([corpus.path()]).with_filter(Filter::unrestricted(level));
+        let coverage = membership::filter(1 << coverage);
+        let scope = Scope::new([corpus.path()]).with_filter(coverage);
         let index = build(&scope, cache.path(), "seg");
+
+        // A filter the index covers, and a folder that filter's walk enters.
+        let (bit, binary, pick) = search;
+        let covered = membership::covered(&coverage);
+        let bit = (0..4).map(|b| 1u8 << ((bit + b) % 4)).find(|b| covered & b != 0).unwrap();
+        let mut filter = membership::filter(bit);
+        filter.include_binary = binary;
+        let dirs = entered(&index, filter);
+        let dir = pick.get(&dirs);
         for query in &queries {
             for mode in [Mode::Files, Mode::Lines] {
-                if let Some(failure) = compare(&index, &scope, query, mode) {
+                if let Some(failure) = compare(&index, corpus.path(), dir, filter, query, mode) {
                     prop_assert!(false, "{}", failure);
                 }
             }

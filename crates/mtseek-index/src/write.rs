@@ -1,4 +1,4 @@
-//! Writing a segment file.
+//! Writing a segment, to a file or into memory.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -8,7 +8,9 @@ use crate::format::{
     self, BLOCK_TARGET, END_MAGIC, HEADER_LEN, MAGIC, NO_BLOCK, SECTIONS, UTF16_PATH, VERSION,
     ZSTD_LEVEL,
 };
-use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, parallel_map, text, trigram};
+use std::collections::HashMap;
+
+use crate::{EXTERNAL_BLOCK, Entry, IndexError, MAX_STORED, Meta, Sd, parallel_map, text, trigram};
 
 /// One file to put in the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +21,13 @@ pub struct Doc {
     pub path: PathBuf,
     /// Its NTFS file reference number, or 0 if unknown (ADR 0011).
     pub frn: u64,
+    /// The filters whose walk lists it ([`crate::membership`]). The writer sets
+    /// [`crate::membership::TRUNCATED`] itself, from the content.
+    pub flags: u8,
     /// What the index holds for it.
     pub content: Content,
+    /// Its security descriptor (ADR 0014).
+    pub sd: Sd,
 }
 
 /// Everything a segment holds besides its files' bytes.
@@ -48,8 +55,13 @@ pub enum Content {
     /// The bytes to store: the file, cut as [`text::stored_len`] allows. At most
     /// [`MAX_STORED`] bytes.
     Stored(Vec<u8>),
-    /// Too big to store. It is read from disk by every query that runs.
+    /// Not stored: too big, or a file whose contents never go into the index
+    /// ([`crate::is_secret`]). It is read from disk by every query that reaches it.
     External,
+    /// Not read at all (an encrypted file, a cloud placeholder): read from disk by queries
+    /// that reach it, like [`Content::External`], and flagged
+    /// [`crate::membership::UNSTORED`].
+    Unstored,
 }
 
 /// A file or directory that couldn't be read while building. Every query reports it again,
@@ -62,6 +74,8 @@ pub struct StoredError {
     pub path: PathBuf,
     /// The error message.
     pub message: String,
+    /// The filters whose walk reports it ([`crate::membership`]).
+    pub flags: u8,
 }
 
 /// Sizes of a written segment.
@@ -91,6 +105,36 @@ pub fn write_segment(
     info: &SegmentInfo<'_>,
     docs: &mut [Doc],
     threads: usize,
+) -> Result<WriteStats, IndexError> {
+    encode(path, info, docs, threads, |header, sections| {
+        write_atomically(path, header, sections)
+    })
+}
+
+/// The bytes [`write_segment`] would write to `path`, kept in memory (ADR 0013: the
+/// daemon's delta before it is written). `path` only names the segment in errors.
+pub fn segment_bytes(
+    path: &Path,
+    info: &SegmentInfo<'_>,
+    docs: &mut [Doc],
+    threads: usize,
+) -> Result<(Vec<u8>, WriteStats), IndexError> {
+    let mut bytes = Vec::new();
+    let stats = encode(path, info, docs, threads, |header, sections| {
+        emit(&mut bytes, header, sections)
+    })?;
+    Ok((bytes, stats))
+}
+
+type Sections<'a> = [&'a [&'a [u8]]; SECTIONS];
+
+/// Builds the sections of a segment and hands them to `sink`, which returns the size.
+fn encode(
+    path: &Path,
+    info: &SegmentInfo<'_>,
+    docs: &mut [Doc],
+    threads: usize,
+    sink: impl FnOnce(&Header, &Sections<'_>) -> io::Result<u64>,
 ) -> Result<WriteStats, IndexError> {
     let fits = |n: usize| u32::try_from(n).map_err(|_| too_big(path));
     let roots = info.roots;
@@ -129,7 +173,8 @@ pub fn write_segment(
     let postings = Postings::build(&per_doc);
     drop(per_doc);
 
-    let packed = pack(docs, path)?;
+    let mut descriptors = Descriptors::default();
+    let packed = pack(docs, path, &mut descriptors)?;
     let compressed = compress(&packed.blocks, threads).map_err(|source| IndexError::Io {
         path: path.to_path_buf(),
         source,
@@ -146,19 +191,20 @@ pub fn write_segment(
     let frames: Vec<&[u8]> = compressed.frames.iter().map(Vec::as_slice).collect();
     let mut dirs = Vec::new();
     for entry in info.dirs {
-        format::put_entry(&mut dirs, entry);
+        format::put_entry(&mut dirs, entry, descriptors.id(&entry.sd));
     }
     let mut controls = Vec::new();
     for entry in info.controls {
-        format::put_entry(&mut controls, entry);
+        format::put_entry(&mut controls, entry, descriptors.id(&entry.sd));
     }
+    let descriptor_bytes = format::put_descriptors(&descriptors.table);
     let tombstones: Vec<u8> = info
         .tombstones
         .iter()
         .flat_map(|t| t.to_le_bytes())
         .collect();
     let meta = format::put_meta(info.meta);
-    let sections: [&[&[u8]]; SECTIONS] = [
+    let sections: Sections<'_> = [
         &[info.key.as_bytes()],
         &[&packed.docs],
         &[&packed.paths],
@@ -171,12 +217,12 @@ pub fn write_segment(
         &[&controls],
         &[&tombstones],
         &[&meta],
+        &[&descriptor_bytes],
     ];
-    let file_bytes =
-        write_atomically(path, &header, &sections).map_err(|source| IndexError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let file_bytes = sink(&header, &sections).map_err(|source| IndexError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(WriteStats {
         files: docs.len() as u64,
         external: packed.external,
@@ -186,6 +232,26 @@ pub fn write_segment(
         postings: postings.count as u64,
         file_bytes,
     })
+}
+
+/// The distinct descriptors of a segment, numbered in order of first use.
+#[derive(Default)]
+struct Descriptors {
+    table: Vec<Sd>,
+    ids: HashMap<Sd, u32>,
+}
+
+impl Descriptors {
+    fn id(&mut self, sd: &Sd) -> u32 {
+        if let Some(&id) = self.ids.get(sd) {
+            return id;
+        }
+        // A segment has far fewer distinct descriptors than files, and files fit in u32.
+        let id = u32::try_from(self.table.len()).unwrap_or(u32::MAX);
+        self.table.push(sd.clone());
+        self.ids.insert(sd.clone(), id);
+        id
+    }
 }
 
 struct Header {
@@ -278,7 +344,11 @@ struct Packed {
 
 /// Packs stored files into blocks of about [`BLOCK_TARGET`] bytes, in order. A file at least
 /// that big gets a block of its own. Takes the bytes out of `docs`.
-fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
+fn pack(
+    docs: &mut [Doc],
+    path: &Path,
+    descriptors: &mut Descriptors,
+) -> Result<Packed, IndexError> {
     let fits = |n: usize| u32::try_from(n).map_err(|_| too_big(path));
     let mut packed = Packed {
         blocks: Vec::new(),
@@ -289,8 +359,17 @@ fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
     };
     let mut current = Vec::new();
     for doc in docs.iter_mut() {
+        use crate::membership::{TRUNCATED, UNSTORED};
+        let (truncated, unstored) = match &doc.content {
+            Content::Stored(bytes) => (text::is_cut(bytes), false),
+            Content::External => (false, false),
+            Content::Unstored => (false, true),
+        };
+        let flags = (doc.flags & !(TRUNCATED | UNSTORED))
+            | if truncated { TRUNCATED } else { 0 }
+            | if unstored { UNSTORED } else { 0 };
         let (block, offset, len) = match &mut doc.content {
-            Content::External => {
+            Content::External | Content::Unstored => {
                 packed.external += 1;
                 (EXTERNAL_BLOCK, 0, 0)
             }
@@ -331,6 +410,12 @@ fn pack(docs: &mut [Doc], path: &Path) -> Result<Packed, IndexError> {
             packed.docs.extend_from_slice(&field.to_le_bytes());
         }
         packed.docs.extend_from_slice(&doc.frn.to_le_bytes());
+        packed
+            .docs
+            .extend_from_slice(&u32::from(flags).to_le_bytes());
+        packed
+            .docs
+            .extend_from_slice(&descriptors.id(&doc.sd).to_le_bytes());
     }
     if !current.is_empty() {
         packed.blocks.push(current);
@@ -377,6 +462,7 @@ fn error_records(errors: &[StoredError]) -> Vec<u8> {
         let message = error.message.as_bytes();
         let message_len = u32::try_from(message.len()).unwrap_or(0);
         out.extend_from_slice(&error.root.unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&u32::from(error.flags).to_le_bytes());
         out.extend_from_slice(&(path_len | if utf16 { UTF16_PATH } else { 0 }).to_le_bytes());
         out.extend_from_slice(&path[..path_len as usize]);
         out.extend_from_slice(&message_len.to_le_bytes());
@@ -387,42 +473,15 @@ fn error_records(errors: &[StoredError]) -> Vec<u8> {
 
 /// Writes header, sections and trailer to a temporary file, flushes it to disk and renames
 /// it over `path`. Returns the file size.
-fn write_atomically(
-    path: &Path,
-    header: &Header,
-    sections: &[&[&[u8]]; SECTIONS],
-) -> io::Result<u64> {
+fn write_atomically(path: &Path, header: &Header, sections: &Sections<'_>) -> io::Result<u64> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let result = (|| {
         let file = File::create(&tmp)?;
         let mut out = BufWriter::with_capacity(1 << 20, file);
-        out.write_all(MAGIC)?;
-        for field in [
-            VERSION,
-            header.roots,
-            header.docs,
-            header.blocks,
-            header.trigrams,
-            header.errors,
-        ] {
-            out.write_all(&field.to_le_bytes())?;
-        }
-        let mut at = HEADER_LEN as u64;
-        let mut table = Vec::with_capacity(SECTIONS * 16);
-        for parts in sections {
-            let len: u64 = parts.iter().map(|p| p.len() as u64).sum();
-            table.extend_from_slice(&at.to_le_bytes());
-            table.extend_from_slice(&len.to_le_bytes());
-            for part in *parts {
-                out.write_all(part)?;
-            }
-            at += len;
-        }
-        out.write_all(&table)?;
-        out.write_all(END_MAGIC)?;
+        let size = emit(&mut out, header, sections)?;
         let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
         file.sync_all()?;
-        Ok(at + table.len() as u64 + END_MAGIC.len() as u64)
+        Ok(size)
     })();
     match result {
         Ok(size) => {
@@ -434,6 +493,52 @@ fn write_atomically(
             Err(e)
         }
     }
+}
+
+/// Writes `bytes` (a segment made by [`segment_bytes`]) to `path` the way
+/// [`write_segment`] does: complete and flushed to disk before it replaces anything.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let result = File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    match result {
+        Ok(()) => std::fs::rename(&tmp, path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Writes header, sections and trailer to `out`. Returns the size.
+fn emit(out: &mut impl Write, header: &Header, sections: &Sections<'_>) -> io::Result<u64> {
+    out.write_all(MAGIC)?;
+    for field in [
+        VERSION,
+        header.roots,
+        header.docs,
+        header.blocks,
+        header.trigrams,
+        header.errors,
+    ] {
+        out.write_all(&field.to_le_bytes())?;
+    }
+    let mut at = HEADER_LEN as u64;
+    let mut table = Vec::with_capacity(SECTIONS * 16);
+    for parts in sections {
+        let len: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        table.extend_from_slice(&at.to_le_bytes());
+        table.extend_from_slice(&len.to_le_bytes());
+        for part in *parts {
+            out.write_all(part)?;
+        }
+        at += len;
+    }
+    out.write_all(&table)?;
+    out.write_all(END_MAGIC)?;
+    Ok(at + table.len() as u64 + END_MAGIC.len() as u64)
 }
 
 fn block_number(n: usize, path: &Path) -> Result<u32, IndexError> {
