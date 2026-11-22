@@ -264,6 +264,7 @@ impl Args {
     fn scope(&self) -> Scope {
         let mut filter = Filter::unrestricted(self.unrestricted);
         filter.respect_ignore_files &= !self.no_ignore;
+        filter.respect_vcs_ignores = !self.no_ignore_vcs;
         filter.include_hidden |= self.hidden;
         filter.follow_links = self.follow;
         let roots = if self.paths.is_empty() {
@@ -316,7 +317,6 @@ impl Args {
                 iglobs: self.iglobs.clone(),
                 types: self.type_rules.clone(),
                 ignore_files: IgnoreFiles {
-                    no_vcs: self.no_ignore_vcs,
                     no_dot: self.no_ignore_dot,
                     no_parent: self.no_ignore_parent,
                     no_global: self.no_ignore_global,

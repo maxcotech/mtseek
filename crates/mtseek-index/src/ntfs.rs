@@ -22,6 +22,22 @@ pub(crate) fn is_control(name: &str) -> bool {
 pub(crate) struct Listed {
     pub(crate) name: String,
     pub(crate) frn: u64,
+    /// Whether it is a folder.
+    pub(crate) dir: bool,
+    /// Whether it is a symbolic link or junction (a name-surrogate reparse point), which
+    /// the walker doesn't list without `-L`. Cloud placeholders are reparse points too, but
+    /// files to the walker.
+    pub(crate) link: bool,
+}
+
+impl Listed {
+    pub(crate) fn is_dir(&self) -> bool {
+        self.dir
+    }
+
+    pub(crate) fn is_link(&self) -> bool {
+        self.link
+    }
 }
 
 /// A directory's own FRN and its entries' names and FRNs.
@@ -62,6 +78,11 @@ mod imp {
     use super::{Checkpoint, File, JournalError, Listed, Listing, Path, Sd, io, no_sd};
     use mtseek_ntfs::{DirBuffer, Directory, Journal, VolumeError};
 
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    /// `IsReparseTagNameSurrogate`: the tag names another file (a link or junction).
+    const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
     pub(crate) fn file_frn(file: &File) -> u64 {
         mtseek_ntfs::file_ref_of(file).unwrap_or(0)
     }
@@ -84,6 +105,10 @@ mod imp {
             .map(|e| Listed {
                 name: e.name,
                 frn: e.file_ref,
+                dir: e.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                // As `std::fs::FileType::is_symlink` decides on Windows.
+                link: e.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    && e.reparse_tag & REPARSE_TAG_NAME_SURROGATE != 0,
             })
             .collect();
         Ok(Listing { frn, entries })
@@ -136,8 +161,20 @@ mod imp {
     }
 
     pub(crate) fn list_dir(path: &Path) -> io::Result<Listing> {
-        let _ = std::fs::read_dir(path)?;
-        Ok(Listing::default())
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            entries.push(super::Listed {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                frn: 0,
+                dir: file_type.is_dir(),
+                link: file_type.is_symlink(),
+            });
+        }
+        Ok(Listing { frn: 0, entries })
     }
 
     pub(crate) fn checkpoint(_: char) -> Option<Checkpoint> {

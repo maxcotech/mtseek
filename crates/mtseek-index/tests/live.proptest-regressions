@@ -8,3 +8,4 @@ cc 57a1a713d0e6eb23353c9ad670d3c03ec2a1a7609dc2f02aea020e0dee9b18db # shrinks to
 cc 8068ad7b5045d45c3a1d2e680bb6804a6c91660d5d17a0a052a5eca4e74404c8 # shrinks to setup = [], batches = [[MakeDir { dir: 2 }], [HideDir { dir: 1, hidden: true }]], which = 2
 cc 727eb762a42507c0dac73022f7381ef2f9155b7d5f598575bce76195fd5ec14b # shrinks to setup = [], batches = [[Above { what: 0 }]], which = 0
 cc fe58a589f2506ea406765115019fdc2dc868a983a4da0eb8ba71b997608f62d6 # shrinks to setup = [Write { dir: 2, file: 0, text: 0 }, MakeGit { dir: 1 }], batches = [([Permit { dir: 0, file: None, dacl: 0 }], 0)], which = 2, later = false
+cc 56ff4563dbb9bb76c252b0940f866df9ca5e369ff3a598de41cae678ab12ab14 # shrinks to setup = [], batches = [([MakeDir { dir: 5 }], 0), ([Permit { dir: 5, file: None, dacl: 0 }], 0)], which = 0, later = false

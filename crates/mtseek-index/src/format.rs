@@ -16,7 +16,7 @@ use crate::{Checkpoint, Entry, Meta, Sd};
 
 pub(crate) const MAGIC: &[u8; 8] = b"MTSKCIDX";
 pub(crate) const END_MAGIC: &[u8; 8] = b"MTSKCEND";
-pub(crate) const VERSION: u32 = 4;
+pub(crate) const VERSION: u32 = 5;
 pub(crate) const HEADER_LEN: usize = 32;
 pub(crate) const SECTIONS: usize = 13;
 pub(crate) const TRAILER_LEN: usize = SECTIONS * 16 + 8;

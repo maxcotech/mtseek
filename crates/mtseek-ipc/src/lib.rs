@@ -14,7 +14,8 @@
 //!   sides ignore fields they don't know. An option that changes what a search reports
 //!   always needs a new version, because a server that ignored it would answer wrongly
 //!   (ADR 0015 §4). Version 2 added context, `-m`, counts, match positions, globs and
-//!   types; [`SearchParams::version`] says which version a search needs.
+//!   types; version 3 `--no-ignore-vcs` (ADR 0016). [`SearchParams::version`] says which
+//!   version a search needs.
 //!
 //! This crate knows nothing about indexes, so clients can depend on it alone. [`client`]
 //! (Windows) connects over the named pipe.
@@ -32,7 +33,7 @@ pub mod base64;
 pub mod client;
 
 /// The newest protocol version this crate speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest protocol version this crate speaks.
 pub const MIN_PROTOCOL: u32 = 1;
 /// A message longer than this is refused (the connection is closed).
@@ -273,6 +274,9 @@ pub struct SearchParams {
     /// Version 2: `-t` and `-T`, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeRule>,
+    /// Version 3: with `ignore_files`, leave out git's ignore files (`--no-ignore-vcs`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_ignore_vcs: bool,
 }
 
 impl SearchParams {
@@ -288,7 +292,13 @@ impl SearchParams {
             || !self.globs.is_empty()
             || !self.iglobs.is_empty()
             || !self.types.is_empty();
-        if v2 { 2 } else { 1 }
+        if self.no_ignore_vcs {
+            3
+        } else if v2 {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -731,6 +741,7 @@ mod tests {
             globs: Vec::new(),
             iglobs: Vec::new(),
             types: Vec::new(),
+            no_ignore_vcs: false,
         }
     }
 
@@ -771,6 +782,7 @@ mod tests {
             not: false,
         };
         assert_eq!(needs(&|p| p.types = vec![rust.clone()]), 2);
+        assert_eq!(needs(&|p| p.no_ignore_vcs = true), 3);
         let mode = serde_json::to_string(&SearchMode::CountMatches).unwrap();
         assert_eq!(mode, r#""count_matches""#);
     }
@@ -904,6 +916,7 @@ mod tests {
                 globs: vec!["*.rs".into(), "!target".into()],
                 iglobs: vec!["*.MD".into()],
                 types: vec![TypeRule { name: "rust".into(), not: true }],
+                no_ignore_vcs: true,
             };
             let mut line = Vec::new();
             super::request(&mut line, &Value::from(1), "search", &request);

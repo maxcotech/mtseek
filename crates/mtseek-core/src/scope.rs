@@ -18,6 +18,10 @@ pub struct Scope {
 pub struct Filter {
     /// Honour `.gitignore`, `.ignore`, `.rgignore` and git excludes (`rg` default; `--no-ignore` turns it off).
     pub respect_ignore_files: bool,
+    /// With `respect_ignore_files`: honour git's own ignore files too, `.gitignore`,
+    /// `.git/info/exclude` and the global excludes file (`--no-ignore-vcs` turns it off,
+    /// leaving `.ignore` and `.rgignore`). Without it, nothing is honoured anyway.
+    pub respect_vcs_ignores: bool,
     /// Include hidden files and directories (`rg --hidden`).
     pub include_hidden: bool,
     /// Search binary files instead of skipping them (`rg --binary`).
@@ -42,6 +46,7 @@ impl Filter {
     pub fn unrestricted(level: u8) -> Self {
         Self {
             respect_ignore_files: level < 1,
+            respect_vcs_ignores: true,
             include_hidden: level >= 2,
             include_binary: level >= 3,
             follow_links: false,
@@ -71,8 +76,6 @@ pub struct Select {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[allow(clippy::struct_excessive_bools)] // each flag maps 1:1 to a ripgrep option
 pub struct IgnoreFiles {
-    /// Skip `.gitignore`, `.git/info/exclude` and git's global excludes (`--no-ignore-vcs`).
-    pub no_vcs: bool,
     /// Skip `.ignore` and `.rgignore` (`--no-ignore-dot`).
     pub no_dot: bool,
     /// Skip ignore files in folders above the search root (`--no-ignore-parent`).
@@ -89,10 +92,9 @@ pub struct IgnoreFiles {
 
 impl IgnoreFiles {
     /// Whether a walk with `filter` and these settings reads exactly the ignore files the
-    /// filter alone reads: the walks a content index records (ADR 0012).
+    /// filter alone reads: the walks a content index records (ADR 0012, 0016).
     pub fn is_standard_for(&self, filter: &Filter) -> bool {
-        let finer =
-            self.no_vcs || self.no_dot || self.no_parent || self.no_global || self.no_exclude;
+        let finer = self.no_dot || self.no_parent || self.no_global || self.no_exclude;
         self.extra.is_empty() && !(filter.respect_ignore_files && finer)
     }
 }
@@ -157,12 +159,12 @@ mod tests {
         let default = Filter::default();
         let no_ignore = Filter::unrestricted(1);
         assert!(IgnoreFiles::default().is_standard_for(&default));
-        let vcs = IgnoreFiles {
-            no_vcs: true,
+        let dot = IgnoreFiles {
+            no_dot: true,
             ..IgnoreFiles::default()
         };
-        assert!(!vcs.is_standard_for(&default));
-        assert!(vcs.is_standard_for(&no_ignore));
+        assert!(!dot.is_standard_for(&default));
+        assert!(dot.is_standard_for(&no_ignore));
         let extra = IgnoreFiles {
             extra: vec![PathBuf::from("x.ignore")],
             ..IgnoreFiles::default()

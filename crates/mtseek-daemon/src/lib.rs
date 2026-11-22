@@ -847,6 +847,7 @@ pub fn search_request(params: &SearchParams) -> SearchRequest {
         roots,
         filter: Filter {
             respect_ignore_files: params.ignore_files,
+            respect_vcs_ignores: !params.no_ignore_vcs,
             include_hidden: params.hidden,
             include_binary: params.binary,
             follow_links: params.follow,
@@ -969,6 +970,7 @@ mod tests {
             globs: Vec::new(),
             iglobs: Vec::new(),
             types: Vec::new(),
+            no_ignore_vcs: false,
         }
     }
 

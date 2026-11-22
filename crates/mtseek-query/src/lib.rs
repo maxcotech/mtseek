@@ -22,7 +22,7 @@
 
 mod plan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -232,12 +232,15 @@ fn answers(index: &Index, target: Target<'_>, rules: &Rules, viewer: &dyn Viewer
 }
 
 /// Why the index can't answer a search of `target` with `rules` exactly, if it can't
-/// (ADR 0015 §2). Without rules it always can.
+/// (ADR 0015 §2, 0016). Without rules it always can.
 ///
-/// * A glob without `!` lists ignored and hidden files in the folders the search enters,
-///   and a `-t` type lists hidden ones: the index must hold them, so its coverage must
-///   include the walk that lists them.
-/// * A glob that names a folder the search wouldn't enter makes the walk enter it.
+/// A glob without `!` lists ignored and hidden files in the folders the search enters, and
+/// a `-t` type lists hidden ones. The index holds them: what its walk lists, and by name
+/// what it leaves out of the folders it enters (ADR 0016). What it can't answer:
+///
+/// * A walk that reads only some ignore files (`--no-ignore-dot`, `--ignore-file`...).
+/// * A glob that names a folder the search wouldn't enter makes the walk enter it, and the
+///   index holds nothing inside.
 /// * A `!` glob can leave out folders the index recorded errors for, or that the caller may
 ///   not list. Those are reported per folder; rather than work out which reports remain,
 ///   such searches are left to the scanner. Both are rare.
@@ -256,21 +259,7 @@ pub fn unanswerable(
         ));
     }
     let bit = membership::bit(&target.filter);
-    let covered = membership::covered(&index.coverage());
-    let widening = rules.widening();
-    let need = match widening {
-        Widening::None => bit,
-        Widening::Hidden => hidden_bit(target.filter),
-        Widening::All => membership::ALL,
-    };
-    if covered & need == 0 {
-        return Ok(Some(if widening == Widening::Hidden {
-            "the index leaves out hidden files, which a -t type can list"
-        } else {
-            "the index leaves out ignored and hidden files, which a glob can list"
-        }));
-    }
-    if widening == Widening::All {
+    if rules.widening() == Widening::All {
         let dirs = index.dirs()?;
         let everywhere = target.dir.as_os_str().is_empty();
         for dir in dirs.iter() {
@@ -314,6 +303,12 @@ struct Listing<'a> {
     rules: &'a Rules,
     bit: u8,
     hidden_bit: u8,
+    /// Whether the index records the walk with hidden files on (`hidden_bit`). If not, the
+    /// walker decides for the files that matter ([`Listing::not_ignored`]).
+    hidden_known: bool,
+    /// What the walk with hidden files on lists in a folder (relative to the search root),
+    /// for the folders the walker was asked about.
+    walked: HashMap<PathBuf, HashSet<std::ffi::OsString>>,
     /// The membership bits of each folder (relative to the index's root), when the rules can
     /// list files the filter alone doesn't.
     dirs: HashMap<PathBuf, u8>,
@@ -336,13 +331,17 @@ impl<'a> Listing<'a> {
                 .map(|d| (d.path.clone(), d.flags))
                 .collect()
         };
+        let root_bits = membership::covered(&index.coverage());
+        let hidden_bit = hidden_bit(target.filter);
         Ok(Self {
             target,
             rules,
             bit: membership::bit(&target.filter),
-            hidden_bit: hidden_bit(target.filter),
+            hidden_bit,
+            hidden_known: root_bits & hidden_bit != 0,
+            walked: HashMap::new(),
             dirs,
-            root_bits: membership::covered(&index.coverage()),
+            root_bits,
             pruned: HashMap::new(),
         })
     }
@@ -363,14 +362,38 @@ impl<'a> Listing<'a> {
         {
             return false;
         }
-        // A file the walk lists is in a folder it enters; for the others, look it up.
+        // A file the walk lists is in a folder it enters; for the others, look it up. Every
+        // file in such a folder is in the index, by name at least (ADR 0016).
         let entered = listed || self.entered(relative.parent());
         let known = Known {
             listed,
-            not_ignored: entered && flags & self.hidden_bit != 0,
-            exists: entered && flags & membership::FILTERS != 0,
+            exists: entered,
         };
-        self.rules.lists(&self.target.root.join(rest), known)
+        let rules = self.rules;
+        let spelled = self.target.root.join(rest);
+        rules.lists(&spelled, known, &mut || self.not_ignored(flags, rest))
+    }
+
+    /// Whether ignore files leave out a file (`rest`, relative to the search root, with
+    /// `flags`) in a folder the search enters, for a `-t` type. From its walk bits if the
+    /// index records the walk with hidden files on; else the walker lists the file's folder,
+    /// one level deep, with hidden files on, as the scanner would (the subtree rule of
+    /// ADR 0012 makes that walk agree with one from the root).
+    fn not_ignored(&mut self, flags: u8, rest: &Path) -> bool {
+        if self.hidden_known {
+            return flags & self.hidden_bit != 0;
+        }
+        let folder = rest.parent().unwrap_or_else(|| Path::new(""));
+        let Some(name) = rest.file_name() else {
+            return false;
+        };
+        if !self.walked.contains_key(folder) {
+            let listed = walk_folder(&self.target.disk_root.join(folder), self.target.filter);
+            self.walked.insert(folder.to_path_buf(), listed);
+        }
+        self.walked
+            .get(folder)
+            .is_some_and(|names| names.contains(name))
     }
 
     /// Whether the search's walk enters folder `dir` (relative to the index's root).
@@ -397,6 +420,37 @@ impl<'a> Listing<'a> {
         self.pruned.insert(rest.to_path_buf(), pruned);
         pruned
     }
+}
+
+/// The names of the files the walk with `filter`, hidden files on, lists directly in
+/// `folder`.
+fn walk_folder(folder: &Path, filter: Filter) -> HashSet<std::ffi::OsString> {
+    let scope = mtseek_core::Scope {
+        roots: vec![folder.to_path_buf()],
+        filter: Filter {
+            include_hidden: true,
+            ..filter
+        },
+    };
+    let names = Mutex::new(HashSet::new());
+    mtseek_walk::list(
+        &scope,
+        Options { threads: 1 },
+        Some(1),
+        &|entry| {
+            if entry.depth == 1
+                && !entry.is_dir
+                && let Some(name) = entry.path.file_name()
+            {
+                names
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.to_os_string());
+            }
+        },
+        &|_| {},
+    );
+    names.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The errors the index recorded that walk `bit` from `target` reports, outside folders the

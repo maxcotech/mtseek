@@ -203,7 +203,7 @@ mod imp {
             // No index answers these walks yet, so the daemon has nothing to add, and the
             // protocol doesn't carry them (ADR 0015, As built).
             return Ok(Answer::Declined(
-                "searches with --no-ignore-vcs, --ignore-file and the like run in this process"
+                "searches with --no-ignore-dot, --ignore-file and the like run in this process"
                     .into(),
             ));
         }
@@ -248,6 +248,8 @@ mod imp {
                     not: t.negated,
                 })
                 .collect(),
+            no_ignore_vcs: request.filter.respect_ignore_files
+                && !request.filter.respect_vcs_ignores,
         };
         let speaks = client.info().protocol;
         if params.version() > speaks {

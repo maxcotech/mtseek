@@ -74,8 +74,16 @@ pub mod membership {
     pub const HIDDEN: u8 = 4;
     /// Neither (`-uu`).
     pub const ALL: u8 = 8;
-    /// All four filter bits.
-    pub const FILTERS: u8 = DEFAULT | NO_IGNORE | HIDDEN | ALL;
+    /// `.ignore` and `.rgignore` honoured, git's ignore files not, hidden entries skipped
+    /// (`--no-ignore-vcs`, ADR 0016).
+    pub const NO_VCS: u8 = 64;
+    /// Like [`NO_VCS`], hidden entries included (`--no-ignore-vcs --hidden`).
+    pub const NO_VCS_HIDDEN: u8 = 128;
+    /// Every walk bit. A file with none is one the index's walk left out (ADR 0016): in a
+    /// folder it enters, never read, listed only by glob and type rules.
+    pub const FILTERS: u8 = DEFAULT | NO_IGNORE | HIDDEN | ALL | NO_VCS | NO_VCS_HIDDEN;
+    /// The walk bits, one per walk.
+    pub const WALKS: [u8; 6] = [DEFAULT, NO_IGNORE, HIDDEN, ALL, NO_VCS, NO_VCS_HIDDEN];
     /// Files only: the stored bytes end at a NUL (ripgrep stops reading there unless it
     /// searches binary files). A binary-mode search reads the file from disk.
     pub const TRUNCATED: u8 = 16;
@@ -86,26 +94,30 @@ pub mod membership {
 
     /// The bit of `filter`'s walk.
     pub fn bit(filter: &Filter) -> u8 {
-        match (filter.respect_ignore_files, filter.include_hidden) {
-            (true, false) => DEFAULT,
-            (false, false) => NO_IGNORE,
-            (true, true) => HIDDEN,
-            (false, true) => ALL,
+        let vcs = filter.respect_vcs_ignores;
+        match (filter.respect_ignore_files, vcs, filter.include_hidden) {
+            (true, true, false) => DEFAULT,
+            (true, true, true) => HIDDEN,
+            (true, false, false) => NO_VCS,
+            (true, false, true) => NO_VCS_HIDDEN,
+            (false, _, false) => NO_IGNORE,
+            (false, _, true) => ALL,
         }
     }
 
     /// The bits of every walk that lists no more than `filter`'s walk: the filters an index
-    /// built with `filter` can answer.
+    /// built with `filter` can answer. `filter` is a coverage filter
+    /// ([`crate::coverage`]): it honours git's ignore files whenever it honours any.
     pub fn covered(filter: &Filter) -> u8 {
         let mut bits = DEFAULT;
         if !filter.respect_ignore_files {
-            bits |= NO_IGNORE;
+            bits |= NO_IGNORE | NO_VCS;
         }
         if filter.include_hidden {
             bits |= HIDDEN;
         }
         if !filter.respect_ignore_files && filter.include_hidden {
-            bits |= ALL;
+            bits |= ALL | NO_VCS_HIDDEN;
         }
         bits
     }
@@ -113,8 +125,9 @@ pub mod membership {
     /// The filter of walk `bit`, with binary files skipped and links not followed.
     pub fn filter(bit: u8) -> Filter {
         let mut f = Filter::unrestricted(0);
-        f.respect_ignore_files = bit & (DEFAULT | HIDDEN) != 0;
-        f.include_hidden = bit & (HIDDEN | ALL) != 0;
+        f.respect_ignore_files = bit & (DEFAULT | HIDDEN | NO_VCS | NO_VCS_HIDDEN) != 0;
+        f.respect_vcs_ignores = bit & (NO_VCS | NO_VCS_HIDDEN) == 0;
+        f.include_hidden = bit & (HIDDEN | ALL | NO_VCS_HIDDEN) != 0;
         f
     }
 }

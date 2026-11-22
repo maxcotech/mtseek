@@ -1,6 +1,7 @@
 # 0016: The index records what its walk leaves out, and the `--no-ignore-vcs` walks
 
-**Status:** Proposed, 2026-11-22. Second decision of M4. Amends
+**Status:** Accepted, 2026-11-22; built (see [As built](#as-built)). Second decision of M4.
+Amends
 [0010](0010-content-index-format.md) (segment format v5), [0011](0011-live-content-index.md)
 (what catch-up keeps current) and [0012](0012-index-coverage.md) (which searches an index
 answers). Follows [0015](0015-agents-json-and-mcp.md) §2.
@@ -105,6 +106,32 @@ to pay for.
   index, and `--no-ignore-vcs` through `--index`.
 - **Benchmark:** `-g '*.rs'`, `-g '*.log'`, `-t ts` and `--no-ignore-vcs` cells on the `dev`
   scope, before and after, and the build time and size of the `dev` index.
+
+## As built
+
+- **Flags stay 8 bits.** `NO_VCS` (64) and `NO_VCS_HIDDEN` (128) take the two free bits,
+  so §4's 16-bit flags weren't needed; a left-out file is a document with no walk bit and
+  `UNSTORED`. The format is still v5: an older index would read left-out documents as
+  unknown, so it is rebuilt.
+- **`--no-ignore-vcs` is part of `Filter`** (`respect_vcs_ignores`), like the other walk
+  settings, rather than a rule beside it. `membership::bit` maps it to its walk, and
+  `coverage` maps a search that skips git's ignore files to an index that honours none, so
+  `--index --no-ignore-vcs` builds or widens a `-u` index.
+- **Links are never left-out names.** A name-surrogate reparse point (symbolic link,
+  junction) isn't a file or folder to the walker without `-L`; a cloud placeholder is a file
+  and is recorded.
+- **Catch-up ignores what changes inside a left-out folder.** Only a folder the walk enters
+  counts as a changed record's parent, so writes into `node_modules`, `bin` or `.git` don't
+  load the index's paths; renaming or deleting the folder itself is seen through its parent.
+  A left-out folder is never re-listed or re-walked, and holds no descriptor.
+- **Measured** before (the M4a build) and after, medians of 11 alternating runs, same
+  output in every cell. On the `dev` tree with a default index: `-g '*.ts'` 405 → 168 ms,
+  `-g '*.cs'` 305 → 118 ms, `-t ts` 557 → 262 ms, `-t cs -n` 338 → 140 ms, plain 85 → 86 ms;
+  the index build 2,208 → 2,186 ms (7 builds each) at 38.0 MiB, with 119 more entries. A
+  `-u` index of all of `dev` (about 1.06 million files) runs out of memory while building,
+  before and after, so `--no-ignore-vcs` was measured on one project (47,716 files under
+  `-u`) with a `-u` index: 2,145 → 336 ms for `-l`, 2,227 → 493 ms for `-n`; `-u` itself
+  200 → 204 ms.
 
 ## Alternatives considered
 

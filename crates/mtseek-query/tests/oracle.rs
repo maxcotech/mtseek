@@ -38,6 +38,10 @@ impl Shape {
     }
 }
 
+/// Why the index may decline a search with rules: a glob names a folder the search
+/// wouldn't enter, or a `!` glob meets a folder the index recorded an error for.
+const LEFT_TO_SCANNER: &[&str] = &["a glob names a folder", "a ! glob may leave out"];
+
 thread_local! {
     /// Rule cases the index answered, and those it left to the scanner, in this test.
     static ANSWERED: Cell<usize> = const { Cell::new(0) };
@@ -154,12 +158,7 @@ fn build(scope: &Scope, dir: &Path, name: &str) -> Index {
 fn filters(coverage: Filter) -> Vec<Filter> {
     let covered = membership::covered(&coverage);
     let mut out = Vec::new();
-    for bit in [
-        membership::DEFAULT,
-        membership::NO_IGNORE,
-        membership::HIDDEN,
-        membership::ALL,
-    ] {
+    for bit in membership::WALKS {
         if covered & bit != 0 {
             for binary in [false, true] {
                 let mut f = membership::filter(bit);
@@ -208,8 +207,12 @@ fn compare(
     }
     match (expected, actual) {
         (Ok(e), Ok(a)) if e == a => None,
-        // The index says it can't answer these rules exactly; the engine scans instead.
-        (_, Err(Error::Declined(_))) if !shape.select.is_empty() => None,
+        // The two cases the index leaves to the scanner (ADR 0016); any other decline fails.
+        (_, Err(Error::Declined(why)))
+            if !shape.select.is_empty() && LEFT_TO_SCANNER.iter().any(|w| why.starts_with(w)) =>
+        {
+            None
+        }
         (Err(_), Err(_)) => None, // an invalid pattern is invalid either way
         (e, a) => {
             let describe = |r: &mtseek_core::Result<(Results, Vec<String>)>| match r {
@@ -346,7 +349,7 @@ fn the_index_matches_the_scanner_on_the_edge_case_corpus() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     let (answered, left) = (ANSWERED.with(Cell::get), LEFT.with(Cell::get));
     assert!(
-        answered > left / 4,
+        answered > left * 4,
         "the index answered {answered} rule cases and left {left}: too few to test"
     );
 }
@@ -562,7 +565,7 @@ proptest! {
         ignores in proptest::collection::vec((0..2usize, 0..IGNORES.len()), 0..3),
         repo in any::<bool>(),
         coverage in 0u8..4,
-        search in (0u8..4, any::<bool>(), any::<prop::sample::Index>()),
+        search in (0u8..6, any::<bool>(), any::<prop::sample::Index>()),
         shapes in proptest::collection::vec(gen_shape(), 1..4),
     ) {
         let corpus = tempfile::tempdir().unwrap();
@@ -589,7 +592,8 @@ proptest! {
         // A filter the index covers, and a folder that filter's walk enters.
         let (bit, binary, pick) = search;
         let covered = membership::covered(&coverage);
-        let bit = (0..4).map(|b| 1u8 << ((bit + b) % 4)).find(|b| covered & b != 0).unwrap();
+        let walks = membership::WALKS;
+        let bit = (0..walks.len()).map(|b| walks[(usize::from(bit) + b) % walks.len()]).find(|b| covered & b != 0).unwrap();
         let mut filter = membership::filter(bit);
         filter.include_binary = binary;
         let dirs = entered(&index, filter);
