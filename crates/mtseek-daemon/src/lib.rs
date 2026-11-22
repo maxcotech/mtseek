@@ -862,6 +862,8 @@ pub fn search_request(params: &SearchParams) -> SearchRequest {
                     negated: t.not,
                 })
                 .collect(),
+            // Version 2 doesn't carry finer ignore settings: clients search those themselves.
+            ignore_files: mtseek_core::IgnoreFiles::default(),
         },
         output: Output {
             mode: match params.mode {

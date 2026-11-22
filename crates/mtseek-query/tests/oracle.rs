@@ -465,6 +465,7 @@ fn gen_shape() -> impl Strategy<Value = Shape> {
                     negated,
                 })
                 .collect(),
+            ignore_files: mtseek_core::IgnoreFiles::default(),
         });
     let output = (
         prop_oneof![

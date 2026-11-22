@@ -199,6 +199,14 @@ mod imp {
         request: &SearchRequest,
         printer: &Printer,
     ) -> Result<Answer, Failure> {
+        if !request.select.ignore_files.is_standard_for(&request.filter) {
+            // No index answers these walks yet, so the daemon has nothing to add, and the
+            // protocol doesn't carry them (ADR 0015, As built).
+            return Ok(Answer::Declined(
+                "searches with --no-ignore-vcs, --ignore-file and the like run in this process"
+                    .into(),
+            ));
+        }
         let cwd = std::env::current_dir()?;
         let params = SearchParams {
             pattern: request.query.pattern.clone(),

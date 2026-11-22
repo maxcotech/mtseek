@@ -31,7 +31,9 @@ use grep_searcher::{
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
 use ignore::{WalkBuilder, WalkState};
-use mtseek_core::{CaseMode, Error, Filter, PatternKind, Query, Result, Scope, Select};
+use mtseek_core::{
+    CaseMode, Error, Filter, IgnoreFiles, PatternKind, Query, Result, Scope, Select,
+};
 
 /// What a search reports for each matching file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -320,11 +322,15 @@ impl FileSearcher {
 ///   `-t` type is searched even if it is hidden. With any `-t`, other files are left out.
 /// * Globs are matched against the path relative to the working directory when it is
 ///   inside it, else against the whole path. Types look at the file name only.
+///
+/// They also carry which ignore files the walk reads, when that isn't all or none
+/// ([`IgnoreFiles`]: `--no-ignore-vcs`, `--ignore-file` and the like).
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
     globs: Option<Override>,
     types: Option<Types>,
     selects_types: bool,
+    ignore_files: IgnoreFiles,
 }
 
 /// What a rule says about a path.
@@ -386,12 +392,18 @@ impl Rules {
             globs,
             types,
             selects_types: select.types.iter().any(|t| !t.negated),
+            ignore_files: select.ignore_files.clone(),
         })
     }
 
     /// Whether there are no rules.
     pub fn is_empty(&self) -> bool {
-        self.globs.is_none() && self.types.is_none()
+        self.globs.is_none() && self.types.is_none() && self.ignore_files == IgnoreFiles::default()
+    }
+
+    /// Which ignore files the walk reads.
+    pub fn ignore_files(&self) -> &IgnoreFiles {
+        &self.ignore_files
     }
 
     /// Which files beyond its filter's a walk with these rules may list.
@@ -507,7 +519,7 @@ pub fn list(
             Err(err) => on_error(&walk_error(err)),
         };
     for (root_index, root) in scope.roots.iter().enumerate() {
-        let mut builder = walk_builder(
+        let (mut builder, _) = walk_builder(
             std::slice::from_ref(root),
             scope.filter,
             &Rules::default(),
@@ -591,52 +603,55 @@ pub fn scan(
         on_error(&err);
     };
 
-    walk_builder(&scope.roots, scope.filter, rules, options)
-        .build_parallel()
-        .run(|| {
-            let matcher = matcher.clone();
-            let mut searcher = FileSearcher::new(scope.filter, output);
-            let report_error = &report_error;
-            let counts = &counts;
-            Box::new(move |entry| {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(err) => {
-                        report_error(walk_error(err));
-                        return WalkState::Continue;
-                    }
-                };
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
+    let (builder, unreadable) = walk_builder(&scope.roots, scope.filter, rules, options);
+    // ripgrep reports an ignore file it can't read and goes on; it doesn't count as an error.
+    for err in unreadable {
+        on_error(&Error::InvalidArgument(err.to_string()));
+    }
+    builder.build_parallel().run(|| {
+        let matcher = matcher.clone();
+        let mut searcher = FileSearcher::new(scope.filter, output);
+        let report_error = &report_error;
+        let counts = &counts;
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    report_error(walk_error(err));
                     return WalkState::Continue;
                 }
-                counts.searched.fetch_add(1, Ordering::Relaxed);
-                let found = match searcher.search_path(&matcher, entry.path()) {
-                    Ok(Some(found)) => found,
-                    Ok(None) => {
-                        counts.add(&searcher.last());
-                        return WalkState::Continue;
-                    }
-                    Err(source) => {
-                        report_error(Error::Io {
-                            path: entry.path().to_path_buf(),
-                            source,
-                        });
-                        return WalkState::Continue;
-                    }
-                };
-                counts.matched.fetch_add(1, Ordering::Relaxed);
-                counts.add(&found.stats);
-                match on_hit(&FileHit {
-                    path: entry.path(),
-                    lines: found.lines,
-                    binary_offset: found.binary_offset,
-                    stats: found.stats,
-                }) {
-                    ControlFlow::Continue(()) => WalkState::Continue,
-                    ControlFlow::Break(()) => WalkState::Quit,
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+            counts.searched.fetch_add(1, Ordering::Relaxed);
+            let found = match searcher.search_path(&matcher, entry.path()) {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    counts.add(&searcher.last());
+                    return WalkState::Continue;
                 }
-            })
-        });
+                Err(source) => {
+                    report_error(Error::Io {
+                        path: entry.path().to_path_buf(),
+                        source,
+                    });
+                    return WalkState::Continue;
+                }
+            };
+            counts.matched.fetch_add(1, Ordering::Relaxed);
+            counts.add(&found.stats);
+            match on_hit(&FileHit {
+                path: entry.path(),
+                lines: found.lines,
+                binary_offset: found.binary_offset,
+                stats: found.stats,
+            }) {
+                ControlFlow::Continue(()) => WalkState::Continue,
+                ControlFlow::Break(()) => WalkState::Quit,
+            }
+        })
+    });
 
     Ok(Summary {
         files_searched: counts.searched.into_inner(),
@@ -672,13 +687,14 @@ fn default_threads() -> usize {
         .min(12)
 }
 
-/// The walk ripgrep does for these roots, filter and rules.
+/// The walk ripgrep does for these roots, filter and rules, and the errors of `--ignore-file`
+/// files it couldn't read.
 fn walk_builder(
     roots: &[std::path::PathBuf],
     filter: Filter,
     rules: &Rules,
     options: Options,
-) -> WalkBuilder {
+) -> (WalkBuilder, Vec<ignore::Error>) {
     let mut roots = roots.iter();
     let mut builder =
         WalkBuilder::new(roots.next().map_or_else(|| Path::new("."), |p| p.as_path()));
@@ -690,16 +706,31 @@ fn walk_builder(
         .hidden(!filter.include_hidden)
         .follow_links(filter.follow_links)
         .threads(options.thread_count());
+    let ignore = &rules.ignore_files;
     if filter.respect_ignore_files {
-        builder.add_custom_ignore_filename(".rgignore");
+        // As ripgrep maps its `--no-ignore-*` flags onto the walker.
+        builder
+            .parents(!ignore.no_parent)
+            .ignore(!ignore.no_dot)
+            .git_global(!ignore.no_vcs && !ignore.no_global)
+            .git_ignore(!ignore.no_vcs)
+            .git_exclude(!ignore.no_vcs && !ignore.no_exclude);
+        if !ignore.no_dot {
+            builder.add_custom_ignore_filename(".rgignore");
+        }
     }
+    let unreadable = ignore
+        .extra
+        .iter()
+        .filter_map(|path| builder.add_ignore(path))
+        .collect();
     if let Some(globs) = &rules.globs {
         builder.overrides(globs.clone());
     }
     if let Some(types) = &rules.types {
         builder.types(types.clone());
     }
-    builder
+    (builder, unreadable)
 }
 
 fn searcher(filter: Filter, output: Output) -> Searcher {
@@ -1166,6 +1197,7 @@ mod tests {
                     negated,
                 })
                 .collect(),
+            ignore_files: IgnoreFiles::default(),
         }
     }
 

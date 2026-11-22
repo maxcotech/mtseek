@@ -93,17 +93,7 @@ fn indexed(
     outcome: &mut Outcome,
 ) -> Result<Vec<PathBuf>> {
     let explicit = request.index.explicit();
-    let decline = |why: &str| Err(Error::Declined(why.to_owned()));
-    if view.only_indexed && (request.index == IndexUse::Off || request.filter.follow_links) {
-        return decline("the search doesn't use the content index");
-    }
-    if request.index == IndexUse::Off {
-        return Ok(request.roots.clone());
-    }
-    if request.filter.follow_links {
-        if explicit {
-            report.note("searches that follow links (-L) don't use the content index; scanning");
-        }
+    if !uses_index(request, report, view)? {
         return Ok(request.roots.clone());
     }
     let Some(cache) = engine.cache.clone() else {
@@ -189,6 +179,34 @@ fn indexed(
             .push(format!("{} root(s) scanned instead", rest.len()));
     }
     Ok(rest)
+}
+
+/// Whether a search may use content indexes at all. For the service, [`Error::Declined`]
+/// if it may not.
+fn uses_index(request: &SearchRequest, report: &dyn Report, view: &View<'_>) -> Result<bool> {
+    let why = if request.index == IndexUse::Off {
+        None
+    } else if request.filter.follow_links {
+        Some("searches that follow links (-L) don't use the content index; scanning")
+    } else if !request.select.ignore_files.is_standard_for(&request.filter) {
+        // No index records a walk that reads only some ignore files.
+        Some(
+            "--no-ignore-vcs, --ignore-file and the like don't use the content index yet; scanning",
+        )
+    } else {
+        return Ok(true);
+    };
+    if view.only_indexed {
+        return Err(Error::Declined(
+            "the search doesn't use the content index".to_owned(),
+        ));
+    }
+    if let Some(why) = why
+        && request.index.explicit()
+    {
+        report.note(why);
+    }
+    Ok(false)
 }
 
 /// The `--stats` line for a search of root `typed` through an index.
