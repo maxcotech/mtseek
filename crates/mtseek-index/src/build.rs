@@ -19,9 +19,13 @@ use crate::{
 
 /// The filter an index is built with for a search with `filter` (ADR 0012): the same
 /// ignore-file and hidden settings, binary files skipped (binary-mode searches read cut files
-/// from disk) and links not followed (such searches never use an index).
+/// from disk) and links not followed (such searches never use an index). A search that
+/// skips only git's ignore files (`--no-ignore-vcs`) needs an index that honours none: it
+/// enters folders `.gitignore` hides (ADR 0016).
 pub fn coverage(filter: Filter) -> Filter {
     Filter {
+        respect_ignore_files: filter.respect_ignore_files && filter.respect_vcs_ignores,
+        respect_vcs_ignores: true,
         include_binary: false,
         follow_links: false,
         ..filter
@@ -158,14 +162,66 @@ impl Found {
 fn narrower(filter: &Filter) -> impl Iterator<Item = u8> {
     let main = membership::bit(filter);
     let covered = membership::covered(filter);
-    [
-        membership::DEFAULT,
-        membership::NO_IGNORE,
-        membership::HIDDEN,
-        membership::ALL,
-    ]
-    .into_iter()
-    .filter(move |&b| b != main && covered & b != 0)
+    membership::WALKS
+        .into_iter()
+        .filter(move |&b| b != main && covered & b != 0)
+}
+
+/// The entries of a folder the index's walk enters that it leaves out (ADR 0016): ignored
+/// or hidden files and folders, not links, which the walker never lists without `-L`. Each
+/// is (path relative to the root, FRN, whether it is a folder).
+pub(crate) fn left_out<'a>(
+    rel: &'a Path,
+    listing: &'a ntfs::Listing,
+    listed: &'a dyn Fn(&Path) -> bool,
+) -> impl Iterator<Item = (PathBuf, u64, bool)> + 'a {
+    listing
+        .entries
+        .iter()
+        .filter(|e| !e.is_link())
+        .map(move |e| (rel.join(&e.name), e.frn, e.is_dir()))
+        .filter(move |(path, _, _)| !listed(path))
+}
+
+/// Adds what the walk left out of the folders it entered, as documents and directories
+/// without walk bits: never read, never entered.
+fn add_left_out(
+    found: &mut Found,
+    root: &Path,
+    root_u32: u32,
+    listings: &[(PathBuf, ntfs::Listing)],
+) {
+    let known: HashSet<PathBuf> = found
+        .docs
+        .iter()
+        .map(|d| d.path.clone())
+        .chain(found.dirs.iter().map(|d| d.path.clone()))
+        .chain(found.errors.iter().map(|e| e.path.clone()))
+        .collect();
+    let listed = |p: &Path| known.contains(p);
+    for (rel, listing) in listings {
+        for (path, frn, is_dir) in left_out(rel, listing, &listed) {
+            if is_dir {
+                found.dirs.push(Entry {
+                    frn,
+                    root: root_u32,
+                    path,
+                    flags: 0,
+                    sd: no_sd(),
+                });
+            } else {
+                let sd = ntfs::descriptor_at(&root.join(&path));
+                found.docs.push(Doc {
+                    root: root_u32,
+                    path,
+                    frn,
+                    flags: 0,
+                    content: Content::Unstored,
+                    sd,
+                });
+            }
+        }
+    }
 }
 
 /// What one walk lists: paths relative to the root, and the errors it reports.
@@ -296,6 +352,7 @@ pub(crate) fn walk_tree(
     let root_u32 = u32::try_from(root).unwrap_or(u32::MAX);
     let main = membership::bit(&scope.filter);
     let found = Mutex::new(Found::default());
+    let listings: Mutex<Vec<(PathBuf, ntfs::Listing)>> = Mutex::new(Vec::new());
     let include_binary = scope.filter.include_binary;
     mtseek_walk::list(
         &sub,
@@ -325,9 +382,11 @@ pub(crate) fn walk_tree(
                     controls.extend(git_info(entry.path, &rel, root_u32));
                 }
                 let sd = ntfs::descriptor_at(entry.path);
+                let frn = listing.frn;
+                lock(&listings).push((rel.clone(), listing));
                 let mut found = lock(&found);
                 found.dirs.push(Entry {
-                    frn: listing.frn,
+                    frn,
                     root: root_u32,
                     path: rel,
                     flags: main,
@@ -372,6 +431,10 @@ pub(crate) fn walk_tree(
         })
         .collect();
     mark(&mut found, &walks, within);
+    let listings = listings
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    add_left_out(&mut found, root_path, root_u32, &listings);
     found
 }
 

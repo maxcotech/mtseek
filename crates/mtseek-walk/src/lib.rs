@@ -442,13 +442,15 @@ impl Rules {
     }
 
     /// Whether a walk with these rules lists the file at `path`, from what is known about it
-    /// without them. The folders above it are the caller's to check ([`Rules::glob`]).
-    pub fn lists(&self, path: &Path, known: Known) -> bool {
+    /// without them. `not_ignored` says whether ignore files leave it out (it may be
+    /// hidden); it is asked only for a file of a `-t` type the walk alone doesn't list. The
+    /// folders above it are the caller's to check ([`Rules::glob`]).
+    pub fn lists(&self, path: &Path, known: Known, not_ignored: &mut dyn FnMut() -> bool) -> bool {
         match self.glob(path, false) {
             Verdict::Include => known.exists,
             Verdict::Exclude => false,
             Verdict::Pass => match self.file_type(path) {
-                Verdict::Include => known.not_ignored,
+                Verdict::Include => known.listed || (known.exists && not_ignored()),
                 Verdict::Exclude => false,
                 Verdict::Pass => known.listed,
             },
@@ -456,14 +458,12 @@ impl Rules {
     }
 }
 
-/// What is known about a file in a folder the walk enters, for [`Rules::lists`].
+/// What is known about a file, for [`Rules::lists`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Known {
     /// The walk without rules lists it.
     pub listed: bool,
-    /// Ignore files don't leave it out (it may be hidden).
-    pub not_ignored: bool,
-    /// It is there at all.
+    /// It is there, in a folder the walk enters.
     pub exists: bool,
 }
 
@@ -709,12 +709,13 @@ fn walk_builder(
     let ignore = &rules.ignore_files;
     if filter.respect_ignore_files {
         // As ripgrep maps its `--no-ignore-*` flags onto the walker.
+        let vcs = filter.respect_vcs_ignores;
         builder
             .parents(!ignore.no_parent)
             .ignore(!ignore.no_dot)
-            .git_global(!ignore.no_vcs && !ignore.no_global)
-            .git_ignore(!ignore.no_vcs)
-            .git_exclude(!ignore.no_vcs && !ignore.no_exclude);
+            .git_global(vcs && !ignore.no_global)
+            .git_ignore(vcs)
+            .git_exclude(vcs && !ignore.no_exclude);
         if !ignore.no_dot {
             builder.add_custom_ignore_filename(".rgignore");
         }

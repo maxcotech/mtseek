@@ -13,7 +13,7 @@ use mtseek_core::Scope;
 use mtseek_walk::Options;
 
 use crate::build::{
-    Found, coverage, is_above, list_level, new_build_id, read_file, repo_of, walk_tree,
+    Found, coverage, is_above, left_out, list_level, new_build_id, read_file, repo_of, walk_tree,
 };
 use crate::{
     BlockReader, Checkpoint, Content, Doc, Entry, IndexError, Location, Meta, Sd, Segment,
@@ -319,26 +319,36 @@ impl Index {
         })
     }
 
-    /// Whether any record names a tracked file, directory or control file, as itself or as
-    /// the parent. Only FRNs are compared, no paths decoded.
+    /// Whether any record names a tracked file, directory or control file itself, or has a
+    /// folder the walk enters (or a control folder) as its parent. A folder the walk leaves
+    /// out (ADR 0016) counts only itself: what changes inside `node_modules` is irrelevant.
+    /// Only FRNs are compared, no paths decoded.
     fn any_tracked(&self, records: &[(u64, u64)]) -> Result<bool, IndexError> {
         let newest = self.newest();
-        let mut tracked: HashSet<u64> = HashSet::new();
+        let mut itself: HashSet<u64> = HashSet::new();
+        let mut parents: HashSet<u64> = HashSet::new();
         for (segment, _) in self.layers() {
-            tracked.extend((0..segment.len()).map(|id| segment.frn(id)));
+            itself.extend((0..segment.len()).map(|id| segment.frn(id)));
         }
-        tracked.extend(newest.dirs()?.into_iter().map(|e| e.frn));
-        tracked.extend(
-            newest
-                .controls()?
-                .into_iter()
-                .filter(|e| !is_above(&e.path))
-                .map(|e| e.frn),
-        );
-        tracked.remove(&0);
+        for dir in newest.dirs()? {
+            itself.insert(dir.frn);
+            if dir.flags != 0 {
+                parents.insert(dir.frn);
+            }
+        }
+        for control in newest
+            .controls()?
+            .into_iter()
+            .filter(|e| !is_above(&e.path))
+        {
+            itself.insert(control.frn);
+            parents.insert(control.frn);
+        }
+        itself.remove(&0);
+        parents.remove(&0);
         Ok(records
             .iter()
-            .any(|(frn, parent)| tracked.contains(frn) || tracked.contains(parent)))
+            .any(|(frn, parent)| itself.contains(frn) || parents.contains(parent)))
     }
 
     /// Whether a record shows that an ignore source above the root changed (ADR 0012): an
@@ -722,6 +732,13 @@ impl State {
         }
         let docs = by_frn(self.docs.iter().map(|(k, l)| (k, l.frn)));
         let dirs = by_frn(self.dirs.iter().map(|(k, (f, _, _))| (k, *f)));
+        // Only a folder the walk enters is re-listed when something in it changes.
+        let entered = by_frn(
+            self.dirs
+                .iter()
+                .filter(|(_, (_, flags, _))| *flags != 0)
+                .map(|(k, (f, _, _))| (k, *f)),
+        );
         let controls = by_frn(
             self.controls
                 .iter()
@@ -737,7 +754,7 @@ impl State {
         );
         let mut work = Work::default();
         for &(frn, parent) in records {
-            for key in dirs.get(&parent).into_iter().flatten() {
+            for key in entered.get(&parent).into_iter().flatten() {
                 work.dirty.insert((*key).clone());
             }
             if security.contains(&frn)
@@ -789,8 +806,11 @@ impl State {
             if walked.iter().any(|w| is_under(key, w)) {
                 continue;
             }
-            // A folder the index doesn't hold is settled by its parent's re-listing.
-            if let Some(&(_, within, _)) = self.dirs.get(key) {
+            // A folder the index doesn't hold, or holds only by name, is settled by its
+            // parent's re-listing.
+            if let Some(&(_, within, _)) = self.dirs.get(key)
+                && within != 0
+            {
                 self.rewalk(scope, options, key, within, stats);
                 walked.push(key.clone());
             }
@@ -838,6 +858,9 @@ impl State {
         let Some(&(frn_before, within, _)) = self.dirs.get(key) else {
             return Relisted::Done;
         };
+        if within == 0 {
+            return Relisted::Done; // left out: only its name is held
+        }
         let Ok(listing) = ntfs::list_dir(&full) else {
             self.remove_under(key);
             return Relisted::Gone;
@@ -876,8 +899,25 @@ impl State {
                 .unwrap_or(0)
         };
         let level = list_level(scope, *root as usize, dir, within);
+        // What the walk leaves out of this folder, by name (ADR 0016).
+        let known: HashSet<&PathBuf> = level
+            .files
+            .iter()
+            .chain(&level.dirs)
+            .map(|(p, _)| p)
+            .chain(level.errors.iter().map(|e| &e.path))
+            .collect();
+        let mut files = level.files.clone();
+        let mut out_dirs: Vec<(PathBuf, u64)> = Vec::new();
+        for (path, frn, is_dir) in left_out(dir, &listing, &|p| known.contains(&p.to_path_buf())) {
+            if is_dir {
+                out_dirs.push((path, frn));
+            } else {
+                files.push((path, 0));
+            }
+        }
 
-        self.refresh_files(scope, key, &level.files, &frn_of, changed, stats);
+        self.refresh_files(scope, key, &files, &frn_of, changed, stats);
         let listed_files: HashSet<&PathBuf> = level.files.iter().map(|(p, _)| p).collect();
         self.errors.retain(|e| {
             !(e.root == Some(*root)
@@ -890,7 +930,12 @@ impl State {
 
         // Subdirectories: walk the new, the replaced and those whose membership changed (it
         // changes for everything under them); drop the vanished.
-        let listed_dirs: HashSet<&PathBuf> = level.dirs.iter().map(|(p, _)| p).collect();
+        let listed_dirs: HashSet<&PathBuf> = level
+            .dirs
+            .iter()
+            .map(|(p, _)| p)
+            .chain(out_dirs.iter().map(|(p, _)| p))
+            .collect();
         let vanished: Vec<Key> = children(&self.dirs, key)
             .filter(|(k, _)| !listed_dirs.contains(&k.1.path))
             .map(|(k, _)| k.clone())
@@ -898,6 +943,7 @@ impl State {
         for k in vanished {
             self.remove_under(&k);
         }
+        self.hold_left_out(*root, &out_dirs);
         for (path, flags) in &level.dirs {
             let sub = key_of(*root, path);
             let frn = frn_of(path);
@@ -910,6 +956,25 @@ impl State {
             }
         }
         Relisted::Done
+    }
+
+    /// Records folders the walk leaves out, by name only (ADR 0016): `(path, FRN)` under
+    /// root `root`.
+    fn hold_left_out(&mut self, root: u32, folders: &[(PathBuf, u64)]) {
+        for (path, frn) in folders {
+            let sub = key_of(root, path);
+            match self.dirs.get(&sub) {
+                Some(&(f, 0, _)) if f == *frn => {}
+                // Entered before, or another folder under the name: drop what it held.
+                Some(_) => {
+                    self.remove_under(&sub);
+                    self.dirs.insert(sub, (*frn, 0, crate::no_sd()));
+                }
+                None => {
+                    self.dirs.insert(sub, (*frn, 0, crate::no_sd()));
+                }
+            }
+        }
     }
 
     /// Brings the files directly in directory `key` up to date with `listed`: keeps the
@@ -945,8 +1010,23 @@ impl State {
             if unchanged {
                 continue;
             }
-            stats.read += 1;
             let full = scope.roots[*root as usize].join(path);
+            if flags & membership::FILTERS == 0 {
+                // Left out by the walk (ADR 0016): held by name, never read.
+                let sd = ntfs::descriptor_at(&full);
+                let source = Source::New(Content::Unstored);
+                self.docs.insert(
+                    doc_key,
+                    Live {
+                        frn,
+                        flags,
+                        sd,
+                        source,
+                    },
+                );
+                continue;
+            }
+            stats.read += 1;
             match read_file(&full, scope.filter.include_binary) {
                 Ok((content, frn, sd)) => {
                     self.docs.insert(
@@ -1036,8 +1116,9 @@ impl State {
                 live.sd = ntfs::descriptor_at(&at(key));
             }
         }
-        for (key, (frn, _, sd)) in &mut self.dirs {
-            if frns.contains(frn) {
+        // A folder the walk leaves out is held by name only, without a descriptor.
+        for (key, (frn, flags, sd)) in &mut self.dirs {
+            if frns.contains(frn) && *flags != 0 {
                 *sd = ntfs::descriptor_at(&at(key));
             }
         }

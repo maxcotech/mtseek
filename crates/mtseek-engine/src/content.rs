@@ -190,9 +190,7 @@ fn uses_index(request: &SearchRequest, report: &dyn Report, view: &View<'_>) -> 
         Some("searches that follow links (-L) don't use the content index; scanning")
     } else if !request.select.ignore_files.is_standard_for(&request.filter) {
         // No index records a walk that reads only some ignore files.
-        Some(
-            "--no-ignore-vcs, --ignore-file and the like don't use the content index yet; scanning",
-        )
+        Some("--no-ignore-dot, --ignore-file and the like don't use the content index; scanning")
     } else {
         return Ok(true);
     };

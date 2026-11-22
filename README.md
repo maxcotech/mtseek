@@ -76,12 +76,14 @@ The flags are ripgrep's (`-F -i -S -s -l -c --count-matches -n -N -H -I -A -B -C
 `rg --json`'s JSON Lines message for message. Editors, scripts and AI agents that already speak
 `rg` work unchanged. That's a tested contract
 ([ADR 0005](docs/adr/0005-ripgrep-compatible-contract.md), [ADR 0015](docs/adr/0015-agents-json-and-mcp.md)).
-As in ripgrep, a file that matches `-g` is searched even if it is ignored or hidden, so the
-index answers a glob or `-t` search only if it was built with `-uu`; otherwise it scans.
+As in ripgrep, a file that matches `-g` is searched even if it is ignored or hidden; the
+index keeps the names of such files so it answers globs and `-t` too
+([ADR 0016](docs/adr/0016-left-out-names.md)).
 Leave files out of one search with `-g '!*.min.js'`, or of every search of a folder with a
 `.ignore` file (gitignore syntax, read by mtseek and rg but not git). `--no-ignore-vcs`
-searches what `.gitignore` hides while `.ignore` still applies; it and the other
-`--no-ignore-*` flags and `--ignore-file` scan for now.
+searches what `.gitignore` hides while `.ignore` still applies; with `--index` it builds an
+index of everything but what `.ignore` leaves out. The other `--no-ignore-*` flags and
+`--ignore-file` scan.
 
 ## Roadmap
 

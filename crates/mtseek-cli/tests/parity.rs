@@ -263,8 +263,8 @@ fn agent_flags_match_ripgrep() {
 
     let mut failures = Vec::new();
     let mut cases = 0;
-    // The last round searches with the default filters through the index the `-uu` round
-    // widened, which then holds the ignored and hidden files globs can list.
+    // Default filters, then `-uu` (which widens the index), then the defaults again through
+    // that wider index. Since ADR 0016 every round answers globs and types from the index.
     for scope_flags in [&[][..], &["-uu"], &[]] {
         for (pattern, case_flags) in AGENT_CASES {
             let flags: Vec<&str> = case_flags
@@ -300,8 +300,9 @@ fn agent_flags_match_ripgrep() {
 
 /// Finer control over ignore files: `--no-ignore-vcs` and its siblings, `--ignore-file`
 /// (which applies even with `-u`), `--no-ignore-files`, and an ignore file that can't be
-/// read (reported, not an error). No index answers these walks; with `--index` they must
-/// still scan rather than use the corpus's index.
+/// read (reported, not an error). With `--index`, `--no-ignore-vcs` widens the corpus's
+/// index to one that honours no ignore files and is answered from it (ADR 0016); the others
+/// scan rather than use it.
 #[test]
 fn ignore_flags_match_ripgrep() {
     if !ripgrep_available() {

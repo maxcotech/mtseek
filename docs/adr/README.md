@@ -20,3 +20,4 @@ Never edit an accepted ADR's decision. Write a new ADR that supersedes it and li
 | [0013](0013-daemon-and-ipc.md) | The daemon and its pipe protocol | Accepted |
 | [0014](0014-service-mode.md) | Service mode: one machine-wide daemon that shows each caller only what it could read | Accepted |
 | [0015](0015-agents-json-and-mcp.md) | Agents: `--json`, the flags agents use, and an MCP server | Accepted |
+| [0016](0016-left-out-names.md) | The index records what its walk leaves out, and the `--no-ignore-vcs` walks | Accepted |

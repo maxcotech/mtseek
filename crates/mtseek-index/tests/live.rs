@@ -482,8 +482,15 @@ fn git_exclude_changes_are_picked_up() {
     let scope = scope(&root, 0);
     let (mut index, _) =
         Index::build(&scope, Options::default(), &cache.path().join("idx")).unwrap();
-    let names =
-        |index: &Index| -> Vec<PathBuf> { view(index).files.into_keys().map(|(_, p)| p).collect() };
+    // The files the walk lists; what it leaves out is held by name too (ADR 0016).
+    let names = |index: &Index| -> Vec<PathBuf> {
+        view(index)
+            .files
+            .into_iter()
+            .filter(|(_, held)| held.1 & membership::FILTERS != 0)
+            .map(|((_, p), _)| p)
+            .collect()
+    };
     let exclude = root.join(".git").join("info").join("exclude");
     for (text, expected) in [
         (Some("x.txt\n"), vec!["y.rs"]),

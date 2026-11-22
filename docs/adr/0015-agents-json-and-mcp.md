@@ -228,6 +228,8 @@ minutes and leaves files in the cache, so a person decides it (`mtseek --index`)
   even with `-u`, and one that can't be read is reported without making the exit code 2.
   No index records these walks (it records all ignore files or none), so they scan, and
   the CLI runs them itself: the protocol doesn't carry them until an index can answer them.
+  Since [0016](0016-left-out-names.md), `--no-ignore-vcs` is a walk the index records
+  (protocol 3), and globs and types are answered by indexes built with default filters.
 
 ## Alternatives considered
 
